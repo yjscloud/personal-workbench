@@ -21,7 +21,7 @@ A self-hosted, single-user console for homelab operators — tasks, Proxmox VE m
 | --- | --- |
 | **导航** | 今日待办、常用网站图标导航、本周最重要的三件事、左上角 AI 助手入口 |
 | **任务** | 清单筛选 + 列表/看板双视图 + 任务详情抽屉，支持归档与回收站 |
-| **监控数据** | Proxmox VE 主机指标（CPU / 内存 / 磁盘 / IO / 容量趋势 / 温度）、整机功耗与电费、节能模式 |
+| **监控数据** | Proxmox VE 主机指标（CPU / 内存 / 磁盘 / IO / 容量趋势 / 温度）、整机功耗与电费（接 [Home Assistant](#依赖说明home-assistant可选) 后为实测值）、节能模式 |
 | **AI 热点** | 每日自动抓取的 AI 资讯流，带模型打分与推荐理由 |
 | **工具箱** | 工具网站按用途分类，支持搜索与增删改，与首页共用一份数据 |
 | **知识库** | SOP + Runbook，按类型与标签区分 |
@@ -33,6 +33,7 @@ A self-hosted, single-user console for homelab operators — tasks, Proxmox VE m
 
 - **Node.js 20+**
 - **MySQL 8**
+- **Home Assistant**（可选）—— 只为读取智能插座的真实功耗，不配也能跑，功耗改用估算模型。见下方[依赖说明](#依赖说明home-assistant可选)
 
 ### 1. 建库建账号
 
@@ -110,9 +111,38 @@ systemctl enable --now personal-workbench
 | `PORT` | 服务端口，默认 `8787` |
 | `AUTH_USER` `AUTH_PASSWORD` | 面板登录账号；`AUTH_PASSWORD` 留空即关闭登录 |
 | `PVE_HOST` `PVE_TOKEN_ID` `PVE_TOKEN_SECRET` | Proxmox VE 连接，留空走演示模式 |
-| `HA_URL` `HA_TOKEN` | Home Assistant，用于读取智能插座的真实功耗 |
+| `HA_URL` `HA_TOKEN` | Home Assistant，读取智能插座的真实功耗（可选，见[依赖说明](#依赖说明home-assistant可选)） |
 | `AI_BASE_URL` `AI_API_KEY` `AI_MODEL` | 任意 OpenAI 兼容端点（官方 API / Ollama / vLLM 均可） |
 | `HERMES_BASE_URL` | 局域网 Hermes Agent Office 网关（可选） |
+
+## 依赖说明：Home Assistant（可选）
+
+**整机功耗与电费默认是估算出来的**，想拿到真实读数就要接 Home Assistant —— 通过智能插座读实测功率。
+
+不配 HA 时，功耗走「CPU 利用率 → 功耗」的工程估算模型；配上之后：
+
+- **整机功耗** = 各插座实测功率之和
+- **用电量与电费** = 对上面的求和功率做积分，按电价折算（也可读插座自带的累计电量实体）
+
+### 配置步骤
+
+1. 在 Home Assistant 生成长期访问令牌：**左下角头像 → 安全 → 长期访问令牌**
+2. 写进 `.env`：
+
+   ```bash
+   HA_URL=http://127.0.0.1:8123
+   HA_TOKEN=你的长期访问令牌
+   ```
+
+3. 到 **设置 → 功耗 → 插座列表** 添加插座：每个插座填一个**功率实体**（如 `sensor.plug_electric_power`），
+   可再加一个**累计电量实体**，留空则由服务端对功率做积分。支持多个插座，整机功耗是它们的和。
+
+### 几点说明
+
+- **令牌只从环境变量读取**，不落库、也不进备份导出；设置页只显示「已配置 / 未配置」，不会回显令牌本身。
+- `HA_POWER_ENTITY` / `HA_COUNTER_ENTITY` 是旧版单插座配置的兜底，仅当插座列表为空时才会被读。
+- 电量累计依赖服务持续运行，**停机期间不补算**（避免虚增）。
+- 没接 HA、或插座读不到数时，界面会明确标注数据来源，不会拿估算值冒充实测。
 
 ## 数据存储
 
