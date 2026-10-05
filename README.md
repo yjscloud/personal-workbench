@@ -1,362 +1,155 @@
-# 个人工作台
+# Personal Workbench · 个人工作台
 
-面向家庭实验室（Home Lab）运维者的单人控制台。七个页面：导航、任务、监控数据、AI 热点、工具箱、知识库、设置。
+面向家庭实验室（Home Lab）的**单人控制台**：任务工单、Proxmox VE 监控、AI 热点、知识库与 AI 助手。所有数据存在自己的 MySQL 里，不依赖任何云服务。
 
-```
-导航      置顶今日待办 · 常用网站图标导航 · 左上角 AI 助手
-任务      清单 + 列表/看板双视图 + 任务详情抽屉，行内完成与回车快速添加
-监控数据   Proxmox VE 主机指标（CPU / 内存 / 硬盘 / IO / 容量趋势 / 温度）
-          PVE 整机功耗、预估电费、节能模式开关
-AI 热点    每日 06:00 自动抓取的卡片流
-工具箱     工具网站按用途分类，支持搜索 / 增删改，与首页「常用网站」共用一份数据
-知识库     SOP + Runbook 合并页面，用标签与类型区分
-设置      主题/强调色、PVE 连接、功耗电价模型、数据备份
-```
+A self-hosted, single-user console for homelab operators — tasks, Proxmox VE monitoring, AI news feed, knowledge base and an AI assistant.
 
-## 快速开始
+![界面预览](docs/screenshot.jpg)
 
-数据全部存放在 **MySQL** 里，第一次跑起来之前先准备数据库：
+![Node.js](https://img.shields.io/badge/Node.js-20%2B-3C873A?style=flat-square&logo=nodedotjs&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=flat-square&logo=typescript&logoColor=white)
+![Vite](https://img.shields.io/badge/Vite-5-646CFF?style=flat-square&logo=vite&logoColor=white)
+![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-3-38BDF8?style=flat-square&logo=tailwindcss&logoColor=white)
+![Express](https://img.shields.io/badge/Express-4-000000?style=flat-square&logo=express&logoColor=white)
+![MySQL](https://img.shields.io/badge/MySQL-8-4479A1?style=flat-square&logo=mysql&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)
+
+## 功能一览
+
+| 页面 | 内容 |
+| --- | --- |
+| **导航** | 今日待办、常用网站图标导航、本周最重要的三件事、左上角 AI 助手入口 |
+| **任务** | 清单筛选 + 列表/看板双视图 + 任务详情抽屉，支持归档与回收站 |
+| **监控数据** | Proxmox VE 主机指标（CPU / 内存 / 磁盘 / IO / 容量趋势 / 温度）、整机功耗与电费、节能模式 |
+| **AI 热点** | 每日自动抓取的 AI 资讯流，带模型打分与推荐理由 |
+| **工具箱** | 工具网站按用途分类，支持搜索与增删改，与首页共用一份数据 |
+| **知识库** | SOP + Runbook，按类型与标签区分 |
+| **设置** | 主题与强调色、PVE 连接、功耗电价模型、数据备份 |
+
+## 部署
+
+### 前置要求
+
+- **Node.js 20+**
+- **MySQL 8**
+
+### 1. 建库建账号
 
 ```bash
-# 1) 建库建账号（会创建 personal_workbench 库与 workbench 账号）
 mysql -uroot -p < server/db/bootstrap.sql
+```
 
-# 2) 安装依赖、准备配置
+会创建 `personal_workbench` 库与 `workbench` 账号。
+
+### 2. 安装依赖并配置
+
+```bash
 npm install
-cp .env.example .env      # 填 MySQL 连接；Proxmox Token 留空则使用演示数据
+cp .env.example .env
+```
 
-# 3) 启动（首次启动会自动建表并写入种子数据）
-npm run dev               # 前端 http://localhost:5173，后端 http://localhost:8787
+编辑 `.env`。**只有 MySQL 连接是必填的**，其余留空即可跑起来 —— 没配 Proxmox 时自动进入演示模式，用模拟数据把界面跑通。
+
+### 3. 启动
+
+开发模式（前端热更新 + 后端自动重启）：
+
+```bash
+npm run dev
+# 前端 http://localhost:5173   后端 http://localhost:8787
 ```
 
 生产模式（单端口，前端产物由后端托管）：
 
 ```bash
 npm run build
-npm start                 # http://localhost:8787
+npm start
+# http://localhost:8787
 ```
 
-其他数据库相关的命令：
+首次启动会自动建表并写入示例数据。
+
+### 4. 常驻运行（可选）
+
+`/etc/systemd/system/personal-workbench.service`：
+
+```ini
+[Unit]
+Description=Personal Workbench
+After=network.target mysql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/personal-workbench
+ExecStart=/usr/bin/node server/index.js
+EnvironmentFile=/opt/personal-workbench/.env
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ```bash
-npm run db:migrate        # 只建表 / 检查连通性与各表行数，不启动 Web 服务
+systemctl daemon-reload
+systemctl enable --now personal-workbench
 ```
 
-> 从旧版本（JSON 文件存储）升级：只要 `server/data/db.json` 还在，首次建表时会把里面的数据
-> 自动迁移进 MySQL（待办、任务、书签、知识库、热点、设置、电量累计全量搬迁），迁移后该文件
-> 只作为备份保留，不再被写入。
-
-## Proxmox VE 对接
-
-在 PVE 上创建权限最小化的 API Token：
-
-```bash
-pveum user token add root@pam workbench --privsep 0
-# 输出里的 value 就是 Token 密钥
-```
-
-在「设置 → Proxmox 连接」中填入地址、端口、`Token ID`（形如 `root@pam!workbench`）与密钥，或直接写在 `.env`：
-
-```
-PVE_HOST=pve.home.local
-PVE_PORT=8006
-PVE_TOKEN_ID=root@pam!workbench
-PVE_TOKEN_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-PVE_VERIFY_TLS=false
-PVE_NODE=pve
-```
-
-### 采集的指标
-
-| 指标 | 接口 | 说明 |
-|---|---|---|
-| CPU / 内存 / 根分区 / 负载 / 运行时长 | `/nodes/{node}/status` | 实时值 |
-| CPU、内存、网络、磁盘 IO 历史 | `/nodes/{node}/rrddata` | 支持 1 小时 / 1 天 / 1 周 / 1 月 |
-| 温度、功率读数 | `/nodes/{node}/sensors` | 需节点已装 `lm-sensors` 并执行 `sensors-detect` |
-| 磁盘容量、健康度、磨损 | `/nodes/{node}/disks/list` | |
-| 磁盘温度 | `/nodes/{node}/disks/smart` | 按盘查询，失败静默忽略 |
-| VM / CT 列表 | `/nodes/{node}/qemu`、`/nodes/{node}/lxc` | |
-
-节点的 RRD 不一定会上报磁盘 IO。拿不到时监控页会自动改用 `iowait` 展示，并明确标注，不会伪造数据。
-
-### 功耗是怎么来的
-
-Proxmox 本身不提供整机功耗，除个别主板通过传感器暴露 PSU 功率外，通常只能估算。本项目的做法是：
-
-1. 若 `/nodes/{node}/sensors` 里有功率读数（PSU / Input / Total），直接采用实测值；
-2. 否则用工程估算模型：
-
-```
-整机功耗 ≈ 其它固定功耗(extraW)
-         + 硬盘数量 × 单盘功耗(perDiskW)
-         + [ 空闲功耗(idleW) + (满载功耗(maxW) − idleW) × CPU利用率^1.15 ]
-```
-
-四个参数、电价、节能折算系数都可以在「设置 → 功耗与电费」里按实测功率校准。
-
-电费部分：
-- 服务运行期间每 15 秒采样一次，按时间差累加电量到当日（同时记录总电量），页面刷新时即可看到今日 kWh 与花费；
-- 预估电费按「当前功率 × 剩余小时」推算当日，日 × 30 得月，日 × 365 得年；
-- 最近 14 天的每日用电以柱状图展示，可回看趋势。
-
-### 节能模式
-
-「监控数据 → 功耗与电费」提供了两个互斥按钮：**标准模式** 与 **节能模式**。
-
-- 应用侧：切换后按 `ecoFactor`（默认 0.85）折算功耗模型上限，并对比展示标准 / 节能的瓦数与节省百分比、累计节省电量；
-- 硬件侧（可选）：若配置了 `ECO_WEBHOOK_URL` 或 `PVE_ECO_COMMAND`，切换时会同步触发外部联动，例如：
-
-```
-ECO_WEBHOOK_URL=https://your-hook.example.com/eco
-PVE_ECO_COMMAND=cpupower frequency-set -g powersave
-```
-
-`PVE_ECO_COMMAND` 会在服务器本机执行，请自行确认命令安全。
-
-### 节点连不上时怎么排查
-
-界面上「监控数据」报错时，按这个顺序看：
-
-1. **先用设置页的「测试连接」**。它会直接列出现在能读到的节点名，这一步能解决绝大多数问题；
-2. **`hostname lookup 'xxx' failed` 不是 DNS 问题**。这是 PVE 对「节点不存在」的报错原文——它在内部解析节点名，写出来的却是主机名解析失败的样子，很容易把排查方向带偏。真因通常是「默认节点」填错了（比如填了 `pve-master`，而实际节点叫 `pve`）。
-   代码里已经做了兜底：配置的节点不在节点列表里时，会自动改用第一个可用节点并在页面上提示，不会再整页 500；
-3. **401 / 认证失败**：确认 Token ID 形如 `user@realm!tokenname`，且该 Token 已被授权（PVE 新建 Token 默认没有权限，需要在 `数据中心 → 权限` 里给 `/` 路径加角色）；
-4. **证书报错**：自签证书要在设置里打开「信任自签证书」。
-
-## Hermes Agent Office 对接
-
-局域网里跑着的「智能工位」网关（nginx 反代 + agent-office 服务），接进来只用了两个口子：
-
-| 用途 | 接口 | 是否需要凭证 |
-|---|---|---|
-| 工位 / 员工在线状态 | `GET /public/agents` | 否 |
-| 登录换会话 | `POST /auth/login` | 用户名 + 口令 |
-| 其余业务接口 | 各自路径 | 需要上一步的 Cookie |
-
-其余所有路径未登录时统一返回 `{"error":"未登录","login":"/login.html"}`，所以「登录」是绕不开的一步。
-
-配置（`.env`）：
-
-```
-HERMES_BASE_URL=http://hermes.home.local
-HERMES_USER=agent
-HERMES_PASSWORD=xxxxxxxx
-```
-
-口径说明：
-
-- **工位状态免登录**，所以不配 `HERMES_USER` / `HERMES_PASSWORD` 也能用；只有要调登录后的接口才需要这两项；
-- 口令只从环境变量读，**不落库、不进备份、不回显**——和 `HA_TOKEN` 一个规矩；
-- 会话在服务端内存里缓存（默认 20 分钟主动重登一次），遇到 401 会自动重登**一次**；
-- ⚠️ **Hermes 的登录失败是会计数的**（返回里会写「剩余尝试 N 次」，试满锁账号）。所以服务端登录失败后会自我冷却 5 分钟，不会拿着错口令反复撞；要立刻重试就改完 `.env` 重启服务。
-
-### AI 助手能查到什么
-
-「Hermes 工位现在谁在线」这类问题由规则引擎直接回答，不依赖外部大模型：地址、网关版本、工位总数 / 在编 / 空缺 / 在线，以及每个员工的在线标记。这条走的是公开接口，**不配口令也能回答**；凭证状态会一并说清楚（未配置 / 已配置但还没会话），因为那决定了下一步能不能"管"。
-
-接了大模型之后，工位快照会作为上下文的一部分注入：`buildContext()` 里多了一段 `hermes`，模型可以基于它自由回答。
-
-### 想调用登录后的业务接口
-
-Hermes 未登录时对所有路径统一返回 401，光靠猜测拿不到接口清单。凭证填好后用一个脚本自动枚举：
-
-```bash
-npm run hermes:probe                      # 内置候选路径
-npm run hermes:probe -- /api/foo /api/bar # 追加自己想试的路径
-```
-
-它会先读公开接口确认可达，再登录，然后用 GET 逐个试探候选路径，把每个路径的 HTTP 状态码和返回字段打印出来。**只发 GET，不改动任何数据。** 把返回 200 的路径和字段记下来，就是业务接口的清单。
-
-拿到清单后，在 `services/hermes.js` 里用已经封装好的 `hermesApi(path)`（带会话缓存、401 自动重登）包一层读/写函数，再到 `services/assistant.js` 里接一条规则分支即可。
-
-## AI 热点
-
-默认订阅 5 个源（机器之心、arXiv cs.AI、Hacker News AI、Hugging Face Blog、Google Research），每天按 `settings.news.cron`（默认 `0 6 * * *`）自动抓取，也可在页面手动刷新。源与 cron 在「设置 → AI 热点来源」中编辑，格式为每行 `名称 | URL | 标签1,标签2`。
-
-全部源失败时保留上一批缓存内容，不会清空页面。
-
-## AI 助手
-
-左上角「AI 助手」按钮，或 `⌘K` / `Ctrl+K` 唤起。
-
-- **默认（本地规则引擎）**：不依赖任何外部服务，可直接查询监控与功耗、开关节能模式、读写今日待办、汇总本周任务、检索知识库（标题／标签／正文加权匹配）、播报最新 AI 热点、查看 Hermes 工位在线情况；
-- **接入大模型**：在 `.env` 中配置 `AI_API_KEY`（可选 `AI_BASE_URL`、`AI_MODEL`），助手会先把当前实时上下文（监控、**Hermes 工位**、待办、任务、热点标题、知识库目录）注入系统提示，再交给模型回答。模型调用失败会自动回退到本地规则，并在气泡上说明原因。
-
-> **写操作永远由工作台自己执行**。`ask()` 会先跑本地写操作（开关节能模式、加待办），命中就地落库并直接返回，**不交给模型** —— 「模型答『已开启』而库里没变」这种假成功是明确要避免的；顺带也省掉一次上万 token 的调用。命中时气泡上标的是「本地执行 · 未调用大模型」。
->
-> 其余请求（只读查询、自由问答）在配了 `AI_API_KEY` 后交给模型，模型调用失败才回退到本地规则引擎。也就是说，**知识库检索、工位播报这些确定性输出在接了大模型后不再触发**，改由模型自行组织答案（工位快照仍会作为上下文注入，所以照样答得准）。
-
-### 接局域网里的 Hermes Agent 当模型用
-
-Hermes 的 API Server 走标准 OpenAI 协议，所以**不需要任何专用代码**，当普通模型供应商填即可：
-
-```
-AI_BASE_URL=http://hermes.home.local:8642/v1
-AI_API_KEY=<Hermes 机器上 ~/.hermes/.env 里的 API_SERVER_KEY>
-AI_MODEL=hermes-agent
-```
-
-实测：`temperature` / `system` 角色 / 非流式返回都兼容，但**耗时波动极大**——简单问题约 1.4 秒，复杂问题（多步推理、调工具）实测 29～64 秒。所以单次等待上限默认给到 120 秒，可用 `AI_TIMEOUT_MS` 调整（下限 5000）。
-
-超时值要和部署形态对齐：**经 nginx 反代访问时 `proxy_read_timeout` 必须大于 `AI_TIMEOUT_MS`**，否则连接会先被反代掐断，只能收到 504 —— 这种情况前端会直接指出「上游响应超时」，而不是笼统地报一句"非 JSON 内容"。
-
-### 流式输出
-
-界面上的助手走的是 `POST /api/assistant/stream`（SSE），而不是一次性返回的 `/api/assistant`：
-
-- 答案逐字出现，不用干等；Hermes 的 `reasoning_content` 转成进度提示（气泡里显示「正在推理 · 已 N 字」），**推理原文不铺出来**——那是模型的思考稿，摆进气泡只会干扰阅读；
-- 超时换成两道闸：`AI_STREAM_TIMEOUT_MS`（默认 300000，整体上限）+ 90 秒空闲上限（流里连续 90 秒没有任何分片就断开）。因为一直有数据在流，反代的读超时也不容易触发；
-- **已经吐出半截答案再出错时不会回退规则引擎**：两段文字接在一起比直接报错更难懂，这种情况保留已流出的内容，只在下面标注中断原因；
-- 写操作（开关节能模式、加待办）在流式路径里同样优先本地执行，只是它们本来就是瞬时完成，没有流式的必要。
-
-> 心跳：推理阶段若长时间没有分片，服务端每 15 秒发一个 SSE 注释帧 `: ping`，让中间设备知道连接还活着。
-
-### 对话历史
-
-助手面板里的对话会落到 MySQL 的 `assistant_messages` 表：刷新页面、重新打开浏览器、换设备都还在。清空走面板右上角的垃圾桶图标（带二次确认）。
-
-这张表是**全项目唯一不走 `store.js` 内存镜像**的表，理由写在 `server/db/messages.js` 顶部：镜像的落库方式是「整表 `DELETE` + 全量 `INSERT` + 整表 JSON 指纹判重」，而对话是只追加、持续增长的数据 —— 走镜像等于每发一条消息都重写全部历史，越用越慢。所以它复用连接池逐行读写。
-
-由此有三条必须知道的边界：
-
-- **备份导出不含对话历史**：`/api/backup` 导出的是内存镜像快照，对话不在里面（导入也不会动它）；
-- 只保留**最近 500 条**，更老的会在写入时自动裁掉，这张表不会无限膨胀；
-- 健康检查的「表行数」里能看到它（`countMessages()` 单独数一次补上）。
-
-落库时机：提问一发出就存用户消息（哪怕这轮失败，问过什么也留得住）；回答结束再存助手消息，带上 `engine` 与 `warning`。流式回答中途断掉时，已流出的部分会连同中断说明一起存；空回答不存，免得历史里堆一串空气泡。
-
-### 前端更新后，开着的页面怎么知道
-
-`npm run build` 只会换掉 `dist/` 里的产物，**已经打开的页面不会自己更新**——它手里还是旧 JS，会继续按旧逻辑调接口（比如一直走非流式端点）。过去只能靠人记得强刷，现在页面会自己发现：
-
-- `GET /api/version` 返回 `dist/index.html` 里引用的入口 JS 文件名（带内容哈希，换构建就换名字；dev 模式返回 `null`）；
-- 页面加载时记下这个版本，之后每 60 秒复查一次，一旦变了就在底部弹一条「工作台有新版本 → 刷新」；
-- 是**提示**而不是自动重载：正在等助手回答或填表单时被强制刷新丢内容，比"晚几分钟再更新"更糟。
-
-注意它只能发现「服务器换了产物」，发现不了「浏览器缓存了旧 HTML」。所以 `index.html` 不要给它设长缓存（nginx 那边 `location /` 保持默认，别加 `Cache-Control: max-age`；`/assets/` 下的文件带哈希，长缓存是安全的）。
-
-两个要知道的特点：
-
-- **每次请求约 1.5 万 prompt token**。这是 Hermes agent 自己的系统提示（不是工作台注入的上下文造成的），局域网自用无所谓，但别拿它当轻量模型刷量；
-- **它是个会自己动手的 agent，不是纯模型**。它有自己的工具集，工作台把问题原样转过去之后，它可能真的去执行动作。工作台的 system 提示里虽然要求「不要编造数据」，但约束力取决于 Hermes 侧的提示词优先级。
-
-若只想接一个干净的对话模型，建议另配 `AI_BASE_URL` 指向 Ollama / vLLM 之类的纯推理端点。
-
-Dashboard（80 端口那个登录页）是另一条路，只有工位状态与管理面板，没有标准 API；它需要的 `HERMES_USER` / `HERMES_PASSWORD` 与上面的 `API_SERVER_KEY` 是两套独立的凭证。
+> **放在 nginx 后面时**：若用 AI 助手的流式问答，`proxy_read_timeout` 必须大于 `AI_TIMEOUT_MS`，
+> 否则连接会先被反代掐断，前端只能收到 504。另外 `index.html` 不要设长缓存
+> （`/assets/` 下的文件带哈希，长缓存是安全的）。
+
+## 环境变量
+
+完整清单和注释见 [`.env.example`](.env.example)。常用的几组：
+
+| 变量 | 说明 |
+| --- | --- |
+| `DB_HOST` `DB_PORT` `DB_USER` `DB_PASSWORD` `DB_NAME` | MySQL 连接（**必填**） |
+| `PORT` | 服务端口，默认 `8787` |
+| `AUTH_USER` `AUTH_PASSWORD` | 面板登录账号；`AUTH_PASSWORD` 留空即关闭登录 |
+| `PVE_HOST` `PVE_TOKEN_ID` `PVE_TOKEN_SECRET` | Proxmox VE 连接，留空走演示模式 |
+| `HA_URL` `HA_TOKEN` | Home Assistant，用于读取智能插座的真实功耗 |
+| `AI_BASE_URL` `AI_API_KEY` `AI_MODEL` | 任意 OpenAI 兼容端点（官方 API / Ollama / vLLM 均可） |
+| `HERMES_BASE_URL` | 局域网 Hermes Agent Office 网关（可选） |
 
 ## 数据存储
 
-所有数据都落在 **MySQL**，没有本地文件落盘。连接参数走 `.env`（`DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME`），建表脚本是 `server/db/schema.sql`，服务启动时自动执行（幂等），也可以 `npm run db:migrate` 单独跑。
+所有数据都在 **MySQL**，不落本地文件。表结构见 [`server/db/schema.sql`](server/db/schema.sql)，服务启动时自动执行（幂等），也可以单独跑：
 
-表结构（明细表都带 `sort_order`，用来原样还原列表顺序；数组字段用 JSON 列）：
+```bash
+npm run db:migrate      # 只建表 / 检查连通性与各表行数，不启动 Web 服务
+```
 
-| 表 | 内容 |
-|---|---|
-| `todos` | 今日待办（内容/优先级/截止/完成态） |
-| `tickets` | 任务（编号/状态/项目/负责人/备注/标签/子任务/归档与回收站时间） |
-| `bookmark_groups` / `bookmarks` | 常用网站分组与入口 |
-| `knowledge_items` | 知识库 SOP / Runbook（`tags`、`steps` 为 JSON） |
-| `news_items` | AI 热点条目（`tags` 为 JSON） |
-| `news_state` | 热点最近抓取时间与错误（单行） |
-| `app_settings` | 主题、PVE 连接、功耗电价模型、订阅源（单行 JSON） |
-| `energy_state` / `energy_daily` | 电量电费总量与每日明细 |
+写请求在返回前会等待 MySQL 事务提交，提交失败返回 503 —— 不会出现「界面提示保存成功、库里其实没写」。设置页支持导出 / 导入 JSON、立即落盘与重置为示例数据。
 
-写入策略：
-
-- 进程内保留一份内存镜像供读取与修改，**任何写请求在返回之前都会等 MySQL 事务提交**；提交失败会返回 503 与原因，不会出现"界面提示保存成功、库里其实没写"；
-- 每次同步按表做内容指纹比对，只有真正变化的表会重写，并在一个事务内完成，读端不会看到中间状态；
-- 进程收到 `SIGINT` / `SIGTERM` 时会先落库再退出。
-
-> 注意：内存镜像是写入源头，所以**用手写 SQL 改库之后要重启一次服务**，否则下一次同步会用内存里的数据覆盖掉手工改动。正常通过界面/接口读写不会遇到这个问题。
-
-「设置 → 数据与备份」支持导出 JSON、导入 JSON（整体覆盖回库）、立即落盘（手动触发一次同步）、重置为示例数据。
+> 内存镜像是写入源头，所以**手工改库之后要重启一次服务**，否则下一次同步会覆盖掉手工改动。通过界面或接口读写不会有这个问题。
 
 ## 目录结构
 
 ```
-├── server/
-│   ├── index.js              Express 入口、落库闸门、静态托管、cron 定时任务
-│   ├── routes.js             全部 REST 接口
-│   ├── store.js              数据层：内存镜像 + 写穿 MySQL + 退出前落库
-│   ├── seed.js               初始数据
-│   ├── db/
-│   │   ├── bootstrap.sql     一次性建库建账号
-│   │   ├── schema.sql        表结构（启动时自动执行）
-│   │   ├── migrate.js        独立建表 / 自检脚本
-│   │   ├── config.js         连接参数
-│   │   ├── connection.js     连接池
-│   │   ├── schema.js         DDL 执行
-│   │   └── repository.js     表映射、全量加载、事务化落库
-│   ├── services/
-│   │   ├── pve.js            PVE API 客户端、传感器解析、增长趋势回归、演示模拟器
-│   │   ├── power.js          功耗模型、电量累计、电费报表、节能联动
-│   │   ├── news.js           RSS 抓取与去重
-│   │   ├── news-id.js        热点条目 ID 生成
-│   │   └── assistant.js      规则引擎 + 大模型代理
-│   ├── tools/
-│   │   └── hermes-probe.js   Hermes 接口清单探测器（npm run hermes:probe）
-│   └── data/db.json          旧版 JSON 数据（仅首次迁移时读取）
-└── src/
-    ├── components/           外壳、AI 助手、UI 基础件、书签公共件（首页与工具箱共用）
-    ├── lib/                  API 客户端、全局 store、监控上下文、主题、格式化
-    └── pages/                七个页面
-```
-
-## 设计说明
-
-默认是**浅色轻科技风**：浅蓝灰画布 + 纯白圆角卡片 + 柔和投影，靠色彩和留白分区，几乎不画线。整体走现代控制台的语言：浅色左轨 + 全宽顶栏 + 居中内容区。
-
-- **布局**：外壳全宽流式，各页内容区按信息密度取 1080 / 1440 / 1720 三档上限并居中；`#root` 用 `overflow-x: clip` 兜住偶发的超宽元素；
-- **配色**：浅蓝灰画布（`#F1F5FB`）+ 纯白卡片 + 近黑墨（`#1A1D23`），层次主要交给**柔和投影**而不是描边线。强调色是 `#2563EB`（白底 5.17:1 达标），选中态一律**浅蓝底 `#E8F1FF` + 蓝字**。四个强调色：科技蓝 / 冷青 / 铜琥珀 / 紫罗兰，`--accent-deep` / `--glow` / `--glow-soft` 都从 `--accent` 用 `color-mix` 派生，四个色两套主题通吃；
-- **圆角与投影**：卡片 16px、控件/内嵌块 10px、图标块 11px、药丸全圆。投影分三档——`--shadow-soft`（内嵌块）、`--shadow-panel`（卡片，带 3.5% 的极浅描边环做定形）、`--shadow-lift`（悬浮抬升）、`--shadow-pop`（浮层）；
-- **画布**：`--canvas` 是四团径向色斑（右上 / 左上 / 左下 / 中右）+ 一条落差极小的线性叠底。径向负责"彩色"，线性只负责上下有过渡；**刻意不用三停靠线性渐变**——中间那个停靠点会在页面上留下一道肉眼可见的坡度断层；
-- **色彩过渡（这一层是"素不素"的关键）**：全站不用纯色填充，凡是成片的面都带方向感——
-  · `--panel-sheen`：每张卡片叠一层「右上角柔光 + 上下渐变」，白卡不再是死平的白板；
-  · `{tileWash()}`：指标卡按图标色铺同色渐变洗染，一排指标卡之间就有了色彩过渡，而不是四块一样的白；
-  · `.rail` 的 `--rail-sheen`、进度条 `Meter`、折线图面积、图标块 `TILE` 全部走渐变而非实色。
-  实测「有彩色像素占比」从 5% 提到 **22%**。**洗染一律用 `color-mix(… , var(--panel))` 而不是混白色**——写死浅色渐变的话，深色主题下卡片会变成白底配浅色文字，直接不可读（这个坑踩过一次，已修）；
-- **左轨（`.rail`）**：**白色立柱**，靠一条极浅的右侧分隔 + 柔和影子与内容分开（不画实线边框）。导航选中态是 `.rail-active` 的**浅蓝渐变胶囊 + 蓝字**，不是深色块；页脚是一张「系统运行状态」软填充小卡。移动端底栏复用同一套令牌；
-- **彩色图标块（`TileIcon`）**：参考图的签名元素——每个指标配一个浅渐变方块（蓝/紫/橙/绿/青/红六套）+ 深色图标。`Stat` / `RatioStat` 用 `variant="card"`（页面指标行，白卡+投影）或 `variant="flat"`（嵌在卡片里，软填充，避免白卡套白卡）；
-- **字体**：Fira Sans 负责界面文字，Fira Code 负责所有指标数值（等宽 + 表格数字，刷新时不跳动），中文回落到系统字体；标题走紧负字距（display 级 −0.03em）；
-- **材质**：卡片 `.panel` = 圆角 + 投影、**无边框**；字段 `.field` 是软填充圆角框（聚焦时描边染蓝 + 3px 淡蓝光圈）；主按钮 `.btn-primary` 走 `accent → accent-deep` 渐变 + 柔和投影。顶栏与移动端底栏保留 `.glass` 模糊；
-- **页面头**：全站两种块级容器——`PageHead`（页面第一行：大号标题 + 一句话说明 + 页面级动作）和 `Section`（内容区块）；
-- **导航页首屏结构**（照参考图的节奏排）：问候 → **主卡 + 圆环** → **KPI 行** → **清单 + 三件事** → 常用网站 → 提示带。
-  · `GreetingBar`：按时段出的问候语 + 完整日期，右侧是采集状态胶囊，替代"页面名"这种冷开场；
-  · `FocusRow`：左边 `.focus-card`（渐变大卡）放**由数据推出来的**今日主题句——有待办就有"先清掉 N 件高优先级的事"，清空了就变成"去监控那边巡检一圈"，不是写死的文案；右边是一张 `Ring` 圆环卡（今日待办完成度）；
-  · `KpiRow`：四张带**底部进度条**的指标卡（进度条走内联圆角细条而不是压在卡底边上——压在边上会被 16px 圆角切掉，看着像脱离了卡片）；
-  · `TopThree`：从没结束的任务里按优先级取前三，对应参考图右栏的编号清单；
-  · `KpiRow` 是**四张独立的卡**（不是合并成一张），每张都带 1px 边框 + 一句文字说明 + 底部进度条，整组挂在「监控快照」小标题下，右上角有「查看全部」出口，点任意一张进监控数据页。独立 + 有框 + 有说明 = 边界清楚、数字有上下文；彩色图标块保留；
-  · 第四格是**预估月电费**。月电费没有天然上限可比，所以它的进度条画的是「本月已过时间」而不是金额占比，金额旁边有个能对上的参照；
-- **左轨分组标题**：`NAV` 每项带 `group`，渲染时只在分组切换处插一条小标题（工作台 / 监控与信息 / 系统）；
-- **任务**：参考 Tower 的清单式任务页——左侧清单栏按「项目」聚合未完成计数；工具条里是完成度进度条、搜索、时间（逾期／今天／7 天内）、优先级、负责人筛选与排序，右侧切列表／看板。列表按状态分组、可折叠，点复选框即完成（6 秒内可撤销），每组底部可直接回车连续录入；看板四列可拖拽换状态，同时保留「⋮ 移动到」菜单和详情抽屉里的状态切换作为非拖拽替代（WCAG 2.5.7）；
-- **深色底的对比度陷阱**：`.focus-card` 上的小字是**白色 + 透明度**，所以渐变的"最亮端"必须够深——起点定在 `#1F52D0` 时 90% 白仍有 5.68:1；起点一旦放到 `#3B7BFF` 就掉到 2.84:1，直接不达标。同理，卡上的柔光只压在右上角空白处且很弱，压到文字区会再吃掉一截对比度；
-- **可访问性**：浅色下正文与次要文字对比度均 ≥ 4.5:1（实测最低 5.0:1），主卡上的白字 5.68–6.61:1，全局保留可见焦点环，图标按钮都带 `aria-label`，尊重 `prefers-reduced-motion`（减弱动效时关闭数值滚动与入场动画）。浅色 / 深色两套主题全项 ≥ 4.77:1。
-
-## 接口速查
-
-```
-GET    /api/health                     服务 / MySQL 连通性与各表行数 / 配置状态
-GET    /api/bootstrap                  首屏数据（待办/任务/书签/知识库/设置）
-GET    /api/pve/overview?timeframe=    监控总览（含功耗与容量趋势）
-POST   /api/pve/eco                    切换节能模式
-POST   /api/pve/config/test            测试 PVE 连接
-GET    /api/hermes/seats               Hermes 工位/员工在线状态（公开接口，免凭证）
-POST   /api/hermes/test                测试 Hermes 连接（公开状态 + 登录凭证分层报错）
-GET    /api/news                       热点列表
-POST   /api/news/refresh               立即抓取
-CRUD   /api/todos /tickets /bookmarks /knowledge
-GET    /api/backup                     导出
-POST   /api/backup/restore|reset|save  导入 / 重置 / 落盘
-POST   /api/assistant                  助手问答（一次性返回）
-POST   /api/assistant/stream           助手问答（SSE 流式，界面走这条）
-GET    /api/assistant/messages         对话历史（最近 limit 条，时间正序）
-POST   /api/assistant/messages         追加一条对话记录
-DELETE /api/assistant/messages         清空对话历史
+server/          Express 服务
+  index.js       入口、落库闸门、静态托管、定时任务
+  routes.js      全部 REST 接口
+  store.js       数据层：内存镜像 + 写穿 MySQL
+  seed.js        示例数据
+  db/            建库建表、连接池、事务化落库
+  services/      PVE 客户端、功耗模型、热点抓取、AI 助手
+src/             React 前端
+  components/    外壳、AI 助手、UI 基础件
+  pages/         七个页面
+  lib/           API 客户端、全局 store、主题
+docs/            截图
 ```
 
 ## 已知边界
 
-- 演示模式下所有监控数值由时间驱动的确定性算法生成，用于把界面跑通，不代表真实硬件；
-- 磁盘 IO 与温度依赖 PVE 节点侧的 `lm-sensors` / SMART 配置，缺失时界面会明确标注「未探测到」而非补零；
-- **风扇转速不再采集、也不再展示**。`lm-sensors` 没装时 `/nodes/{node}/sensors` 一个风扇通道都返回不了，留着只会是一个永远「未探测到」的空模块。解析器里对 `fan*_input` 通道直接丢弃——注意这里**不能只是删掉 `classify()` 里那条 fan 分支**，否则 `CPU Fan` 这类标签会往下掉进温度规则被误判成温度，所以显式返回 `other` 丢弃；
-- 电量累计依赖服务持续运行，服务停机期间不补算（避免虚增）。
+- 演示模式下监控数值由时间驱动的确定性算法生成，用于跑通界面，**不代表真实硬件**；
+- 磁盘 IO 与温度依赖 PVE 节点侧的 `lm-sensors` / SMART 配置，缺失时界面标注「未探测到」而非补零；
+- 电量累计依赖服务持续运行，停机期间不补算；
+- **AI 热点的数据来自第三方公开接口 [AIHOT](https://aihot.news)**。个人自用没问题；对外商用或公开再分发前，请先确认其使用条款。
+
+## License
+
+[MIT](LICENSE)
