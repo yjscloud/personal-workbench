@@ -1,0 +1,1248 @@
+/* ══════════════════════════════════════════════════════════════════
+   字体 · IBM Plex 自托管
+
+   Sans 是可变字体：Google 对 400/500/600 返回的是同一个文件（实测 md5 相同），
+   所以三个 @font-face 共用一份，靠 font-weight 描述符挑字重；Mono 是三个独立文件。
+
+   原来在 index.html 里引 fonts.googleapis.com 的样式表：那是「渲染阻塞」
+   资源，浏览器要等它回来才肯画第一帧。国内出口一旦卡住或超时，
+   整站刷新就是白屏好几秒 —— 字体文件本身却几乎用不上（中文一直是
+   回落到 PingFang / 微软雅黑，Plex 只管西文与数字）。
+
+   现在把 woff2 收进仓库、@font-face 写死在主样式里：
+   · 零第三方请求，首屏不再被外部域名拖住；
+   · 和主 CSS 一起走 /assets/ 的强缓存（nginx 里 30 天 immutable）；
+   · 只留 latin / latin-ext 两个子集、400/500/600 三个字重（全站只用到这三个），
+     页面实际只会下载自己用到的那几片，约 45KB。
+   ══════════════════════════════════════════════════════════════════ */
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-mono-latin-ext-400.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-mono-latin-400.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 500;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-mono-latin-ext-500.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 500;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-mono-latin-500.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 600;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-mono-latin-ext-600.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 600;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-mono-latin-600.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-sans-latin-ext-400.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-sans-latin-400.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 500;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-sans-latin-ext-400.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 500;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-sans-latin-400.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 600;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-sans-latin-ext-400.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 600;
+  /* 换成 swap：字体没到之前先用系统字体把字画出来，不要让页面白等 */
+  font-display: swap;
+  src: url('./fonts/plex-sans-latin-400.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ══════════════════════════════════════════════════════════════════════
+   设计令牌 · 浅色科技风
+
+   表面策略（参考 vercel 的分析）：
+   中性冷白画布 + 纯白面板，结构全部交给 1px 发丝线，投影几乎不用；
+   近黑墨而不是纯黑，正文/次要/弱文字三级对比拉开；
+   装饰只由一条彩色 mesh 渐变负责（顶部光带、态势横幅光斑、主按钮）。
+   深色主题是同一套语义的夜间版本。
+
+   每个颜色有两份定义，必须保持一致：
+   · --x        实色，供内联样式 / SVG / 渐变使用
+   · --x-rgb    通道三元组，供 Tailwind 的透明度修饰（如 bg-panel/35）
+   ══════════════════════════════════════════════════════════════════════ */
+
+:root[data-theme='light'] {
+  /* Carbon 灰阶：页面就是白的，层级靠三级灰面 + 1px 发丝线，没有任何投影。
+     对白底对比度：text 17.5:1 / muted 8.0:1 / faint 5.3:1 */
+  --bg: #f1f5fb;
+  /* 四团径向色斑（都淡出到透明，因此不会有接缝）+ 一条落差极小的线性叠底。
+     径向负责"彩色"，线性只负责上下有过渡，所以中间停靠点不会留下坡度断层。 */
+  --canvas: radial-gradient(78% 56% at 94% -10%, #b7d0ff 0%, rgba(183, 208, 255, 0) 60%),
+    radial-gradient(70% 52% at 0% -6%, #c2d9ff 0%, rgba(194, 217, 255, 0) 62%),
+    radial-gradient(74% 54% at 26% 104%, #bdd4ff 0%, rgba(189, 212, 255, 0) 62%),
+    radial-gradient(60% 48% at 88% 62%, rgba(190, 214, 255, 0.85) 0%, rgba(190, 214, 255, 0) 74%),
+    linear-gradient(178deg, #e8f1fe 0%, #e2ebfa 100%);
+  --bg-2: #f1f6fe;
+  --bg-3: #e9eff9;
+  --panel: #ffffff;
+  --panel-2: #f5f8fd;
+  --line: #e7eef8;
+  --line-2: #eff4fb;
+  --line-strong: #1a1d23;
+  --text: #1a1d23;
+  --muted: #4e5969;
+  --faint: #5d6673;
+
+  --bg-rgb: 241 245 251;
+  --bg-2-rgb: 241 246 254;
+  --bg-3-rgb: 233 239 249;
+  --panel-rgb: 255 255 255;
+  --panel-2-rgb: 245 248 253;
+  --line-rgb: 231 238 248;
+  --line-2-rgb: 239 244 251;
+  --line-strong-rgb: 26 29 35;
+  --text-rgb: 26 29 35;
+  --muted-rgb: 78 89 105;
+  --faint-rgb: 93 102 115;
+
+  /* 四种强调色都是 Carbon 60 档的实色，不用渐变 */
+  --accent-azure: #2563eb;
+  --accent-azure-soft: #e8f1ff;
+  --accent-azure-rgb: 0 82 217;
+  --accent-azure-hover: #006eff;
+  --accent-azure-hover-rgb: 0 110 255;
+  --accent-signal: #007d79;
+  --accent-signal-soft: #e3f6f9;
+  --accent-signal-rgb: 0 125 121;
+  --accent-signal-hover: #006a7d;
+  --accent-signal-hover-rgb: 0 93 93;
+  --accent-copper: #a15c00;
+  --accent-copper-soft: #fdf1e0;
+  --accent-copper-rgb: 161 92 0;
+  --accent-copper-hover: #7a4400;
+  --accent-copper-hover-rgb: 122 68 0;
+  --accent-violet: #8a3ffc;
+  --accent-violet-soft: #f3ecff;
+  --accent-violet-rgb: 138 63 252;
+  --accent-violet-hover: #6929c4;
+  --accent-violet-hover-rgb: 105 41 196;
+
+  --accent-2: #007d79;
+  --accent-2-soft: #e3f6f9;
+  --accent-2-rgb: 0 125 121;
+
+  --ok: #198038;
+  --ok-soft: #defbe6;
+  --ok-rgb: 25 128 56;
+  --warn: #a15c00;
+  --warn-soft: #fdf1e0;
+  --warn-rgb: 161 92 0;
+  --crit: #da1e28;
+  --crit-soft: #fff1f1;
+  --crit-rgb: 218 30 40;
+
+  /* ── 指标域色：腾讯云那支蓝的三个明度档 ────────────────────────────
+     起点 #0052D9 就是腾讯云（TDesign）的品牌蓝，往下两档是它的浅位。
+     三个域共用一支色相、只用明度分档 —— 读数是"同一台机器的几个侧面"，
+     按色相拆成蓝/紫/铜/青再加琥珀，一页会有五六个颜色在抢注意力，
+     看着就是"花"；是哪一项靠标签和位置说就够了。
+
+     明度档只做三档、不做四档：再浅一档（#94bff7 那个区间）当 1.8px
+     曲线在白底上只有 2:1 出头的对比度，读不出来，留它等于留个坑。
+     网络和存储共用第二档 —— 两者从不出现在同一张图里。
+
+     刻意不复用 --accent-azure 那一组：那是「设置 → 强调色」的候选，
+     用户换一次强调色，整页域色跟着串位。这一组只为 components/ui.tsx
+     的 TONE_COLOR 服务。 */
+  --tone-cool-1: #0052d9;
+  --tone-cool-2: #2e73ee;
+  --tone-cool-3: #5f97f2;
+  --on-accent: #ffffff;
+  --on-accent-rgb: 255 255 255;
+  /* 压在 ok 实心块上的前景色。必须和 --on-accent 分开定义 ——
+     两支底色（强调蓝 / 成功绿）的明度不一样，深色主题下尤其明显：
+     那里的 --ok 是浅绿，配白字只有 2.4:1，得换成深墨 */
+  --on-ok: #ffffff;
+
+  /* 只有浮层允许投影，其余层次全交给发丝线 */
+  /* 左轨底色：实色，比内容区 canvas 沉半档、也更冷 ——
+     右缘一条发丝线把它和内容分开（见 .rail）。
+     浅色下最怕"白玻璃压白底"，所以这块底必须比画布明显沉一档，
+     否则导航区和内容区会糊成一片。浓度条已按 --faint(12px) 的 4.5:1 卡过。 */
+  --rail-bg: #dceafa;
+  /* 右缘那条发丝线单配，不复用 --line-strong：后者在浅色下是正文黑
+     （#1a1d23），当分隔线会画出一道黑边。 */
+  --rail-line: rgb(20 40 80 / 0.12);
+
+  /* 按钮按下时的深度内阴影：上方压深、底部留一道亮边。
+     光从上方来，底边那道白才让凹陷读起来是"压进去"而不是"脏了一块"。 */
+  --press-inset: inset 0 2px 4px rgb(15 30 60 / 0.26), inset 0 8px 12px -8px rgb(15 30 60 / 0.34),
+    inset 0 -1px 0 rgb(255 255 255 / 0.3);
+
+  /* 背景照片上那层纱的颜色。浅色主题用白纱提亮、压住照片细节，
+     换成深色纱会让整个浅色界面瞬间变脏。深色主题反过来。 */
+  --bg-scrim-rgb: 255 255 255;
+  --shadow-soft: 0 1px 2px rgba(20, 40, 80, 0.04), 0 4px 14px -4px rgba(20, 40, 80, 0.07);
+  --shadow-panel: 0 0 0 1px rgba(20, 40, 80, 0.035), 0 1px 2px rgba(20, 40, 80, 0.04),
+    0 8px 24px -8px rgba(20, 40, 80, 0.1);
+  --shadow-lift: 0 0 0 1px rgba(20, 40, 80, 0.05), 0 2px 4px rgba(20, 40, 80, 0.05),
+    0 16px 36px -12px rgba(20, 40, 80, 0.16);
+  --shadow-pop: 0 12px 32px -8px rgba(20, 40, 80, 0.18), 0 2px 6px rgba(20, 40, 80, 0.06);
+  --scrim: rgba(22, 22, 22, 0.38);
+  --glass: rgba(255, 255, 255, 0.92);
+  --panel-hi: transparent;
+
+  /* Markdown 代码块：深色面。刻意不跟随主题 —— 「命令从正文里跳出来」
+     这件事深浅两套主题下都成立，同一个深底省掉一整套适配。
+     取近黑（#1c1c1e）而不是纯黑：纯黑在浅色页面里像一块洞，
+     近黑才读成"一个面"。这两个变量只给 .prose-kb 用。 */
+  --code-bg: #1c1c1e;
+  --code-ink: #e9ecf2;
+
+  /* 深色焦点面：只留给首页横幅，其余页面不出现 */
+}
+
+:root[data-theme='dark'] {
+  /* 深蓝控制台：底色是深蓝而不是中性黑，和浅色页面里的深色模块共用同一套取值 */
+  --bg: #0b2247;
+  --canvas: radial-gradient(78% 56% at 94% -10%, #1b3f7a 0%, rgba(27, 63, 122, 0) 62%),
+    radial-gradient(84% 60% at 4% 104%, #152f63 0%, rgba(21, 47, 99, 0) 64%),
+    linear-gradient(180deg, #0d2750 0%, #091c3d 100%);
+  --bg-2: #10305e;
+  --bg-3: #1a4178;
+  --panel: #16386b;
+  --panel-2: #0e2851;
+  --line: #24508c;
+  --line-2: #1b3f75;
+  --line-strong: #5b8ed8;
+  --text: #eaf1fb;
+  --muted: #b3c6e2;
+  --faint: #8fa8cc;
+
+  --bg-rgb: 11 34 71;
+  --bg-2-rgb: 16 48 94;
+  --bg-3-rgb: 26 65 120;
+  --panel-rgb: 22 56 107;
+  --panel-2-rgb: 14 40 81;
+  --line-rgb: 36 80 140;
+  --line-2-rgb: 27 63 117;
+  --line-strong-rgb: 91 142 216;
+  --text-rgb: 234 241 251;
+  --muted-rgb: 179 198 226;
+  --faint-rgb: 143 168 204;
+
+  --accent-azure: #8ab6ff;
+  --accent-azure-soft: rgba(138, 182, 255, 0.1);
+  --accent-azure-rgb: 138 182 255;
+  --accent-azure-hover: #a8caff;
+  --accent-azure-hover-rgb: 168 202 255;
+  --accent-signal: #3ddbd9;
+  --accent-signal-soft: rgba(61, 219, 217, 0.15);
+  --accent-signal-rgb: 61 219 217;
+  --accent-signal-hover: #08bdba;
+  --accent-signal-hover-rgb: 8 189 186;
+  --accent-copper: #f1c21b;
+  --accent-copper-soft: rgba(241, 194, 27, 0.15);
+  --accent-copper-rgb: 241 194 27;
+  --accent-copper-hover: #d2a106;
+  --accent-copper-hover-rgb: 210 161 6;
+  --accent-violet: #be95ff;
+  --accent-violet-soft: rgba(190, 149, 255, 0.15);
+  --accent-violet-rgb: 190 149 255;
+  --accent-violet-hover: #d4bbff;
+  --accent-violet-hover-rgb: 212 187 255;
+
+  --accent-2: #3ddbd9;
+  --accent-2-soft: rgba(61, 219, 217, 0.14);
+  --accent-2-rgb: 61 219 217;
+
+  --ok: #42be65;
+  --ok-soft: rgba(66, 190, 101, 0.16);
+  --ok-rgb: 66 190 101;
+  --warn: #f1c21b;
+  --warn-soft: rgba(241, 194, 27, 0.16);
+  --warn-rgb: 241 194 27;
+  --crit: #ff8389;
+  --crit-soft: rgba(255, 131, 137, 0.16);
+  --crit-rgb: 255 131 137;
+
+  /* 深色下的同一族：底是深藏蓝，所以三档整体提到高亮区 */
+  --tone-cool-1: #4c8ff5;
+  --tone-cool-2: #6ba6f7;
+  --tone-cool-3: #94c2fa;
+  --on-accent: #061224;
+  --on-accent-rgb: 6 18 36;
+  --on-ok: #061224;
+
+  /* 左轨同样是实色。取值刻意落在"页面底色 → 卡片"之间：
+     直接写 #16386b 会恰好等于 --panel（深色下卡片就是这个色），
+     左轨会读成一张卡片而不是一列导航。原来的半透明底压出来正是这一档。 */
+  --rail-bg: #12315c;
+  --rail-line: rgb(255 255 255 / 0.09);
+
+  /* 深色下内阴影得用纯黑才压得住，底边亮边也要收——不然会发灰 */
+  --press-inset: inset 0 2px 4px rgb(0 0 0 / 0.45), inset 0 8px 12px -8px rgb(0 0 0 / 0.55),
+    inset 0 -1px 0 rgb(255 255 255 / 0.1);
+
+  /* 深色主题用底色的深蓝压，而不是纯黑：纯黑会把照片褪成灰 */
+  --bg-scrim-rgb: 6 16 34;
+  --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 14px -4px rgba(0, 0, 0, 0.4);
+  --shadow-panel: 0 0 0 1px rgba(255, 255, 255, 0.05), 0 1px 2px rgba(0, 0, 0, 0.3),
+    0 8px 24px -8px rgba(0, 0, 0, 0.5);
+  --shadow-lift: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 2px 4px rgba(0, 0, 0, 0.35),
+    0 16px 36px -12px rgba(0, 0, 0, 0.6);
+  --shadow-pop: 0 12px 32px -8px rgba(0, 0, 0, 0.7), 0 2px 6px rgba(0, 0, 0, 0.4);
+  --scrim: rgba(2, 8, 18, 0.66);
+  --glass: rgba(12, 31, 61, 0.92);
+  --panel-hi: transparent;
+
+  /* 代码块：深色下画布本身就是深蓝，所以这里要比画布再沉一档才分得出来 ——
+     浅色里"压深"是相对白纸，深色里"压深"是相对 #0b2247。 */
+  --code-bg: #061831;
+  --code-ink: #e6eefa;
+}
+
+/* 强调色（写在主题之后，保证覆盖默认；默认 azure）
+   四种强调色都从 --accent 派生下面这一支，不用各写一份：
+   · --accent-deep  按钮渐变的第二个色停（比 accent 深一档）
+   （这里原来还有 --glow / --glow-soft 两支"强调辉光"，已撤掉。
+     它们唯一的用途是给主按钮、应用标记和左轨选中刻度各挂一圈彩色的雾，
+     而"不要霓虹 / 外发光"是条明确的准则。需要"抬起来"就上中性投影，
+     颜色留给元素本身。） */
+:root[data-theme][data-accent='azure'],
+:root[data-theme]:not([data-accent]) {
+  --accent: var(--accent-azure);
+  --accent-soft: var(--accent-azure-soft);
+  --accent-rgb: var(--accent-azure-rgb);
+  --accent-hover: var(--accent-azure-hover);
+  --accent-hover-rgb: var(--accent-azure-hover-rgb);
+}
+:root[data-theme][data-accent='signal'] {
+  --accent: var(--accent-signal);
+  --accent-soft: var(--accent-signal-soft);
+  --accent-rgb: var(--accent-signal-rgb);
+  --accent-hover: var(--accent-signal-hover);
+  --accent-hover-rgb: var(--accent-signal-hover-rgb);
+}
+:root[data-theme][data-accent='copper'] {
+  --accent: var(--accent-copper);
+  --accent-soft: var(--accent-copper-soft);
+  --accent-rgb: var(--accent-copper-rgb);
+  --accent-hover: var(--accent-copper-hover);
+  --accent-hover-rgb: var(--accent-copper-hover-rgb);
+}
+:root[data-theme][data-accent='violet'] {
+  --accent: var(--accent-violet);
+  --accent-soft: var(--accent-violet-soft);
+  --accent-rgb: var(--accent-violet-rgb);
+  --accent-hover: var(--accent-violet-hover);
+  --accent-hover-rgb: var(--accent-violet-hover-rgb);
+}
+
+:root[data-theme] {
+  --accent-deep: color-mix(in srgb, var(--accent) 84%, #0a1a3c);
+
+  /* ── 按压物理令牌（motion-consistency：全站按钮共用这一套节奏）──
+     按下要「即刻」，所以短；回弹是「落位」，才交给弹簧。
+     两者的差是刻意的：按下必须跟手，回弹需要时间才读得出弹性。 */
+  --press-down: 110ms;
+  --press-release: 380ms;
+  /* 按下的减速曲线（easing：抵达用减速） */
+  --press-ease-down: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@layer base {
+  * {
+    border-color: var(--line);
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--bg);
+    background-image: var(--canvas);
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+    background-size: cover;
+    color: var(--text);
+    font-family: 'IBM Plex Sans', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* ── 背景照片 ──────────────────────────────────────────────────────
+     铺在 body 自己的 canvas 之上、#root（relative z-10）之下，所以它只从
+     卡片之间的空隙透出来，不会盖住任何内容。
+
+     只有 data-photo='on' 时才生成这一层 —— 不开就是零开销，连伪元素都没有。
+
+     两点必须做对：
+       1. 遮罩不是装饰。照片千差万别，没有这层主题色的纱，浅色文字压在
+          深色照片上会直接不可读。纱的颜色跟着主题走（见 --bg-scrim-rgb）。
+       2. 先放大再虚化。blur 会把边缘一起糊掉、四周露出底色，scale 补偿掉
+          这一圈。放大比例要略大于 blur 半径，24px 上限下 1.06 够用。 */
+  :root[data-photo='on'] body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background-image: linear-gradient(var(--bg-scrim), var(--bg-scrim)), var(--bg-photo);
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    transform: scale(1.06);
+    filter: blur(var(--bg-blur, 0px));
+  }
+
+  /* 防止单个宽元素（长表格 / 长字符串）把整页撑出横向滚动条；
+     用 clip 而非 hidden，避免生成新的滚动容器而破坏 sticky */
+  #root {
+    overflow-x: clip;
+  }
+
+  ::selection {
+    background: var(--accent);
+    color: var(--on-accent);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* 全站按钮：给按压内阴影（::after 覆盖层）留一个定位上下文。
+     刻意只写在 base 层——Week.tsx 里有个
+     <button class="scrim absolute inset-0"> 的全屏遮罩按钮，
+     若把这条写在不分层的位置，会把它的 absolute 顶掉、直接搞坏弹窗。 */
+  button {
+    position: relative;
+  }
+
+  /* 标题走紧负字距（display 用 -0.03em，小标题略松），是"工程精度"最直接的信号 */
+  /* Carbon 式标题：一套字重，层级靠字号与字距拉开 */
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.3;
+  }
+
+  input,
+  textarea,
+  select,
+  button {
+    font: inherit;
+    color: inherit;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--faint);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--line);
+    border-radius: 999px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--faint);
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  /* 指标数值：等宽 + 表格数字，像仪表读数，刷新时不跳动 */
+  .num {
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
+  }
+
+  /* ── 面板：白底 + 1px 发丝线 + 16px 圆角。层次全部交给线 ──
+     这里原先还挂着 --panel-sheen：一层从右上角打下来的径向光斑。
+     它不表达任何信息，唯一作用是"让白卡片看着不死平" —— 而一张白纸
+     本来就不需要"不平"。全站 50 张卡各叠一层，页面就有了一种洗不掉的
+     "生成感"。撤掉之后卡片之间靠 1px 线、间距和字号差分层，反而更清楚。 */
+  .panel {
+    background-color: var(--panel);
+    border-radius: 1rem;
+    box-shadow: var(--shadow-panel);
+  }
+
+  /* 可交互面板：悬浮只把面沉一档、描边转成强调色，不做位移也不发光。
+     这里原先是一条**不会生效**的规则 —— `:hover { border-color: var(--line-strong) }`：
+     .panel 从来没有 border-width，光改 border-color 什么都看不见；
+     而 .panel 那圈 1px 其实是 --shadow-panel 的第一层投影，也不跟着 border-color 走。
+     于是"可交互面板"悬停时毫无反应。现在改成真看得见的：面沉一档 + 一圈强调色细边。
+     为了投影能平滑过渡，基础态先把那圈写成透明的、且层数相同 ——
+     否则 3 层 → 4 层的 box-shadow 是跳变而不是过渡。
+     用它就要一起带上 .panel（它的 box-shadow 会覆盖 .panel 的那条）。 */
+  .panel-hover {
+    box-shadow: 0 0 0 1px transparent, var(--shadow-panel);
+    transition: background-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .panel-hover:hover {
+    background-color: var(--panel-2);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent), var(--shadow-panel);
+  }
+
+  /* 玻璃层：只给顶栏与浮层用，透明度接近实色，避免糊成一片 */
+  .glass {
+    background: var(--glass);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+
+  .scrim {
+    background: var(--scrim);
+  }
+
+  /* ── 主操作按钮：实色强调色，方角 ──
+     投影改用中性色。原来用的是强调色的 34% 透明（--glow），
+     效果是按钮底下一直挂着一圈蓝雾 —— 那就是"会发光的按钮"。
+     抬起感由明度和中性投影给就够了，颜色留给按钮本身。 */
+  .btn-primary {
+    background-image: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
+    border-color: transparent;
+    color: var(--on-accent);
+    box-shadow: 0 1px 2px rgba(20, 40, 80, 0.12), 0 6px 16px -6px rgba(20, 40, 80, 0.24);
+  }
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.06);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background-color: var(--accent-hover);
+    border-color: var(--accent-hover);
+  }
+  .btn-primary:active:not(:disabled) {
+    filter: brightness(0.92);
+  }
+
+  /* 强调分隔线：1px 实色，不再是渐变光带 */
+  .accent-rail {
+    background-color: var(--accent);
+  }
+
+  /* 隐藏滚动条但保留滚动能力（看板横向浏览用） */
+  .scrollbar-none {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+
+  .text-gradient {
+    color: var(--accent);
+  }
+
+  /* ── 深色焦点面（首页横幅）── */
+
+  /* ── 表单字段：Carbon 的填色 + 底部一条线的样式 ── */
+  .field {
+    background: var(--bg-2);
+    border: 1px solid transparent;
+    border-radius: 0.625rem;
+    padding: 0.5rem 0.75rem;
+    width: 100%;
+    transition:
+      background-color 0.15s ease,
+      border-color 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+  .field:hover {
+    background: var(--bg-3);
+  }
+  /* 用 :focus-visible 而不是 :focus。输入框本来就是"键盘可交互"控件，
+     文本类字段在浏览器里即便用鼠标点进来也仍然匹配 :focus-visible，
+     所以观感不会变差；但 select 这类点开即完成交互的控件，
+     不会再被鼠标点出一圈键盘焦点环。
+     下面那圈 box-shadow 就是上面 outline:none 的替代，两者缺一不可。 */
+  .field:focus-visible {
+    outline: none;
+    background: var(--panel);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
+  /* ── 深色模块 ──────────────────────────────────────────────────────
+     给浅色页面里的容器加一个类，子树内重新绑定同一批语义令牌，
+     内部的卡片、徽章、表格、输入框、图表不用改一行代码就整体变深色。
+     按新规范它只应该出现在「每页一处」的位置。 */
+
+  /* 深色面里的强调色要换成深底可读的那一档 */
+  /* 主卡：图里那块渐变大卡。仍是冷蓝，只是把渐变、辉光和柔光收在一处当"焦点面" */
+  .focus-card {
+    /* 渐变的"最亮端"必须够深：卡上有一堆 75% 透明的白色小字，
+       起点定在 #1F52D0 时，75% 白对最亮端仍有 4.72:1；
+       起点若放到 #3B7BFF 就只有 2.84:1，直接不达标 */
+    background-image: linear-gradient(135deg, #1f52d0 0%, #1a45b4 52%, #122c78 100%);
+    color: #ffffff;
+    box-shadow: 0 20px 44px -20px rgba(37, 99, 235, 0.5), var(--shadow-soft);
+  }
+  /* 右上角一团柔光，避免大色块死平 */
+  .focus-card::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    /* 柔光只压在右上角、且很弱：它会把底色提亮，压到文字区会再吃掉一截对比度 */
+    background-image: radial-gradient(42% 68% at 97% 5%, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0) 62%);
+  }
+
+  /* ── 浅蓝焦点面：.focus-card.sky ────────────────────────────────────
+     用途还是"这块和周围的白卡不是一张纸"，但**不着深色**。
+     深色焦点面在一块的时候是有效的（一眼看出主次），可监控页顶上的
+     功耗块里塞着读数、模式按钮和一行元信息，深色面一压上去，整页的
+     视觉重量就全吃在上半屏，下面那些真正要看的读数反而没人看了。
+     浅蓝面保留了"这是一块不同的面"，重量却和周围的白卡同级。
+     蓝取腾讯云 #0052D9 的浅位，和页面里的域色同源，整页只有一支蓝。
+
+     ── 这一块只留一条坡度（上一版叠了三层，过渡是断的）──────────────
+     卡片很宽很扁（约 1600×145）。色差一旦沿**长边**走，8 位色深下每一档
+     要占 60 多像素宽，眼睛就会看到一条条横向色带 —— 这就是"过渡不自然"
+     的直接来源。所以渐变方向必须落在**短边**上（上下）：同样的色差被压进
+     145px，每档只占几个像素，坡度才连得起来。
+     另外两层装饰也一并撤了，它们各自都会画出一组等值线：
+     · 30px 的 1px 网格 —— 非整数缩放下列会断成虚线，再被径向遮罩一段段
+       吃掉，右下角于是留下阶梯状的残迹；
+     · 右上角那团 0.9 的白光 —— 在浅蓝底上它是一块边界可辨的白斑，
+       自身的等值线和底色的等值线交在一起，看着反而更脏。
+     一个面只需要一条坡度，多余的都要拿掉。
+     深色主题下不能再用浅蓝（会在深页面里戳出一个亮洞），换同色相的深蓝。 */
+  .focus-card.sky {
+    background-image: linear-gradient(180deg, #eef4fd 0%, #d8e6fa 100%);
+    color: var(--text);
+    /* 上缘一道白内高光：浅色大色块没有它就和页面底色糊在一起，
+       读不出"这是一块被光照到的面" */
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.9),
+      0 12px 30px -22px rgb(0 82 217 / 0.45),
+      var(--shadow-soft);
+  }
+  /* 关掉从 .focus-card 继承来的右上角柔光：那团白光是给深色面提亮暗部用的，
+     浅蓝面上它只会多画一圈等值线出来。一个面一条坡度，够了。 */
+  .focus-card.sky::after {
+    content: none;
+  }
+  :root[data-theme='dark'] .focus-card.sky {
+    background-image: linear-gradient(180deg, #1e4d8b 0%, #123055 100%);
+    color: #ffffff;
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.12),
+      0 16px 36px -24px rgb(0 0 0 / 0.6),
+      var(--shadow-soft);
+  }
+
+  /* 左轨：实色立柱 + 右缘一道发丝线。
+     这里原来是磨砂玻璃（backdrop-filter: blur(24px) + 三道 1px 叠出的玻璃断面）。
+     磨砂玻璃是"展示型"材质，作用是让底下的东西若隐若现；而左轨是导航，
+     它只需要"和内容分开"这一件事 —— 一块实色加一条线说得比模糊更清楚，
+     顺带省掉一次全高合成，也不必再为玻璃边缘养四支描边 token。 */
+  .rail {
+    background-color: var(--rail-bg);
+    box-shadow: inset -1px 0 0 var(--rail-line);
+  }
+
+  /* ── 导航滑动高亮块 ──────────────────────────────────────────────────
+     位移和缩放全在 transform 上（见 components/SlideHighlight.tsx 的 FLIP），
+     这里只负责节奏：一次约 7% 的单次过冲弹簧，读起来是"弹到位"而不是"滑到位"。
+
+     那条 linear() 是二阶弹簧阶跃响应的数值解（ζ=0.65、ωn=15rad/s，采样 0~500ms，
+     末点归一化到 1）——和按钮按压用的是同一套做法。之所以不写
+     cubic-bezier：三次贝塞尔只能过一次冲，过冲幅度和回落速度是绑死的；
+     弹簧曲线这两段可以各自取值，尾巴收得更干净。
+
+     浏览器不认 linear() 时整条声明被丢弃，回落到上面那条 cubic-bezier：
+     只是少一下回弹，不会失效。 */
+  .slide-highlight {
+    z-index: 0;
+    will-change: transform;
+    transition:
+      transform 500ms cubic-bezier(0.34, 1.4, 0.5, 1),
+      opacity 120ms linear;
+    transition-timing-function: linear(
+        0, 0.0395, 0.1375, 0.2678, 0.4105, 0.5508, 0.6793, 0.7902, 0.881, 0.9515, 1.003, 1.0379,
+        1.0589, 1.069, 1.0709, 1.0672, 1.0599, 1.0507, 1.041, 1.0315, 1.023, 1.0158, 1.0099, 1.0054,
+        1.0021, 1
+      ),
+      linear;
+  }
+
+  /* ── 左轨选中态（已撤）──────────────────────────────────────────────
+     这里原来有一条 `.rail-active`：浅蓝渐变胶囊 + 同色内描边，最早由每个
+     导航项各画一层，后来改成穿在滑动高亮块上。两种做法的"当前项"都靠一块
+     底色说。现在侧栏不再画那块底 —— 当前项由强调色字重 + 左缘一道刻度条
+     标出（见 AppShell 的 NavLink），侧栏里唯一一块实心底留给底部的收口卡。
+     类名随之删掉：留着就是一条没人穿的死样式。 */
+
+  /* ── 焦点卡：顶边一道 accent 线（已撤） ──────────────────────────────
+     它曾用来给首页「今日待办」「本周最重要的三件事」两张卡标一个"这块要紧"。
+     撤掉是因为它并没有在区分重要与不重要：这两张本来就是页面最上面的一排，
+     位置已经把它们和下面的卡分开了；而那道线在整页里只出现在这两张上，
+     横着看过去是"别的卡都没有顶边、就它俩有"，读起来更像这两张排错了，
+     不像"这两张更要紧"。要强调就靠顺序和标题层级，不靠一道装饰线。
+     .card-focus 与 Card 的 focus 属性一并删除（全站只有那两处用过）。 */
+
+  /* ── 工具箱：柔彩画布 + 糖果色磁贴 ─────────────────────────────────
+     这一页刻意偏离全站那套「白面板 + 发丝线」的骨架。它的用途是"找入口"，
+     照参考图做成一幅柔彩波浪底 + 一排排半透明糖果色方块：扫读时靠色块
+     而不是边框来分区，一屏能认下几十个入口。
+
+     三个刻意的选择：
+     1. 画布用多组径向渐变叠出来（不用位图）：任意宽高都不会拉伸变形，
+        也少一次网络请求；底部那几条"浪脊"就是几团压扁的椭圆。
+     2. 磁贴是半透明的，所以画布必须够浅 —— 深色主题另配一套深蓝画布，
+        磁贴换成同色系的低透明度，正文继续走 --text 才守得住对比度。
+     3. 磁贴"上缘一道白"用 inset 阴影而不是边框：边框会跟糖果色打架，
+        而内高光读起来像塑料块的受光面，正是参考图里的质感。 */
+  .tb-canvas {
+    background-color: #e9f3fb;
+    background-image:
+      /* 顶部一层白纱：标题和工具条压在画布最亮处，先压白再叠色 */
+      radial-gradient(120% 17% at 50% -3%, rgb(255 255 255 / 0.94) 0%, rgb(255 255 255 / 0) 70%),
+      /* 左下那片奶油色滩涂，是整幅画里最暖的一块 */
+      radial-gradient(58% 20% at 2% 94%, rgb(250 240 194 / 0.96) 0%, rgb(250 240 194 / 0) 62%),
+      radial-gradient(38% 12% at 30% 82%, rgb(243 234 178 / 0.86) 0%, rgb(243 234 178 / 0) 70%),
+      /* 中段一条青绿浪脊：卡与卡的缝隙里主要看到它 */
+      radial-gradient(50% 13% at 56% 80%, rgb(140 203 194 / 0.88) 0%, rgb(140 203 194 / 0) 66%),
+      /* 右下压深一层的蓝浪 */
+      radial-gradient(64% 17% at 101% 88%, rgb(116 175 211 / 0.92) 0%, rgb(116 175 211 / 0) 62%),
+      radial-gradient(54% 15% at 86% 68%, rgb(146 194 228 / 0.72) 0%, rgb(146 194 228 / 0) 70%),
+      /* 上半段两片更淡的蓝，撑出"天"的那一段 */
+      radial-gradient(62% 17% at 14% 58%, rgb(142 191 226 / 0.5) 0%, rgb(142 191 226 / 0) 72%),
+      radial-gradient(76% 20% at 78% 46%, rgb(176 215 234 / 0.46) 0%, rgb(176 215 234 / 0) 74%),
+      linear-gradient(176deg, #e8f4fd 0%, #dcebf8 32%, #c9e2f3 58%, #b2d2e9 82%, #9cc3dd 100%);
+  }
+
+  :root[data-theme='dark'] .tb-canvas {
+    background-color: #071528;
+    background-image:
+      radial-gradient(120% 17% at 50% -3%, rgb(26 56 98 / 0.9) 0%, rgb(26 56 98 / 0) 70%),
+      radial-gradient(58% 20% at 2% 94%, rgb(168 148 64 / 0.34) 0%, rgb(168 148 64 / 0) 62%),
+      radial-gradient(38% 12% at 30% 82%, rgb(150 136 70 / 0.3) 0%, rgb(150 136 70 / 0) 70%),
+      radial-gradient(50% 13% at 56% 80%, rgb(44 148 138 / 0.36) 0%, rgb(44 148 138 / 0) 66%),
+      radial-gradient(64% 17% at 101% 88%, rgb(38 98 156 / 0.48) 0%, rgb(38 98 156 / 0) 62%),
+      radial-gradient(54% 15% at 86% 68%, rgb(34 84 138 / 0.4) 0%, rgb(34 84 138 / 0) 70%),
+      radial-gradient(62% 17% at 14% 58%, rgb(30 72 126 / 0.34) 0%, rgb(30 72 126 / 0) 72%),
+      linear-gradient(176deg, #0c2141 0%, #0a1c36 40%, #071528 100%);
+  }
+
+  /* 用户自己设了背景照片时，这一页不要再压自己的画布。
+     照片铺在 body::before 上、并且已经按用户设的浓度盖过一层纱了；
+     这里再叠一层 88%~94% 的白纱，整张照片就等于没设（实测就是这个反馈）。
+     直接摘掉画布，照片与其它页面完全一致。
+     必须写在上面两条画布规则之后 —— 选择器权重相同，靠源码顺序决胜。 */
+  :root[data-photo='on'] .tb-canvas {
+    background-color: transparent;
+    background-image: none;
+  }
+
+  /* 糖果色板：低饱和 + 半透明的斜向渐变，参考图里就是这种"糖纸"方块。
+     半透明是刻意的 —— 底下的浪脊会从磁贴里透出一点，整面墙才不像
+     贴了一堆不干胶。色相按 id 稳定散列分配（见 Toolbox.tsx 的 tintOf）。 */
+  .tb-tint-mint {
+    --tb-a: rgb(211 241 224 / 0.95);
+    --tb-b: rgb(176 226 199 / 0.9);
+  }
+  .tb-tint-sky {
+    --tb-a: rgb(208 234 251 / 0.95);
+    --tb-b: rgb(166 211 244 / 0.9);
+  }
+  .tb-tint-butter {
+    --tb-a: rgb(252 244 203 / 0.96);
+    --tb-b: rgb(245 228 163 / 0.92);
+  }
+  .tb-tint-peach {
+    --tb-a: rgb(252 227 205 / 0.96);
+    --tb-b: rgb(246 200 165 / 0.92);
+  }
+  .tb-tint-lilac {
+    --tb-a: rgb(229 225 251 / 0.95);
+    --tb-b: rgb(202 195 244 / 0.9);
+  }
+  .tb-tint-rose {
+    --tb-a: rgb(251 224 235 / 0.95);
+    --tb-b: rgb(243 193 213 / 0.9);
+  }
+  .tb-tint-ice {
+    --tb-a: rgb(234 242 249 / 0.96);
+    --tb-b: rgb(204 225 240 / 0.9);
+  }
+
+  :root[data-theme='dark'] .tb-tint-mint {
+    --tb-a: rgb(86 200 150 / 0.26);
+    --tb-b: rgb(86 200 150 / 0.13);
+  }
+  :root[data-theme='dark'] .tb-tint-sky {
+    --tb-a: rgb(100 172 240 / 0.28);
+    --tb-b: rgb(100 172 240 / 0.14);
+  }
+  :root[data-theme='dark'] .tb-tint-butter {
+    --tb-a: rgb(232 198 84 / 0.24);
+    --tb-b: rgb(232 198 84 / 0.12);
+  }
+  :root[data-theme='dark'] .tb-tint-peach {
+    --tb-a: rgb(238 152 96 / 0.25);
+    --tb-b: rgb(238 152 96 / 0.12);
+  }
+  :root[data-theme='dark'] .tb-tint-lilac {
+    --tb-a: rgb(160 140 245 / 0.28);
+    --tb-b: rgb(160 140 245 / 0.14);
+  }
+  :root[data-theme='dark'] .tb-tint-rose {
+    --tb-a: rgb(238 126 168 / 0.25);
+    --tb-b: rgb(238 126 168 / 0.12);
+  }
+  :root[data-theme='dark'] .tb-tint-ice {
+    --tb-a: rgb(150 190 225 / 0.2);
+    --tb-b: rgb(150 190 225 / 0.1);
+  }
+
+  /* 站点品牌色：前端只把色相和饱和度送进来（--tb-h / --tb-s），
+     明度由这里按主题给 —— 浅色 92% / 81%，深色 25% / 15%。
+     这样浅色和深色两套仍然共用同一条色带，卡片墙不会因为换主题就散架；
+     要是让 JS 直接把两个颜色算好写死，就得在 JS 里判断当前是什么主题。 */
+  .tb-card[data-brand] {
+    --tb-a: hsl(var(--tb-h) var(--tb-s) 92%);
+    --tb-b: hsl(var(--tb-h) calc(var(--tb-s) + 6%) 81%);
+  }
+  :root[data-theme='dark'] .tb-card[data-brand] {
+    --tb-a: hsl(var(--tb-h) var(--tb-s) 25%);
+    --tb-b: hsl(var(--tb-h) var(--tb-s) 15%);
+  }
+
+  .tb-card {
+    background-image: linear-gradient(135deg, var(--tb-a) 0%, var(--tb-b) 100%);
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.7),
+      0 1px 2px rgb(20 40 80 / 0.05),
+      0 6px 14px -8px rgb(20 40 80 / 0.25);
+    transition:
+      transform 0.2s cubic-bezier(0.22, 1, 0.36, 1),
+      box-shadow 0.2s ease,
+      filter 0.2s ease;
+  }
+  /* 悬浮只让这一格"更浓"，不位移。
+     原来 hover 会把它抬起 2px 并放大投影 —— 一屏几十个糖果色方块，
+     每划过一颗就跳一下，滚动时像一路弹珠；而磁贴的用途是"找入口"，
+     动起来反而干扰扫读。饱和度和明度变化已经足够说明"手指在这儿"。
+     按下仍然保留压缩：那是"确实点到了"的反馈，属于该有的手感。 */
+  .tb-card:hover {
+    filter: saturate(1.16) brightness(1.03);
+  }
+  .tb-card:active {
+    transform: scale(0.985);
+  }
+
+  :root[data-theme='dark'] .tb-card {
+    box-shadow:
+      inset 0 1px 0 rgb(255 255 255 / 0.09),
+      0 1px 2px rgb(0 0 0 / 0.35),
+      0 6px 14px -8px rgb(0 0 0 / 0.5);
+  }
+  /* 深色下不再单配 hover 投影：浅色那边已经取消"悬浮放大投影"，
+     这里跟着去掉，两套主题的悬浮行为保持一致。 */
+
+  /* favicon 底下那团白雾：多数站点图标是透明底，直接压在糖果色上会发灰。
+     用径向渐变而不是实心方块 —— 实心方块会把这格变成"小图挤在大框里"，
+     一屏几十个看下来全是空框。 */
+  .tb-icon {
+    background-image: radial-gradient(58% 58% at 50% 48%, rgb(255 255 255 / 0.9) 0%, rgb(255 255 255 / 0) 100%);
+  }
+  :root[data-theme='dark'] .tb-icon {
+    background-image: radial-gradient(58% 58% at 50% 48%, rgb(255 255 255 / 0.14) 0%, rgb(255 255 255 / 0) 100%);
+  }
+
+  /* ── Markdown 正文（知识库 / AI 助手气泡）──────────────────────────
+     刻意**不引 @tailwindcss/typography**：它自带一整套字号与灰阶
+     （gray-700 之类），套进这套语义令牌里会变成"卡片中塞了别人的排版"。
+     这里全部引用现有变量，颜色和主题自动跟随。
+
+     结构上借 Mintlify 文档站的判据（代码块走深色面、行内代码走浅底 +
+     4px 圆角、标题越靠上越紧字距），但**不借它的绝对字号** ——
+     h1 48px 是整页文档的尺度，控制台卡片里只需要 17~19px。
+
+     节奏统一交给 `> * + *`：相邻块之间只有一个方向的间距，
+     不会和 p 默认的 margin 上下打架（那正是"Markdown 渲染完一坨"的来源）。 */
+  .prose-kb {
+    font-size: 13px;
+    line-height: 1.75;
+    color: var(--text);
+    overflow-wrap: break-word;
+  }
+  .prose-kb > * + * {
+    margin-top: 0.75rem;
+  }
+  .prose-kb > :first-child {
+    margin-top: 0;
+  }
+
+  .prose-kb h1,
+  .prose-kb h2,
+  .prose-kb h3,
+  .prose-kb h4,
+  .prose-kb h5,
+  .prose-kb h6 {
+    font-weight: 600;
+    line-height: 1.4;
+    letter-spacing: -0.01em;
+    color: var(--text);
+  }
+  /* 标题也是锚点（rehype-slug 给它们加 id）。顶栏是 sticky 的，
+     不留出这一段，从目录跳过去之后标题正好被压在顶栏底下 ——
+     看着像跳错了位置。 */
+  .prose-kb :is(h1, h2, h3, h4, h5, h6) {
+    scroll-margin-top: 6rem;
+  }
+  .prose-kb h1 {
+    font-size: 1.1875rem;
+    margin-top: 1.75rem;
+  }
+  .prose-kb h2 {
+    font-size: 1.0625rem;
+    margin-top: 1.75rem;
+    padding-bottom: 0.375rem;
+    border-bottom: 1px solid var(--line);
+  }
+  .prose-kb h3 {
+    font-size: 0.9375rem;
+    margin-top: 1.5rem;
+  }
+  .prose-kb h4,
+  .prose-kb h5,
+  .prose-kb h6 {
+    font-size: 0.875rem;
+    margin-top: 1.25rem;
+  }
+
+  .prose-kb strong {
+    font-weight: 600;
+  }
+  .prose-kb del {
+    color: var(--faint);
+  }
+  .prose-kb a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-underline-offset: 2px;
+  }
+  .prose-kb a:hover {
+    opacity: 0.8;
+  }
+  /* 站内双链。实线 = 链到了某一篇；虚线 = 没找到同名文章。
+     除了颜色，线型也再区分一次 —— 只靠颜色的话色觉障碍的用户看不出来 */
+  .prose-kb .kb-wikilink {
+    text-decoration: none;
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  }
+  .prose-kb .kb-wikilink:hover {
+    border-bottom-color: var(--accent);
+  }
+  .prose-kb .kb-wikilink-missing {
+    color: var(--faint);
+    border-bottom: 1px dashed var(--line-strong);
+    cursor: help;
+  }
+
+  .prose-kb ul,
+  .prose-kb ol {
+    padding-left: 1.35rem;
+  }
+  .prose-kb ul {
+    list-style: disc;
+  }
+  .prose-kb ol {
+    list-style: decimal;
+  }
+  .prose-kb li + li {
+    margin-top: 0.3rem;
+  }
+  .prose-kb li::marker {
+    color: var(--faint);
+  }
+  /* 松散列表会把条目内容包进 <p>，默认 margin 会让每个条目之间拉开一大截 */
+  .prose-kb li > p {
+    margin: 0;
+  }
+  .prose-kb li > p + p {
+    margin-top: 0.4rem;
+  }
+  /* GFM 任务清单：去掉项目符号，让复选框顶到行首 */
+  .prose-kb li:has(> input[type='checkbox']) {
+    list-style: none;
+    margin-left: -1.35rem;
+  }
+  .prose-kb input[type='checkbox'] {
+    margin-right: 0.4rem;
+    accent-color: var(--accent);
+  }
+
+  .prose-kb blockquote {
+    border-left: 2px solid var(--accent);
+    padding-left: 0.8rem;
+    color: var(--muted);
+  }
+
+  .prose-kb hr {
+    border: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .prose-kb img {
+    max-width: 100%;
+    border-radius: 0.625rem;
+  }
+
+  .prose-kb table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .prose-kb th,
+  .prose-kb td {
+    border: 1px solid var(--line);
+    padding: 0.35rem 0.6rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  .prose-kb th {
+    background: var(--bg-2);
+    font-weight: 600;
+  }
+
+  /* 行内代码：浅底 + 4px 圆角（正对全站的 rounded-xs） */
+  .prose-kb code {
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.9em;
+    background: var(--bg-2);
+    color: var(--text);
+    border-radius: 0.25rem;
+    padding: 0.1rem 0.3rem;
+  }
+
+  /* 代码块：深色面（--code-bg），两种主题下都成立。 */
+  .prose-kb pre {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border-radius: 0.625rem;
+    padding: 0.75rem 0.9rem;
+    overflow-x: auto;
+    font-size: 12px;
+    line-height: 1.6;
+    tab-size: 2;
+  }
+  .prose-kb pre code {
+    background: none;
+    color: inherit;
+    padding: 0;
+    border-radius: 0;
+    font-size: inherit;
+  }
+
+  /* 气泡里那一档：容器只有 88% 宽的一小块，标题再撑到 19px 就会顶破气泡 */
+  .prose-kb-compact {
+    font-size: 13px;
+    line-height: 1.65;
+  }
+  .prose-kb-compact > * + * {
+    margin-top: 0.5rem;
+  }
+  .prose-kb-compact h1,
+  .prose-kb-compact h2,
+  .prose-kb-compact h3,
+  .prose-kb-compact h4 {
+    font-size: 0.9375rem;
+    margin-top: 0.9rem;
+  }
+  .prose-kb-compact h2 {
+    border-bottom: 0;
+    padding-bottom: 0;
+  }
+  .prose-kb-compact pre {
+    padding: 0.6rem 0.7rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes live-ping {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.85;
+  }
+  70% {
+    transform: scale(2.1);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.1);
+    opacity: 0;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   全站按钮的按压物理
+   ══════════════════════════════════════════════════════════════════
+   按下：110ms 内压到 scale(.96)，同时吃进一层深度内阴影。
+   松手：380ms 欠阻尼弹簧回弹（ζ=0.28），首次过冲让 scale 到 1.016
+   （超出静息 1.6%），二次过冲只剩 0.26% —— 读起来是一次干净的"弹一下"，
+   而不是抖。过冲幅度受限于 0.96→1.0 这段只有 4% 的区间，再大就得改压缩量。
+
+   三个刻意的选择：
+   1) 用 transition 而不是 animation：animation 不可中断，连点会在半路跳帧；
+      transition 会自动从当前值接着走，天然满足 interruptible。
+   2) 内阴影做成 ::after 覆盖层、阴影值静态，只切它的 opacity ——
+      整条通路因此只动 transform/opacity，不触发重排（transform-performance）。
+   3) 覆盖层是"叠"上去而不是"替掉"按钮自己的 box-shadow，所以 .btn-primary
+      的辉光、各变体的投影都原样保留，只在按下那一刻被内阴影压住。
+
+   这段刻意不放进任何 @layer 且写在文件末尾：产物里 Tailwind 是内联展开的，
+   源码顺序决定级联，放最后才能盖掉 Button 组件自带的 transition-* 工具类。
+   （优先级上 button:not(:disabled) 是 0-1-1，本就高于工具类的 0-1-0。） */
+button:not(:disabled) {
+  transition:
+    transform var(--press-release) cubic-bezier(0.34, 1.45, 0.5, 1),
+    background-color 150ms cubic-bezier(0.4, 0, 0.2, 1),
+    color 150ms cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 150ms cubic-bezier(0.4, 0, 0.2, 1),
+    filter 150ms cubic-bezier(0.4, 0, 0.2, 1),
+    box-shadow 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  /* 上一条的曲线是"单次过冲"的近似，给不认 linear() 的浏览器兜底。
+     这一条只覆盖第一个（transform）的缓动，其余原样。
+     若浏览器解析不了 linear()，整条声明会被丢弃 —— 于是回落到上一条的
+     cubic-bezier，优雅降级；这里不能用 var() 中转，因为 var 替换出非法值时
+     属性会变成 unset，而不是保留前一条声明。 */
+  transition-timing-function: linear(
+      0, 0.0348, 0.1301, 0.271, 0.4414, 0.6258, 0.8095, 0.9803, 1.1283, 1.2468, 1.3319, 1.3824,
+      1.3999, 1.3879, 1.3512, 1.2958, 1.2283, 1.1547, 1.081, 1.0122, 0.9523, 0.9041, 0.8691,
+      0.848, 0.8401, 0.8442, 0.8583, 0.88, 0.9068, 0.9361, 0.9656, 0.9933, 1.0176, 1.0372,
+      1.0516, 1.0604, 1.0639, 1.0626, 1.0572, 1.0487, 1.0381, 1.0264, 1.0145, 1.0034, 0.9936,
+      0.9856, 0.9797, 0.976, 0.9745, 0.9749, 0.9769, 0.9803, 0.9845, 0.9891, 0.9939, 0.9984,
+      1.0023, 1.0056, 1.008, 1
+    ),
+    cubic-bezier(0.4, 0, 0.2, 1), cubic-bezier(0.4, 0, 0.2, 1), cubic-bezier(0.4, 0, 0.2, 1),
+    cubic-bezier(0.4, 0, 0.2, 1), cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 按下：压缩 + 内阴影。时长与曲线整体换成"即刻"那一套 */
+button:not(:disabled):active {
+  transform: scale(0.96);
+  transition-duration: var(--press-down), 150ms, 150ms, 150ms, 150ms, 150ms;
+  transition-timing-function: var(--press-ease-down), cubic-bezier(0.4, 0, 0.2, 1),
+    cubic-bezier(0.4, 0, 0.2, 1), cubic-bezier(0.4, 0, 0.2, 1), cubic-bezier(0.4, 0, 0.2, 1),
+    cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 深度内阴影：静态的一层，只切 opacity */
+button:not(:disabled)::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  box-shadow: var(--press-inset);
+  transition: opacity var(--press-down) var(--press-ease-down);
+}
+button:not(:disabled):active::after {
+  opacity: 1;
+}

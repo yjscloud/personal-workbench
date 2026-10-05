@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+*.log
+
+# 运行时数据（含个人待办/工单/知识库内容，按需自行决定是否入库）
+server/data/db.json
+server/data/*.tmp
+
+# 登录会话密钥：启动时自动生成，属于凭据，不能入库
+server/data/.auth-secret
+
+# 上传的背景图（个人照片），要入库的话把这一行删掉
+server/data/background/
+
+# 浏览器自动化留下的无障碍树快照，里面是真实工单内容
+trash.yaml
