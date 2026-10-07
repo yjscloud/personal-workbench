@@ -63,6 +63,12 @@ type StoreValue = {
     add: (body: Partial<Bookmark> & { name: string; url: string }) => Promise<Bookmark | null>;
     patch: (id: string, patch: Partial<Bookmark>) => Promise<void>;
     remove: (id: string) => Promise<void>;
+    /**
+     * 重排磁贴顺序：传整份 id 顺序（工具箱那面墙的顺序）。
+     * `moved` 是跨分类拖动时顺带改掉的分类归属，与顺序在服务端一次写入。
+     * 成功返回 true；失败时这里已经回滚并弹过错误了。
+     */
+    reorder: (ids: string[], moved?: { id: string; group: string }[]) => Promise<boolean>;
     /** 探测站点品牌色并写回。返回汇总，交给页面报"几个取到、几个没取到" */
     syncColors: (opts?: { force?: boolean; ids?: string[] }) => Promise<{
       total: number;
@@ -453,6 +459,38 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         } catch (err) {
           setBookmarks(prev);
           notify(err instanceof Error ? err.message : '删除失败', 'crit');
+        }
+      },
+      /* 与分类排序同理：拖动是高频动作、一次拖拽只有一次调用，松手即提交，
+         顺序变了就在眼前，所以成功不弹 toast —— 只有失败才回滚并报错。 */
+      async reorder(ids: string[], moved: { id: string; group: string }[] = []) {
+        const prev = bookmarks;
+        const byId = new Map(bookmarks.map((b) => [b.id, b]));
+        const target = new Map(moved.map((m) => [m.id, m.group]));
+        const seen = new Set(ids);
+        /* 本地先按同一套规则排一遍：拉到 ids 里的按新顺序排，没出现在
+           ids 里的（正常不会发生）保持原相对顺序跟在后面。分类改动在这里
+           一起落地，磁贴才不会先跳一次位置、再跳一次分类。 */
+        setBookmarks([
+          ...ids
+            .filter((id) => byId.has(id))
+            .map((id) => {
+              const b = byId.get(id) as Bookmark;
+              const group = target.get(id);
+              return group && group !== b.group ? { ...b, group } : b;
+            }),
+          ...bookmarks.filter((b) => !seen.has(b.id)),
+        ]);
+        try {
+          const res = await api.bookmarks.reorder(ids, moved);
+          /* 以服务端回来的顺序为准。它还会把没传的条目补在末尾，
+             正好是上面这段本地逻辑的兜底 */
+          setBookmarks(res.bookmarks);
+          return true;
+        } catch (err) {
+          setBookmarks(prev);
+          notify(err instanceof Error ? err.message : '排序失败', 'crit');
+          return false;
         }
       },
       async createGroup(name: string) {

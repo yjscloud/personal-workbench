@@ -60,6 +60,14 @@ export default {
         field: '0.625rem',
         xs: '0.25rem',
       },
+
+      /* 网格列数只多给一档：13。首页「常用网站」的方形磁贴要排到 13 列
+         —— 12 列在 1440px 下每张还有 102px，仍偏大；而写成
+         grid-cols-[13fr] 得在类名里塞方括号，那串字符在编辑工具、shell
+         与代码审查里一路都要转义。这里登记一个正经档位。 */
+      gridTemplateColumns: {
+        13: 'repeat(13, minmax(0, 1fr))',
+      },
       boxShadow: {
         panel: 'var(--shadow-panel)',
         soft: 'var(--shadow-soft)',

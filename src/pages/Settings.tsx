@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { CheckCircle2, CloudUpload, Database, Download, HardDriveDownload, History, ImageIcon, KeyRound, Leaf, Palette, Plug, Plus, RefreshCcw, Save, Sun, Moon, Trash2, Upload, User, Zap } from 'lucide-react';
+import { CheckCircle2, CloudUpload, Database, Download, HardDriveDownload, History, ImageIcon, KeyRound, Leaf, Palette, Plug, Plus, RefreshCcw, Save, Search, Sun, Moon, Trash2, Upload, User, Zap } from 'lucide-react';
 import {
   api,
   type HaEntityOption,
   type HaOptions,
   type HaSocket,
   type LoginBackground,
+  type SearchEngine,
   type Settings as SettingsShape,
 } from '@/lib/api';
 import { useStore } from '@/lib/store';
@@ -13,6 +14,7 @@ import { switchTheme, type AccentName, type ThemeMode } from '@/lib/theme';
 import { cls, fmtBytes, fmtEnergy, fmtRelative } from '@/lib/format';
 import { applyBackground } from '@/lib/background';
 import { Badge, Button, buttonClass, Card, CardHead, Field, Input, Led, PageHead, Segmented, Select, SkeletonCard, Spinner, Toggle } from '@/components/ui';
+import { DragHandle, DropMarker, MoveButtons, orderById, useRowReorder, type RowReorder } from '@/components/reorder';
 
 /* swatch 用主题感知的令牌，浅色/深色下都显示该强调色在当前主题的实际取值 */
 const ACCENTS: { value: AccentName; label: string; swatch: string }[] = [
@@ -34,6 +36,11 @@ function keyStamp(key: string) {
   if (!m) return key;
   return m[2] ? `${m[1]} ${m[2]}:${m[3]}` : m[1];
 }
+
+/* 新建搜索引擎行的 id（保存时服务端原样留着，之后就是它的稳定引用）。
+   带一个自增序号：同一毫秒里连点两次「添加引擎」也不会撞 key。 */
+let engineSeq = 0;
+const newEngineId = () => `se_new_${Date.now().toString(36)}_${(engineSeq += 1)}`;
 
 export default function Settings() {
   const { settings, saveSettings, notify, refreshAll } = useStore();
@@ -88,6 +95,18 @@ export default function Settings() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings?.ha?.hasToken]);
 
+  /* 搜索引擎的排序交互：和工具箱的分组排序共用 components/reorder.tsx 那一份。
+     hook 必须声明在 early return 之前（下面那个"草稿还没到"的分支），
+     那一帧根本不渲染列表，所以传空数组占位不影响任何东西 ——
+     真正要排序时 prev 一定已经在了。 */
+  const engineSort = useRowReorder(
+    (draft?.search?.engines ?? []).map((e) => e.id),
+    (ids) =>
+      setDraft((prev) =>
+        prev ? { ...prev, search: { ...prev.search, engines: orderById(prev.search.engines, ids) } } : prev,
+      ),
+  );
+
   if (!draft) {
     /* 这一页是"每块一张卡"的长表单，骨架也照着摞几块。
         原来只渲染一张细条卡，数据一到整页几乎全部重排。 */
@@ -110,6 +129,8 @@ export default function Settings() {
     setDraft((prev) => (prev ? { ...prev, news: { ...prev.news, aihot: { ...prev.news.aihot, ...next } } } : prev));
   const patchProfile = (next: Partial<SettingsShape['profile']>) =>
     setDraft((prev) => (prev ? { ...prev, profile: { ...prev.profile, ...next } } : prev));
+  const patchSearch = (next: Partial<SettingsShape['search']>) =>
+    setDraft((prev) => (prev ? { ...prev, search: { ...prev.search, ...next } } : prev));
   const patchBackup = (next: Partial<SettingsShape['backup']>) =>
     setDraft((prev) => (prev ? { ...prev, backup: { ...prev.backup, ...next } } : prev));
   const patchCos = (next: Partial<SettingsShape['backup']['cos']>) =>
@@ -147,6 +168,50 @@ export default function Settings() {
   const removeSocket = (index: number) =>
     setDraft((prev) => (prev ? { ...prev, ha: { ...prev.ha, sockets: prev.ha.sockets.filter((_, i) => i !== index) } } : prev));
 
+  /* ── 搜索引擎列表：和插座列表同一套做法，只动这里 ───────────────────
+     新建的行在这里就先拿到 id（而不是留空等服务端补）：React 拿它当 key，
+     列表里同时加两行时没有 id 就会撞 key。 */
+  const patchEngine = (index: number, next: Partial<SearchEngine>) =>
+    setDraft((prev) =>
+      prev
+        ? {
+            ...prev,
+            search: {
+              ...prev.search,
+              engines: prev.search.engines.map((e, i) => (i === index ? { ...e, ...next } : e)),
+            },
+          }
+        : prev,
+    );
+
+  function addEngine() {
+    setDraft((prev) =>
+      prev
+        ? {
+            ...prev,
+            search: {
+              ...prev.search,
+              // 名称和地址都留空：地址模板不猜 —— 猜一个域名出去，用户还得先删掉它
+              // 再填自己的，不如让占位提示把 %s 该放哪儿说清楚
+              engines: [...prev.search.engines, { id: newEngineId(), name: '', url: '' }],
+            },
+          }
+        : prev,
+    );
+  }
+
+  const removeEngine = (index: number) =>
+    setDraft((prev) => {
+      if (!prev) return prev;
+      const removed = prev.search.engines[index];
+      const engines = prev.search.engines.filter((_, i) => i !== index);
+      /* 删掉的可能正是默认项：顺手把默认挪到剩下的第一个，
+         否则下拉里会留一个已经不存在的 id，选中项显示成空白 */
+      const defaultEngine =
+        prev.search.defaultEngine === removed?.id ? engines[0]?.id ?? '' : prev.search.defaultEngine;
+      return { ...prev, search: { ...prev.search, engines, defaultEngine } };
+    });
+
   async function loadHaOptions() {
     setHaOptionsLoading(true);
     setHaOptionsError(null);
@@ -177,6 +242,16 @@ export default function Settings() {
 
   /** 没选功率实体的插座：直接拦住保存，而不是筛掉后假装成功 */
   const badSocketIds = (draft?.ha.sockets ?? []).filter((s) => !s.powerEntity.trim()).map((s) => s.id);
+
+  /* ── 搜索源的两类毛病，同样在本地先拦一道 ───────────────────────────
+     服务端也会校验（那边是最后一道闸），但跑到网络那头再弹错，
+     用户得先自己找到是哪一行出的问题；这里能直接说出是哪一个。
+     `?.` 是给"后端进程比这版页面旧、返回值里没有 search"那种情况兜底用的
+     （同下面备份卡的守卫），否则整页会在这里抛。 */
+  const searchEngines: SearchEngine[] = current.search?.engines ?? [];
+  const blankEngines = searchEngines.filter((e) => !e.name.trim() || !e.url.trim());
+  /** 地址里没有 %s 的引擎：少了它，点搜索永远只打开同一个固定页面 */
+  const noPlaceholderEngine = searchEngines.find((e) => e.url.trim() && !e.url.includes('%s'));
 
   /** 保存一个分区。返回落库后的设置；失败时返回 null（错误已经提示过） */
   async function saveSection(key: string, patch: Partial<SettingsShape>) {
@@ -337,6 +412,17 @@ export default function Settings() {
   const saveNews = () => void saveSection('news', { news: current.news });
   const saveMisc = () => void saveSection('misc', { autoBackup: current.autoBackup });
   const saveProfile = () => void saveSection('profile', { profile: current.profile });
+
+  /* 搜索源：三类拒绝都要点明是哪一个，不然用户只能一行行回找。
+     服务端有一模一样的校验，这里只是把错误提前到点保存的那一刻。 */
+  const saveSearch = () => {
+    if (!current.search.engines.length) return notify('至少保留一个搜索引擎', 'crit');
+    if (blankEngines.length) return notify(`有 ${blankEngines.length} 个引擎还没填名称或搜索地址`, 'crit');
+    if (noPlaceholderEngine) {
+      return notify(`「${noPlaceholderEngine.name || '未命名'}」的搜索地址里缺少 %s 占位符`, 'crit');
+    }
+    void saveSection('search', { search: current.search });
+  };
 
   /* ── 背景 ─────────────────────────────────────────────────────────
      和「外观」卡一样是即时生效 + 即时落库：背景是眼睛能直接看到的东西，
@@ -499,6 +585,118 @@ export default function Settings() {
           <SaveAction className="ml-auto" dirty={dirtyOf('profile')} busy={savingSection === 'profile'} onSave={saveProfile} />
         </div>
       </Card>
+
+      {/* 首页搜索。和下面「知识库备份」同一个守卫：后端进程比这版页面旧时，
+          返回值里根本没有 search 这一段，这时不摆一堆"填了也存不进去"的输入框 */}
+      {settings?.search ? (
+        <Card>
+          <CardHead
+            level={2}
+            title="搜索"
+            hint="首页搜索框的引擎列表。地址里用 %s 表示查询词，提交时会替换成你输入的内容"
+            right={<Search size={15} className="text-accent" />}
+          />
+
+          <div className="space-y-2.5">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-xs font-medium text-ink">搜索引擎</p>
+                <p className="mt-0.5 text-2xs leading-relaxed text-faint">
+                  拖动左侧抓手或用箭头上下移动即可改顺序 —— 首页那一行标签就是这个顺序；
+                  标了「首页默认」的那个，是打开首页时预先选中的
+                </p>
+              </div>
+              <Button
+                size="sm"
+                variant="soft"
+                onClick={addEngine}
+                disabled={current.search.engines.length >= 12}
+                title={current.search.engines.length >= 12 ? '最多 12 个' : undefined}
+              >
+                <Plus size={13} aria-hidden />
+                添加引擎
+              </Button>
+            </div>
+
+            {current.search.engines.length === 0 ? (
+              <p className="rounded-field border border-dashed border-line px-4 py-5 text-center text-2xs text-faint">
+                一个引擎都没有，首页的搜索框就没得选了 —— 点「添加引擎」补一个再保存。
+              </p>
+            ) : (
+              <ul className="space-y-2">
+                {current.search.engines.map((e, i) => (
+                  <EngineRow
+                    key={e.id}
+                    engine={e}
+                    index={i}
+                    count={current.search.engines.length}
+                    sortable={engineSort}
+                    isDefault={e.id === current.search.defaultEngine}
+                    invalid={!e.name.trim() || !e.url.trim()}
+                    onPatch={(next) => patchEngine(i, next)}
+                    onRemove={() => removeEngine(i)}
+                    onMakeDefault={() => patchSearch({ defaultEngine: e.id })}
+                  />
+                ))}
+              </ul>
+            )}
+
+            <div className="flex items-center justify-between gap-4 rounded-field bg-bg-2 px-3 py-2.5">
+              <div>
+                <p className="text-[13px]">新标签页打开</p>
+                {/* 关掉就是当前页跳走，工作台本身会被搜索结果替换掉，说清楚 */}
+                <p className="text-2xs text-faint">关闭后搜索结果在当前页打开，会离开工作台</p>
+              </div>
+              <Toggle
+                checked={current.search.newTab}
+                onChange={(v) => patchSearch({ newTab: v })}
+                label="在新标签页打开搜索结果"
+              />
+            </div>
+
+            {/* 这是整站唯一会把用户输入发给第三方的功能，所以开关旁边必须把
+                后果写清楚，而不是只写"联想"两个字 —— 用户有权知道谁看到了什么。
+                缺省（老配置里没有这个字段）按开启算，与前端一致。 */}
+            <div className="flex items-start justify-between gap-4 rounded-field bg-bg-2 px-3 py-2.5">
+              <div>
+                <p className="text-[13px]">搜索联想</p>
+                <p className="mt-0.5 text-2xs leading-relaxed text-faint">
+                  输入时把关键词发给所选搜索引擎（百度 / Google / Bing / 360），取它自己的候选词。
+                  用其它引擎时不外发，只列本站的工具与知识库文章。关闭后一个词也不会发出去。
+                </p>
+              </div>
+              <Toggle
+                checked={current.search.suggest !== false}
+                onChange={(v) => patchSearch({ suggest: v })}
+                label="开启搜索联想（会把关键词发给搜索引擎）"
+              />
+            </div>
+          </div>
+
+          <div className="mt-4 flex items-center gap-2 border-t border-line pt-3.5">
+            <SaveAction
+              className="ml-auto"
+              dirty={dirtyOf('search')}
+              busy={savingSection === 'search'}
+              onSave={saveSearch}
+            />
+          </div>
+        </Card>
+      ) : (
+        <Card>
+          <CardHead
+            level={2}
+            title="搜索"
+            hint="当前服务端还不认识这一段配置"
+            right={<Search size={15} className="text-signal" />}
+          />
+          <p className="rounded-field bg-warn-soft px-3 py-2.5 text-2xs leading-relaxed text-warn">
+            后端是在这版页面之前启动的进程，它返回的设置里没有搜索这一段，所以这里暂时什么都不显示。
+            在服务器上重启一次（<code className="num">systemctl restart personal-workbench</code>）之后刷新页面，
+            这一块就会连同首页的搜索框一起出现。
+          </p>
+        </Card>
+      )}
 
       {/* 外观 */}
       <Card>
@@ -1454,6 +1652,111 @@ function SaveAction({
         保存
       </Button>
     </span>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   一行搜索源配置
+   ══════════════════════════════════════════════════════════════════
+   名称 + 地址两项，地址必须是带 %s 的模板。缺 %s 时行内立刻标红说明，
+   而不是等按了保存才由服务端退回来 —— 那是这个配置唯一容易写错的地方。 */
+function EngineRow({
+  engine,
+  index,
+  count,
+  sortable,
+  isDefault,
+  invalid,
+  onPatch,
+  onRemove,
+  onMakeDefault,
+}: {
+  engine: SearchEngine;
+  index: number;
+  count: number;
+  sortable: RowReorder;
+  isDefault: boolean;
+  invalid?: boolean;
+  onPatch: (next: Partial<SearchEngine>) => void;
+  onRemove: () => void;
+  onMakeDefault: () => void;
+}) {
+  const missingPlaceholder = Boolean(engine.url.trim()) && !engine.url.includes('%s');
+
+  return (
+    <li
+      {...sortable.rowProps(engine.id)}
+      className={cls(
+        'group relative rounded-field border bg-panel-2 p-3',
+        invalid || missingPlaceholder ? 'border-crit' : 'border-line',
+      )}
+    >
+      <DropMarker at={sortable.marker(engine.id)} />
+
+      <div className="grid gap-2 sm:grid-cols-[1.25rem_7.5rem_minmax(0,1fr)_2.25rem] sm:items-center">
+        {/* 触屏没有 HTML5 拖拽，抓手在那儿等于一个死图标 —— 小屏藏掉，
+            顺序靠下面那两个箭头调，桌面端才给抓手 */}
+        <DragHandle sortable={sortable} id={engine.id} className="hidden sm:block" />
+
+        <Input
+          value={engine.name}
+          onChange={(e) => onPatch({ name: e.target.value })}
+          placeholder="名称"
+          aria-label="搜索引擎名称"
+          maxLength={20}
+        />
+        <Input
+          value={engine.url}
+          onChange={(e) => onPatch({ url: e.target.value })}
+          placeholder="https://www.baidu.com/s?wd=%s"
+          aria-label="搜索地址模板"
+          spellCheck={false}
+          autoComplete="off"
+          /* 地址是机器读的：等宽字体下 %s 和各个参数一眼能对上 */
+          className="num text-2xs"
+        />
+        {/* 行内删除沿用全站约定：桌面端悬停/聚焦才显现，触屏（没有 hover）常显 */}
+        <button
+          type="button"
+          onClick={onRemove}
+          className="justify-self-center rounded-field p-2 text-faint opacity-100 transition-opacity hover:text-crit focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+          aria-label={`删除搜索引擎 ${engine.name || '未命名'}`}
+          title="删除该引擎"
+        >
+          <Trash2 size={14} aria-hidden />
+        </button>
+      </div>
+
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={onMakeDefault}
+          disabled={isDefault}
+          aria-pressed={isDefault}
+          title={isDefault ? '打开首页时就用这个引擎' : '设为打开首页时默认选中的引擎'}
+          className={cls(
+            'rounded-full border px-2 py-0.5 text-2xs transition-colors',
+            isDefault
+              ? 'cursor-default border-accent/50 bg-accent-soft text-accent'
+              : 'border-line text-muted hover:border-faint hover:text-ink',
+          )}
+        >
+          {isDefault ? '首页默认' : '设为默认'}
+        </button>
+        {/* 上/下移推到行尾：它们和"设为默认"不是一回事，
+            挤在一起会被读成一个控件组 */}
+        <MoveButtons
+          sortable={sortable}
+          index={index}
+          count={count}
+          label={engine.name || '未命名'}
+          className="ml-auto"
+        />
+        {missingPlaceholder ? (
+          <span className="w-full text-2xs text-crit">地址里缺少 %s，点搜索只会打开这个固定页面</span>
+        ) : null}
+      </div>
+    </li>
   );
 }
 

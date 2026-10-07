@@ -932,6 +932,105 @@
   /* 深色下不再单配 hover 投影：浅色那边已经取消"悬浮放大投影"，
      这里跟着去掉，两套主题的悬浮行为保持一致。 */
 
+  /* ── 首页搜索：每个引擎带自己的品牌色相 ─────────────────────────────
+     和工具箱磁贴同一套思路：JS 只送色相 / 饱和度（--se-h / --se-s），
+     明度交给主题 —— 浅色用"淡底 + 深字"，深色反过来。
+     色相来自引擎地址的域名（lib/engine-color.ts），所以用户加一个
+     任何搜索引擎它都自动有自己的颜色，不需要在设置里多填一个色值。
+
+     底色是**中性的**（一层半透明白），彩色只落在字上：一排五颜六色的底
+     会互相抢，只有字带色时才能一眼扫过去认出哪家是哪家。 */
+  .se-chip {
+    background-color: rgb(255 255 255 / 0.55);
+    color: hsl(var(--se-h) var(--se-s) 36%);
+    transition:
+      background-color 0.15s ease,
+      color 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+  .se-chip:hover {
+    background-color: rgb(255 255 255 / 0.85);
+  }
+  /* 选中的那颗换实白底：靠"更实的底 + 一层软投影"表达选中，
+     字仍然用它自己的品牌色 —— 换掉色相反而认不出刚点的是哪个 */
+  .se-chip[data-active='true'] {
+    background-color: var(--panel);
+    color: hsl(var(--se-h) var(--se-s) 36%);
+    box-shadow: var(--shadow-soft);
+  }
+  :root[data-theme='dark'] .se-chip {
+    background-color: rgb(255 255 255 / 0.1);
+    color: hsl(var(--se-h) var(--se-s) 76%);
+  }
+  :root[data-theme='dark'] .se-chip:hover {
+    background-color: rgb(255 255 255 / 0.17);
+  }
+  :root[data-theme='dark'] .se-chip[data-active='true'] {
+    background-color: var(--panel);
+    color: hsl(var(--se-h) var(--se-s) 80%);
+    box-shadow: var(--shadow-soft);
+  }
+  /* 逐字上色的品牌（Google 那几个字母）原色偏暗，深底上要整体提亮一档，
+     否则第一个蓝字母会糊进背景里。用 filter 而不是逐个改色：
+     一处规则覆盖所有这类品牌，也不用在 JS 里知道当前是哪个主题。 */
+  :root[data-theme='dark'] .se-ml {
+    filter: brightness(1.45) saturate(1.05);
+  }
+
+  /* 白条：底和圆角由调用方给，这里只管投影与聚焦环。
+     聚焦环跟着选中引擎的色相走 —— 换个引擎，整条输入框就换一种颜色回应。 */
+  .se-bar {
+    background-color: var(--panel);
+    box-shadow: var(--shadow-lift);
+    transition: box-shadow 0.15s ease;
+  }
+  .se-bar:focus-within {
+    box-shadow:
+      0 0 0 1px hsl(var(--se-h) var(--se-s) 58% / 0.6),
+      0 0 0 4px hsl(var(--se-h) var(--se-s) 58% / 0.22),
+      var(--shadow-lift);
+  }
+
+  /* 搜索按钮：实心品牌色。橙黄那段（35~100）白字压不住，
+     由 JS 打上 data-bright 后统一压深一档 —— 不然按钮会白成一片 */
+  .se-go {
+    background-color: hsl(var(--se-h) var(--se-s) 42%);
+    color: #fff;
+    transition:
+      background-color 0.15s ease,
+      transform 0.15s ease;
+  }
+  .se-go:hover {
+    background-color: hsl(var(--se-h) var(--se-s) 36%);
+  }
+  .se-go[data-bright] {
+    background-color: hsl(var(--se-h) var(--se-s) 34%);
+  }
+  .se-go[data-bright]:hover {
+    background-color: hsl(var(--se-h) var(--se-s) 29%);
+  }
+  .se-go:active {
+    transform: scale(0.95);
+  }
+
+  /* 选中引擎的颜色在整块面上淡淡洇开一层：右上角一团同色相的光。
+     压得很低（≤24%）—— 它只负责"这块是活的，换引擎颜色会跟着变"，
+     不参与对比度，落在文字上的那点色差可以忽略。 */
+  .se-glow {
+    background-image: radial-gradient(
+      46% 130% at 96% -12%,
+      hsl(var(--se-h) var(--se-s) 55% / 0.2),
+      hsl(var(--se-h) var(--se-s) 55% / 0) 68%
+    );
+  }
+  :root[data-theme='dark'] .se-glow {
+    background-image: radial-gradient(
+      46% 130% at 96% -12%,
+      hsl(var(--se-h) var(--se-s) 62% / 0.26),
+      hsl(var(--se-h) var(--se-s) 62% / 0) 68%
+    );
+  }
+
   /* favicon 底下那团白雾：多数站点图标是透明底，直接压在糖果色上会发灰。
      用径向渐变而不是实心方块 —— 实心方块会把这格变成"小图挤在大框里"，
      一屏几十个看下来全是空框。 */

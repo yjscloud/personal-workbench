@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
@@ -17,6 +18,7 @@ import { askAboutArticle } from './services/knowledge-ai.js';
 import { askAboutNews, cachedBody, unreadableHosts } from './services/reader.js';
 import { usageSnapshot } from './services/ai-usage.js';
 import { probeSiteColor } from './services/sitecolor.js';
+import { suggestSource, fetchSuggest } from './services/suggest.js';
 import {
   applyBackupSchedule,
   cosConfig,
@@ -130,6 +132,47 @@ function mergeBackup(current, incoming) {
     next.cos = cos;
   }
   return next;
+}
+
+/**
+ * 整理 PUT 进来的 search 片段。
+ *
+ * 三条硬规则都在这儿挡住，并且报错要能直接照做：
+ * · 至少留一个引擎 —— 全删了首页那块搜索框就没得选，等于功能消失；
+ * · 每个引擎都要有名字和地址；
+ * · 地址里必须有 %s 占位符 —— 少一个字符的后果是"点搜索永远跳回同一个固定页面"，
+ *   界面上完全看不出哪里不对（这条以前是静默失败最典型的来源）。
+ * 返回 { ok: true, value } 或 { ok: false, error }。
+ */
+function normalizeSearch(current, incoming) {
+  const base = current || {};
+  const s = incoming || {};
+  const next = { ...base };
+  if (Array.isArray(s.engines)) {
+    const engines = s.engines.slice(0, 12).map((e) => ({
+      // 前端新增的行还没落库，没有 id —— 在这里补一个，之后它就是稳定的引用
+      id: String(e?.id ?? '').trim() || uid('se'),
+      name: String(e?.name ?? '').trim().slice(0, 20),
+      url: String(e?.url ?? '').trim().slice(0, 500),
+    }));
+    if (!engines.length) return { ok: false, error: '至少保留一个搜索引擎' };
+    const blank = engines.findIndex((e) => !e.name || !e.url);
+    if (blank >= 0) return { ok: false, error: `第 ${blank + 1} 个搜索引擎的名称和地址都要填` };
+    const bad = engines.find((e) => !e.url.includes('%s'));
+    if (bad) return { ok: false, error: `「${bad.name}」的搜索地址里缺少 %s 占位符` };
+    next.engines = engines;
+  }
+  if (s.defaultEngine !== undefined) {
+    const ids = (next.engines || []).map((e) => e.id);
+    const want = String(s.defaultEngine || '');
+    // 默认项被删掉之后不留悬空 id：回落到列表第一个，界面上的选中态才和实际一致
+    next.defaultEngine = ids.includes(want) ? want : ids[0] ?? '';
+  }
+  if (s.newTab !== undefined) next.newTab = Boolean(s.newTab);
+  /* 联想总开关。字段不再往上面加的话它会被这里吃掉 ——
+     这个函数是一次"挑字段"的白名单，不是浅合并。 */
+  if (s.suggest !== undefined) next.suggest = Boolean(s.suggest);
+  return { ok: true, value: next };
 }
 
 function maskSettings(settings) {
@@ -379,7 +422,7 @@ router.get(
       projects: await listProjects().catch(() => []),
       // 分类一次全给：前端按 projectId 分组即可，省得每个项目各请求一次
       sections: await listAllSections().catch(() => []),
-      bookmarks: data.bookmarks,
+      bookmarks: data.bookmarks.map(publicBookmark),
       groups: data.groups,
       knowledge: publicKnowledge(data.knowledge),
       news: { updatedAt: data.news.updatedAt, lastError: data.news.lastError, count: data.news.items.length },
@@ -901,9 +944,75 @@ router.delete(
 );
 
 /* ── 常用网站 ─────────────────────────────────────────────────────── */
+
+/**
+ * 上传图标的形状与体积上限。
+ *
+ * 只收**位图**的 base64 data URL，SVG 明确不收：SVG 能带外链与脚本，
+ * 即使通过 <img> 加载时脚本被浏览器挡住，也不该由自己的面板替用户决定
+ * 存一份"万一是 SVG 呢"的东西。
+ *
+ * 上限 256KB。图标是要跟着每一条书签走的（它进 COS 备份，也进下一次
+ * /bootstrap 的数据库往返），再大就该落盘而不是进库了。
+ */
+const ICON_MAX = 256 * 1024;
+const ICON_DATA_URL = /^data:image\/(png|jpeg|gif|webp|avif);base64,([A-Za-z0-9+/]+={0,2})$/;
+
+/** 校验上传的图标。空串 = 清除（回到自动取 favicon） */
+function checkIcon(raw) {
+  const v = String(raw ?? '').trim();
+  if (!v) return { ok: true, value: '' };
+  const m = ICON_DATA_URL.exec(v);
+  if (!m) return { ok: false, error: '图标只接受 PNG / JPEG / GIF / WebP / AVIF 格式的图片' };
+  const bytes = Math.floor((m[2].length * 3) / 4);
+  if (bytes > ICON_MAX) {
+    return { ok: false, error: `图标 ${Math.ceil(bytes / 1024)}KB，超过 ${ICON_MAX / 1024}KB 上限` };
+  }
+  return { ok: true, value: v };
+}
+
+/**
+ * 列表里的书签**不带图标本体**。
+ *
+ * 一张位图 base64 后几百 KB，几十条书签就能把 /bootstrap 顶成几百 KB ——
+ * 而那个接口是每次打开面板都要走一遍的首屏数据。改成只给一个
+ * hasIcon 布尔，图标本体由 /bookmarks/:id/icon 单独取（可缓存、可协商）。
+ */
+function publicBookmark(b) {
+  const { icon, ...rest } = b;
+  return { ...rest, hasIcon: Boolean(icon) };
+}
+
+/** 把 data URL 拆成 (mime, 字节)，拆不出来返回 null */
+function decodeIcon(icon) {
+  const m = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/i.exec(String(icon || '').trim());
+  if (!m) return null;
+  return { mime: m[1], buf: Buffer.from(m[2], 'base64') };
+}
+
 router.get('/bookmarks', (_req, res) => {
   const data = db();
-  ok(res, { bookmarks: data.bookmarks, groups: data.groups });
+  ok(res, { bookmarks: data.bookmarks.map(publicBookmark), groups: data.groups });
+});
+
+/**
+ * 自定义图标本体。单独一个接口而不是塞进列表响应，
+ * 是为了上面 publicBookmark 说的那件事：首屏不背图标，图片按需取。
+ *
+ * Cache-Control 用 no-cache 而不是 immutable —— 同一个地址的内容会变
+ * （用户换图），所以不能让它在浏览器里躺到过期；改由 ETag 协商：
+ * 内容没变就回 304，几乎不花流量。
+ */
+router.get('/bookmarks/:id/icon', (_req, res) => {
+  const bm = db().bookmarks.find((b) => b.id === _req.params.id);
+  const decoded = bm ? decodeIcon(bm.icon) : null;
+  if (!decoded) return fail(res, 404, '这个书签没有自定义图标');
+  const etag = `W/"${decoded.buf.length}-${createHash('sha1').update(decoded.buf).digest('base64url').slice(0, 12)}"`;
+  if (_req.headers['if-none-match'] === etag) return res.status(304).end();
+  res.setHeader('Content-Type', decoded.mime);
+  res.setHeader('Cache-Control', 'private, no-cache');
+  res.setHeader('ETag', etag);
+  res.send(decoded.buf);
 });
 
 /**
@@ -963,13 +1072,18 @@ router.post(
 router.post(
   '/bookmarks',
   wrap(async (req, res) => {
-    const { name, url, group = 'grp_ops', note = '', color = '' } = req.body || {};
+    /* pinned 在新建时也要收：添加工具那个弹窗里有一个「设为常用」开关，
+       用户在点保存之前就打开了它 —— 这里漏掉的话，开关会被静默丢弃，
+       首页看不到刚加的东西，而界面又没报错。 */
+    const { name, url, group = 'grp_ops', note = '', color = '', icon, pinned = false } = req.body || {};
     if (!name || !url) return fail(res, 400, '名称和网址都要填');
+    const checked = checkIcon(icon);
+    if (!checked.ok) return fail(res, 400, checked.error);
     let normalized = String(url).trim();
     if (!/^https?:\/\//i.test(normalized)) normalized = `http://${normalized}`;
-    const bm = { id: uid('bm'), name: String(name).trim().slice(0, 60), url: normalized, group, note: String(note).slice(0, 120), color };
+    const bm = { id: uid('bm'), name: String(name).trim().slice(0, 60), url: normalized, group, note: String(note).slice(0, 120), color, pinned: Boolean(pinned), icon: checked.value };
     update((d) => d.bookmarks.push(bm));
-    ok(res, bm);
+    ok(res, publicBookmark(bm));
   }),
 );
 
@@ -977,6 +1091,8 @@ router.patch(
   '/bookmarks/:id',
   wrap(async (req, res) => {
     const patch = req.body || {};
+    const checked = checkIcon(patch.icon);
+    if (!checked.ok) return fail(res, 400, checked.error);
     let updated = null;
     update((d) => {
       const b = d.bookmarks.find((x) => x.id === req.params.id);
@@ -988,11 +1104,12 @@ router.patch(
         ...(patch.note !== undefined ? { note: patch.note } : {}),
         ...(patch.color !== undefined ? { color: patch.color } : {}),
         ...(patch.pinned !== undefined ? { pinned: Boolean(patch.pinned) } : {}),
+        ...(patch.icon !== undefined ? { icon: checked.value } : {}),
       });
       updated = b;
     });
     if (!updated) return fail(res, 404, '书签不存在');
-    ok(res, updated);
+    ok(res, publicBookmark(updated));
   }),
 );
 
@@ -1003,6 +1120,53 @@ router.delete(
       d.bookmarks = d.bookmarks.filter((b) => b.id !== req.params.id);
     });
     ok(res, { removed: 1 });
+  }),
+);
+
+/**
+ * 重排书签顺序（工具箱那面磁贴墙）。
+ *
+ * 与 /groups/reorder 同一套路：传**整份顺序**而不是"把 A 挪到 B 前面"这类
+ * 增量指令，一次落库就把 sort_order 按数组下标写死 —— 书签的顺序本来就是
+ * 内存数组的顺序（见 db/repository.js 里 bookmarks 的 toRow：sort_order 取下标），
+ * 所以这里只管把数组排对。没出现在 ids 里的书签按原相对顺序追加到末尾，
+ * 避免"漏传即丢序"。
+ *
+ * moved 只在**跨分类拖动**时才带：磁贴被放到另一个分类的邻居之间，
+ * 那它同时也就换了分类。顺序与分类合成一次写入，不会留下"顺序变了、
+ * 分类还没变"的中间态。分类 id 不存在直接拒掉 —— 否则会写出一条指向
+ * 空分类的书签，它在页面上根本不会被渲染出来（分组是遍历分类画的）。
+ */
+router.post(
+  '/bookmarks/reorder',
+  wrap(async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((x) => String(x)) : null;
+    if (!ids) return fail(res, 400, 'ids 必须是数组');
+
+    const raw = Array.isArray(req.body?.moved) ? req.body.moved : [];
+    const known = new Set(db().groups.map((g) => g.id));
+    const moved = [];
+    for (const m of raw) {
+      if (!m || typeof m.id !== 'string' || typeof m.group !== 'string') return fail(res, 400, 'moved 格式不对');
+      if (!known.has(m.group)) return fail(res, 400, '要归入的分类不存在');
+      moved.push({ id: m.id, group: m.group });
+    }
+
+    let list = null;
+    update((d) => {
+      for (const m of moved) {
+        const b = d.bookmarks.find((x) => x.id === m.id);
+        if (b) b.group = m.group;
+      }
+      const byId = new Map(d.bookmarks.map((b) => [b.id, b]));
+      const ordered = ids.filter((id) => byId.has(id));
+      for (const b of d.bookmarks) if (!ordered.includes(b.id)) ordered.push(b.id);
+      d.bookmarks = ordered.map((id) => byId.get(id));
+      list = d.bookmarks;
+    });
+    /* 回整份列表而不是只回 { ok: true }：前端要拿服务端的最终顺序兜底，
+       免得"本地乐观排的结果"和"库里真正落下的顺序"悄悄分叉 */
+    ok(res, { bookmarks: list.map(publicBookmark) });
   }),
 );
 
@@ -1585,6 +1749,37 @@ router.get(
 /** 当前判为读不了的站点。列表页据此提前标出来，省掉一次注定失败的白等 */
 router.get('/news/read/unreadable', (_req, res) => ok(res, { hosts: unreadableHosts() }));
 
+/**
+ * 搜索建议（首页大搜索框的联想词）。
+ *
+ * 这是本站**唯一**会把用户输入转发给第三方的接口，所以口径要说清：
+ * · 只在登录后可达（挂在 /api 下，登录守卫在前面）；
+ * · 上游主机写死在 services/suggest.js 的映射表里，不拿用户填的引擎地址
+ *   去请求（否则就是一个能拿后端身份访问任意地址的跳板）；
+ * · 总开关在设置里（search.suggest），关掉之后**服务端也不给**，
+ *   而不是只让前端不问 —— 一个"关了还在发"的开关等于没关；
+ * · 词长卡在 64 字：这个接口不收长文本，它只是取几个候选词。
+ */
+router.get(
+  '/search/suggest',
+  wrap(async (req, res) => {
+    const q = String(req.query.q ?? '').trim().slice(0, 64);
+    const engineId = String(req.query.engine ?? '');
+    const search = db().settings.search ?? {};
+    const enabled = search.suggest !== false;
+    const engine = (search.engines ?? []).find((e) => e.id === engineId);
+    const source = enabled && q && engine ? suggestSource(engine.url) : null;
+    if (!source) return ok(res, { items: [], source: null, supported: false, enabled });
+    ok(res, {
+      items: await fetchSuggest(source, q),
+      source: source.id,
+      label: source.label,
+      supported: true,
+      enabled,
+    });
+  }),
+);
+
 /* ── 设置 / 备份 ──────────────────────────────────────────────────── */
 router.get('/settings', (_req, res) => ok(res, maskSettings(db().settings)));
 
@@ -1618,6 +1813,11 @@ router.put(
       }
     }
 
+    /* 同 backup：搜索源先整理、校验，再落库。校验一旦塞进 update 里，
+       内存已经改过了，而失败响应同样会触发落库——于是"报错但存进去了"。 */
+    const nextSearch = incoming.search ? normalizeSearch(db().settings.search, incoming.search) : null;
+    if (nextSearch && !nextSearch.ok) return fail(res, 400, nextSearch.error);
+
     update((d) => {
       const s = d.settings;
       if (incoming.theme) s.theme = { ...s.theme, ...incoming.theme };
@@ -1648,6 +1848,7 @@ router.put(
         };
       }
       if (incoming.power) s.power = { ...s.power, ...incoming.power };
+      if (nextSearch) s.search = nextSearch.value;
       if (incoming.news) {
         /* aihot 是嵌套配置，必须逐层合并 —— 浅合并会让"前端只改了一个开关"
            这个动作把其余字段整体抹平（只发 { enabled } 时 mode / minScore 会没）。

@@ -54,6 +54,16 @@ const ADDITIVE_COLUMNS = [
   ['knowledge_items', 'starred', "TINYINT NOT NULL DEFAULT 0 COMMENT '星标：标记 + 可单独筛选' AFTER `pinned`"],
   /* 文章助手的对话记录。放在条目行里而不是单开一张表：删条目时它自然一起消失 */
   ['knowledge_items', 'ai', "JSON NULL COMMENT '文章助手的对话记录' AFTER `starred`"],
+  /* 书签的星标 —— 首页「常用网站」就是按它筛出来的。
+     这一列曾经**哪儿都没有**：建表语句里没有、补列清单里也没有，可接口照收
+     pinned、内存镜像里也照改 —— 于是它只活在内存里，服务一重启就被 loadAll
+     读回一片"未标星"，首页那张卡也跟着空了。列在这里登记一次，
+     老库下次启动自动补上（默认 0，补完之后的行为正好是"一个都没标"）。 */
+  ['bookmarks', 'pinned', "TINYINT NOT NULL DEFAULT 0 COMMENT '标星：常用网站' AFTER `color`"],
+  /* 用户自己上传的图标。存base64 而不是落盘：图标要跟着书签一起进
+     COS 备份（见 services/backup.js，那份快照只导出内存里的对象），
+     存文件就得额外写一套"备份时打包、恢复时落盘"的流程，不值当。 */
+  ['bookmarks', 'icon', "MEDIUMTEXT NULL COMMENT '自定义图标（base64 data URL）' AFTER `color`"],
   /* 回收站。口径与 tickets.deleted_at 完全一致：非空即在回收站里，
      默认列出去掉这些行；满 7 天由 services/retention.js 收走。
      老库补上这一列后所有条目都是 NULL，也就是"一篇都没删过" —— 不会被误判 */

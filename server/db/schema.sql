@@ -121,6 +121,8 @@ CREATE TABLE IF NOT EXISTS `bookmarks` (
   `group_id`   VARCHAR(48)   NOT NULL DEFAULT '' COMMENT '所属分组，对应 bookmark_groups.id',
   `note`       VARCHAR(120)  NOT NULL DEFAULT '' COMMENT '备注',
   `color`      VARCHAR(16)   NOT NULL DEFAULT '' COMMENT '品牌色',
+  `icon`       MEDIUMTEXT   NULL COMMENT '自定义图标（base64 data URL）',
+  `pinned`     TINYINT       NOT NULL DEFAULT 0 COMMENT '标星：常用网站（首页与工具箱共用）',
   `sort_order` INT           NOT NULL DEFAULT 0,
   PRIMARY KEY (`id`),
   KEY `idx_bookmarks_group` (`group_id`),

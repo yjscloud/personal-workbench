@@ -1,16 +1,50 @@
-import { useEffect, useState, type FormEvent } from 'react';
-import { Link } from 'react-router-dom';
-import { ArrowUpRight, Check, Cpu, ExternalLink, MemoryStick, Pencil, Plus, Receipt, Trash2, Zap } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { ArrowUpRight, BookOpen, Check, Cpu,  MemoryStick, Pencil, Plus, Receipt, Search, Trash2, TrendingUp, Zap } from 'lucide-react';
 import { useStore } from '@/lib/store';
 import { BookmarkModal, SiteIcon } from '@/components/bookmarks';
 import { useMonitor } from '@/lib/monitor';
-import { type Bookmark, type Priority } from '@/lib/api';
+import { api, type Bookmark, type KnowledgeItem, type Priority } from '@/lib/api';
 import { cls, fmtBytes, fmtEnergy, fmtMoney, hostOf, todayStr } from '@/lib/format';
-import { dailyQuote } from '@/lib/quotes';
+import { brandTint, paletteTint } from '@/lib/tint';
+import { engineLetters, engineTint, isBrightHue } from '@/lib/engine-color';
 import { Button, Card, CardHead, Empty, Input, Select, Skeleton } from '@/components/ui';
-import { PriorityBadge, Ring, STATUS_META, Stat, Tag } from '@/components/bits';
+import { PriorityBadge, STATUS_META, Stat, Tag } from '@/components/bits';
 
 const PRIORITY_OPTIONS: Priority[] = ['P0', 'P1', 'P2', 'P3'];
+
+/** 首页搜索联想里最多列几条本地命中。再多就把下面那些卡片顶下去了 */
+const SUGGEST_TOOL_MAX = 5;
+const SUGGEST_POST_MAX = 3;
+
+/** 打字的停顿时间。250ms 大致是"还在打"和"打完了"的那条分界：
+    再短就是一个字一个请求，再长候选词就显得迟钝 */
+const SUGGEST_DEBOUNCE_MS = 250;
+
+/** 知识库条目的短标签。刻意不共用 Knowledge.tsx 里那份 TYPE_META：
+    它是那一页的模块内常量，首页 import 会把整个知识库 chunk 拖进首屏
+    （那一页专门做了懒加载），为三个字不值得 */
+const POST_TYPE_LABEL: Record<KnowledgeItem['type'], string> = {
+  sop: 'SOP',
+  runbook: 'Runbook',
+  excerpt: '摘录',
+};
+
+/**
+ * 首页搜索框下拉里的一行：
+ * · tool    —— 工具箱里的入口，选中即新标签页打开（和点磁贴同一个动作）；
+ * · post    —— 知识库条目，选中即进阅读页；
+ * · suggest —— 搜索引擎自己的候选词（外部接口取回来的），选中即用它去搜；
+ * · search  —— 用当前引擎搜**输入框里的原文**。它**永远排在最后**：那是这个框
+ *              原本唯一的动作，也是没有高亮时回车的结果，得让它一直看得见。
+ *
+ * 前两类是"本站已有的东西"，后两类是"去外面找" —— 顺序也按这个来。
+ */
+type SearchSuggestion =
+  | { kind: 'tool'; bookmark: Bookmark }
+  | { kind: 'post'; post: KnowledgeItem }
+  | { kind: 'suggest'; word: string }
+  | { kind: 'search' };
 
 export default function Dashboard() {
   const { ready, error: storeError } = useStore();
@@ -27,8 +61,12 @@ export default function Dashboard() {
   return (
     <div className="mx-auto w-full max-w-[1440px] space-y-5">
       <GreetingBar />
-      <FocusRow />
+      <SearchBar />
       <KpiRow />
+
+      {/* 常用网站排在待办之前：它是每天真正会点的东西（一排入口），
+          先扫完入口再看清单，顺序才跟着一天的动作走 */}
+      <QuickLinks />
 
       <div className="grid gap-5 lg:grid-cols-3">
         <div className="lg:col-span-2">
@@ -37,7 +75,6 @@ export default function Dashboard() {
         <TopThree />
       </div>
 
-      <QuickLinks />
       <HintStrip />
     </div>
   );
@@ -79,71 +116,468 @@ function GreetingBar() {
   );
 }
 
-/** 主卡 + 圆环：左边是"今天该干什么"，右边是"还剩多少" */
-function FocusRow() {
-  const { todos, tickets } = useStore();
-  const { overview, error } = useMonitor();
+/**
+ * 首页搜索条：一条通栏输入框 + 一行引擎标签，铺在一块浅蓝焦点面上。
+ *
+ * 引擎来自「设置 → 搜索」（settings.search.engines），所以这里只负责
+ * "选一个、把词拼进它的地址"。地址模板里的 %s 由服务端保证存在（缺 %s 的
+ * 引擎保存时就被拒了），这里仍然兜一手：真碰上了就退回原地址，不让它变成
+ * 一个静默吞掉关键词的空操作。
+ *
+ * ── 为什么是"焦点面"而不是又一张白卡 ──────────────────────────────
+ * 这块位置原来就是那张蓝色 hero 卡。只放一张和白卡同质的 panel，页面顶部
+ * 就没了主次。改用 .focus-card.sky（与监控页顶上那块同源）把它重新变成
+ * "另一块面"，白条再从浅蓝底上浮起来 —— 这正是参考图里"白条压在有底色的
+ * 背景上"的关系。
+ *
+ * 外框不给圆角：全站只有两类面，容器（卡片/面板）是 16px 圆角、focus 面
+ * 是方角（监控页那块也没圆角）。跟它走，别把这块变成"一张圆角大卡"。
+ *
+ * ── 颜色从哪来 ──────────────────────────────────────────────────────
+ * 每颗引擎标签的**字**带自己的品牌色：色相按引擎地址的域名查一张内置表，
+ * 认不出的按域名散列（同一个引擎永远同一个颜色）。所以用户在设置里
+ * 加任何一个搜索引擎，它都自带颜色，不必再多填一个色值 ——
+ * 这是这块"有颜色"的关键：四个灰底小方块并排，谁也认不出是哪家。
+ * 底色反而是**中性**的（一层半透明白）：一排彩底会互相抢，
+ * 只有彩色落在字上，才能一眼扫过去认出哪家是哪家。
+ * Google 那种本身就是多彩的，逐字上色（见 lib/engine-color.ts）。
+ * 选中引擎的色相还会染到白条的聚焦环、搜索按钮和整块面右上角那团柔光，
+ * 于是换一下引擎，整块搜索区的颜色跟着变。
+ * 明度一律交给主题（CSS 里 hsl(var(--se-h) var(--se-s) L%)），JS 不算颜色。
+ *
+ * 占位符用当前引擎自己的名字（「在 百度 中搜索」）而不是参考图里写死的
+ * 「百度一下」—— 引擎是可配的，写死的提示语在换掉引擎之后就成了假话。
+ *
+ * ── 联想 ────────────────────────────────────────────────────────────
+ * 输入时在白条下面列候选，四类来源见 SearchSuggestion：本站的工具入口、
+ * 知识库文章，以及**外部搜索引擎自己的候选词**（由服务端代取，见
+ * server/services/suggest.js —— 那几家都不给 CORS 头，浏览器直连读不到响应）。
+ *
+ * "回车 = 用当前引擎搜"这条老行为一个字都没改：默认不高亮任何候选，
+ * 按了方向键才进入候选，选中了才会离开本页。外发只发生在"设置里开着联想
+ * 且当前引擎在映射表里认得出"这一种情况下。
+ */
+function SearchBar() {
+  const { settings, bookmarks, groups, knowledge } = useStore();
+  const navigate = useNavigate();
+  const engines = settings?.search?.engines ?? [];
+  const newTab = settings?.search?.newTab ?? true;
+  const [picked, setPicked] = useState('');
+  const [q, setQ] = useState('');
 
-  const status = overview?.status;
-  // 待办清单（todos）和任务（tickets）是两张表：右边圆环量的是待办清单的完成度
-  const pending = todos.filter((t) => !t.done);
-  const doneToday = todos.length - pending.length;
-  // 回收站与归档里的任务一律不计：它们已经不在工作流里了
-  const liveTickets = tickets.filter((t) => !t.deletedAt && !t.archivedAt);
-  const liveDone = liveTickets.filter((t) => t.status === 'done').length;
-  const openTickets = liveTickets.length - liveDone;
+  /* 引擎列表可能在别处被改（设置页存完会刷新全站设置）：选中的那个要是被删了，
+     就回落到默认项、再回落到第一个，而不是留着悬空 id 让选中态和实际不一致。
+     它算在最前面（而不是像原来那样算在下面）：下面那个联想 effect 的依赖里
+     要用到它，而 hook 的依赖数组是在渲染时就求值的。 */
+  const active =
+    engines.find((e) => e.id === picked) ??
+    engines.find((e) => e.id === settings?.search?.defaultEngine) ??
+    engines[0];
 
-  // 每日一句：按日期确定性挑选，同一天永远同一句，跨零点自然翻篇（见 lib/quotes.ts）
-  const quote = dailyQuote();
+  /* ── 搜索联想 ──────────────────────────────────────────────────────
+     这个框原来是"打词 → 回车 → 新标签页打开搜索引擎"。联想不接外部搜索建议：
+     那要么依赖非官方接口、要么把用户输入发给第三方，对一个内网工具都不合适。
+     改成列**你自己的东西** —— 工具箱里的入口与知识库里的文章，本来就在内存里，
+     零延迟，而且"搜到就能直达"。
 
-  const chips = [
-    // 用「进行中的任务数」而不是待办完成度：待办清单常常是空的，
-    // 0/0 摆在那里只有噪音，跟下面「今日待办」卡片的口径也对不上
-    { value: String(openTickets), unit: '件', label: '进行中的任务' },
-    { value: `${liveDone}/${liveTickets.length}`, label: '本周任务已完成' },
-    { value: status ? String(Math.floor(status.uptime / 86400)) : '—', unit: '天', label: '节点连续运行' },
-  ];
+     只在真有本地命中时才弹面板：否则纯外部搜索每敲一个字都顶出一层
+     "用 百度 搜索…"，纯属打扰 —— 那件事回车本来就做，不必再说一遍。 */
+  const [sugOpen, setSugOpen] = useState(false);
+  /* -1 = 没有任何一条高亮。默认必须是这样：回车在这个框里的含义要**保持原样**
+     （用当前引擎搜），不能被联想悄悄改掉。按 ↓ 才进入候选。 */
+  const [sugIndex, setSugIndex] = useState(-1);
+  const suggRef = useRef<HTMLDivElement>(null);
 
-  return (
-    <div className="grid gap-5 lg:grid-cols-[minmax(0,2.1fr)_minmax(0,1fr)]">
-      <section className="focus-card relative overflow-hidden rounded-xl2 p-5 sm:p-7">
-        <div className="relative z-10">
-          <p className="text-2xs tracking-[0.14em] opacity-90">
-            今日主题 · {new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })}
-          </p>
-          {/* 大字留给一句能读进去的话，数据交给下面那句和三个指标——
-              卡片才有喘息的余地。语录按日期确定，不会每次渲染都换 */}
-          <h2 className="mt-3 max-w-lg text-[22px] font-semibold leading-snug sm:text-[25px]">{quote.text}</h2>
-          {quote.from ? <p className="mt-2 text-2xs opacity-70">{quote.from}</p> : null}
-          <p className="mt-3 max-w-lg text-xs leading-relaxed opacity-90">
-            {error ? `监控接口返回：${error}` : `本周还有 ${openTickets} 件任务没结束。`}
-          </p>
-          <div className="mt-6 flex flex-wrap gap-x-7 gap-y-4 sm:gap-x-9">
-            {chips.map((c) => (
-              <div key={c.label}>
-                <p className="num text-[22px] font-semibold leading-none">
-                  {c.value}
-                  {c.unit ? <span className="ml-1 text-xs font-normal opacity-90">{c.unit}</span> : null}
-                </p>
-                <p className="mt-1.5 text-2xs opacity-90">{c.label}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
+  /* 外部联想词。它比本地候选慢一截（要出网），所以单独存一份：
+     本地命中立刻出现，外部候选到了再插进来，互不阻塞。 */
+  const [remote, setRemote] = useState<string[]>([]);
+  const [remoteLabel, setRemoteLabel] = useState('');
+  /* 当前引擎在服务端的映射表里认不出来（自建引擎、GitHub…）：
+     问过一次就不再问，省掉每个字一次注定空手而归的请求 */
+  const [remoteOff, setRemoteOff] = useState(false);
+  const suggestOn = settings?.search?.suggest !== false;
+  /* 请求序号：只认最后一次发出的那个响应。打字快时响应会乱序回来，
+     不认序号就会出现"候选词和你此刻打的字对不上" */
+  const suggestSeq = useRef(0);
 
-      <section className="panel flex flex-col items-center justify-center gap-4 p-5 sm:p-6">
-        {/* 待办清单为空时圆环改为量任务：不然永远是 0/1，一个没有信息量的读数 */}
-        <Ring value={todos.length ? doneToday : liveDone} total={todos.length || liveTickets.length || 1} />
-        <p className="max-w-[13rem] text-center text-2xs leading-relaxed text-muted">
-          {pending.length
-            ? `还剩 ${pending.length} 件，先挑最重要那件。`
-            : openTickets
-              ? `待办已清空，还有 ${openTickets} 件任务在跑。`
-              : '今天的清单已经清空。'}
+  const needle = q.trim().toLowerCase();
+
+  useEffect(() => {
+    if (!needle || !suggestOn || remoteOff || !active?.id) {
+      setRemote([]);
+      return;
+    }
+    const seq = (suggestSeq.current += 1);
+    /* debounce：一个字一个请求既没必要，也容易被对面当成异常流量 */
+    const timer = window.setTimeout(() => {
+      api.search
+        .suggest(active.id, needle)
+        .then((res) => {
+          if (seq !== suggestSeq.current) return;
+          if (!res.supported || !res.enabled) {
+            setRemoteOff(true);
+            setRemote([]);
+            return;
+          }
+          setRemote(res.items);
+          setRemoteLabel(res.label ?? '');
+          /* 候选是异步插进列表的，到达时列表长度会变。这时把高亮收回"没选中"：
+             否则回车会打在那条刚插进来的候选上 —— 而用户以为自己选的是另一条。
+             回车的含义始终是"搜当前输入"，这条不变式比"保住高亮"重要。 */
+          setSugIndex(-1);
+        })
+        /* 服务端已经把失败吞成空数组了，这里再兜一层网络异常：
+           联想拿不到不该在首页弹错误 */
+        .catch(() => {
+          if (seq === suggestSeq.current) setRemote([]);
+        });
+    }, SUGGEST_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [needle, suggestOn, remoteOff, active?.id]);
+
+  const rows = useMemo<SearchSuggestion[]>(() => {
+    if (!needle) return [];
+    const local: SearchSuggestion[] = [
+      ...bookmarks
+        .filter((b) => `${b.name} ${b.url} ${b.note}`.toLowerCase().includes(needle))
+        .slice(0, SUGGEST_TOOL_MAX)
+        .map((bookmark) => ({ kind: 'tool' as const, bookmark })),
+      /* 回收站里的不算命中：它已经"删掉了"，在首页又搜出来只会让人以为没删成 */
+      ...knowledge
+        .filter((k) => !k.deletedAt && `${k.title} ${k.summary} ${k.tags.join(' ')}`.toLowerCase().includes(needle))
+        .slice(0, SUGGEST_POST_MAX)
+        .map((post) => ({ kind: 'post' as const, post })),
+    ];
+    const outside: SearchSuggestion[] = remote.map((word) => ({ kind: 'suggest' as const, word }));
+    /* 本地与外部一条都没有时**不弹面板**：那会变成"每敲一个字都顶出一层
+       '用 百度 搜索…'"，而那是回车本来就会做的事，不必再说一遍。
+       外部候选词一到，面板才有真正的新内容可给。 */
+    if (!local.length && !outside.length) return [];
+    /* 顺序：自己的东西优先（零延迟、直达），别人的候选词其次，最后是搜索动作 */
+    return [...local, ...outside, { kind: 'search' as const }];
+  }, [bookmarks, knowledge, remote, needle]);
+
+  const sugVisible = sugOpen && rows.length > 0;
+  /* 高亮位置夹一下：候选会随输入变短。sugIndex 为 -1 时这里仍是 -1（没高亮） */
+  const sugActive = Math.min(sugIndex, rows.length - 1);
+
+  /* 点外面就收起。与工具箱那处同一个理由：不用输入框的 blur ——
+     blur 会抢在"按住候选行"之前发生，下拉先消失，那一下点击就落空了 */
+  useEffect(() => {
+    if (!sugVisible) return;
+    const onDown = (e: MouseEvent) => {
+      if (!suggRef.current?.contains(e.target as Node)) setSugOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [sugVisible]);
+
+  if (!active) {
+    return (
+      <section aria-label="搜索" className="focus-card sky relative p-4 sm:p-6">
+        <p className="text-xs leading-relaxed text-muted">
+          还没有配置搜索引擎。去「设置 → 搜索」添加一个，这里就会出现搜索框。
         </p>
       </section>
-    </div>
+    );
+  }
+
+  /** 已确认非空，供下面的事件处理函数使用（闭包里的类型收窄会丢） */
+  const engine = active;
+  /* 选中引擎的色相。它挂在 section 上：白条的聚焦环、搜索按钮、右上角那团光
+     都用它；每颗标签再各自覆盖一份自己的色相（见下面的 map），互不干扰 */
+  const tint = engineTint(engine.url);
+
+  /** 候选行右端那点说明用的分类名 */
+  function groupName(id: string) {
+    return groups.find((g) => g.id === id)?.name ?? '未分类';
+  }
+
+  /**
+   * 用当前引擎搜：这个框原来的、也是默认的动作（没有高亮时回车走它）。
+   * 传词就搜那个词（选中外部候选词时用），不传就搜输入框里的原文。
+   */
+  function runSearch(word: string = q) {
+    const value = word.trim();
+    if (!value) return;
+    const target = engine.url.includes('%s') ? engine.url.replace('%s', encodeURIComponent(value)) : engine.url;
+    if (newTab) window.open(target, '_blank', 'noopener,noreferrer');
+    else window.location.href = target;
+    setQ('');
+    setSugIndex(-1);
+    setSugOpen(false);
+  }
+
+  function submit(e: FormEvent) {
+    e.preventDefault();
+    runSearch();
+  }
+
+  /** 选中一行候选 */
+  function pick(s: SearchSuggestion) {
+    if (s.kind === 'tool') {
+      /* 和工具箱里的磁贴同一个动作。搜索词**不清** ——
+         接着挑下一个时不用把刚才那两个字重打一遍 */
+      window.open(s.bookmark.url, '_blank', 'noopener,noreferrer');
+    } else if (s.kind === 'post') {
+      /* 文章是站内的，用不上"新标签页"：直接换页更顺 */
+      navigate(`/knowledge/${s.post.id}`);
+      setQ('');
+    } else if (s.kind === 'suggest') {
+      /* 候选词本身就是"拿它去搜"，所以直接当搜索词提交，
+         不必先把它填回输入框再让用户按一次回车 */
+      runSearch(s.word);
+    } else {
+      runSearch();
+    }
+    setSugIndex(-1);
+    setSugOpen(false);
+  }
+
+  return (
+    <section
+      aria-label="搜索"
+      className="focus-card sky relative p-4 sm:p-6"
+      style={{ '--se-h': tint.h, '--se-s': `${tint.s}%` } as CSSProperties}
+    >
+      {/* 右上角一团同色相的柔光（换引擎时整块面的颜色跟着变）。
+          绝对定位铺满、内容是 z-10，所以它只出现在背景这一层。 */}
+      <span aria-hidden className="se-glow pointer-events-none absolute inset-0" />
+
+      <div className="relative z-10">
+        {/* 引擎切换：每颗标签带**自己的品牌色** —— 色相由 lib/engine-color.ts
+            按域名给出，所以用户在设置里加任何一个引擎，它都自带颜色，
+            不必再多填一个色值。选中那颗换白底 + 一圈同色相细边 + 软投影。
+            gap-2（8px）：相邻可点元素之间至少留 8px，手指才不会点到隔壁；
+            左边不留负边距 —— 第一颗胶囊的左缘和白条左缘对齐，
+            这条竖线比省几像素重要得多。 */}
+        <div role="group" aria-label="选择搜索引擎" className="flex flex-wrap items-center gap-2">
+          {engines.map((e) => {
+            const t = engineTint(e.url);
+            const on = e.id === engine.id;
+            /* 多彩品牌（Google）逐字上色，其余整块一个颜色 */
+            const letters = engineLetters(e.url, e.name);
+            return (
+              <button
+                key={e.id}
+                type="button"
+                onClick={() => setPicked(e.id)}
+                aria-pressed={on}
+                data-active={on ? 'true' : undefined}
+                style={{ '--se-h': t.h, '--se-s': `${t.s}%` } as CSSProperties}
+                className="se-chip h-8 shrink-0 rounded-full px-3.5 text-xs font-medium"
+              >
+                {letters ? (
+                  <span aria-hidden className="se-ml">
+                    {letters.map((c, i) => (
+                      <span key={i} style={{ color: c }}>
+                        {e.name[i]}
+                      </span>
+                    ))}
+                  </span>
+                ) : (
+                  e.name
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+      {/* 白条与搜索按钮同处一个容器：间距、对齐、聚焦环都只在这一层处理，
+          不必用绝对定位去压输入框的右侧内边距（那样窄屏上按钮会盖住文字）。
+          h-14 比常规输入框高一档 —— 这是首页唯一的主动作。
+          按钮是选中引擎的实心品牌色，聚焦环也染成同一色相：换引擎时整块
+          搜索区一起换色，这是它"有颜色"的主要来源。
+          （黄橙那段色相白图标压不住，由 data-bright 压深一档，见 engine-color.ts） */}
+      <form role="search" onSubmit={submit} className="mt-4">
+        {/* 联想面板锚在这一层：左右都与白条齐平，于是它天生不会越出屏幕
+            （工具箱那个框的教训：锚在输入框窄边、面板却更宽，窄窗口下会有一截
+            跑到视口外面，看上去就是"打字没反应"） */}
+        <div ref={suggRef} className="relative">
+          <div className="se-bar flex h-14 items-center gap-2 rounded-field pl-4 pr-1.5">
+            <input
+              value={q}
+              onChange={(e) => {
+                setQ(e.target.value);
+                /* 每敲一下都把高亮拉回"没选中"：否则回车会打在上一条上，
+                   而它跟这次输的词可能毫无关系 */
+                setSugIndex(-1);
+                setSugOpen(true);
+              }}
+              onFocus={() => {
+                if (needle) setSugOpen(true);
+              }}
+              onKeyDown={(e) => {
+                /* Esc 两级退路：先收下拉，已经收着就把词清掉 */
+                if (e.key === 'Escape') {
+                  if (sugVisible) {
+                    e.preventDefault();
+                    setSugOpen(false);
+                  } else if (q) {
+                    e.preventDefault();
+                    setQ('');
+                  }
+                  return;
+                }
+                if (!sugVisible) return;
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  const delta = e.key === 'ArrowDown' ? 1 : -1;
+                  /* 从"没高亮"进来时：↓ 落到第一条，↑ 落到最后一条（= 搜索）。
+                     之后环绕，比"到头就不动"少一次茫然 */
+                  setSugIndex((i) =>
+                    i < 0 ? (delta > 0 ? 0 : rows.length - 1) : (i + delta + rows.length) % rows.length,
+                  );
+                  return;
+                }
+                /* 只有真的高亮着某一条时才拦回车；否则回车照旧 = 搜索 */
+                if (e.key === 'Enter' && sugActive >= 0) {
+                  e.preventDefault();
+                  pick(rows[sugActive]);
+                }
+              }}
+              placeholder={`在 ${engine.name} 中搜索`}
+              aria-label={`用 ${engine.name} 搜索`}
+              /* 不用 type="search"：WebKit 会再画一个原生清除叉，
+                 和右边那颗搜索按钮挤在同一角上，看着像出了故障。
+                 手机上要的"回车即搜"由 enterKeyHint 给。 */
+              enterKeyHint="search"
+              /* 关掉浏览器自己的补全：它和这一份会叠着弹，两个候选框打架 */
+              autoComplete="off"
+              spellCheck={false}
+              /* combobox + listbox 那套：方向键改的是 aria-activedescendant，
+                 焦点始终留在输入框里，读屏会跟着念当前那一条 */
+              role="combobox"
+              aria-expanded={sugVisible}
+              aria-controls={sugVisible ? 'home-suggest' : undefined}
+              aria-autocomplete="list"
+              aria-activedescendant={sugVisible && sugActive >= 0 ? `home-suggest-${sugActive}` : undefined}
+              className="min-w-0 flex-1 bg-transparent text-[15px] text-ink outline-none placeholder:text-faint"
+            />
+            <button
+              type="submit"
+              data-bright={isBrightHue(tint.h) ? '' : undefined}
+              aria-label={`用 ${engine.name} 搜索`}
+              title={`用 ${engine.name} 搜索`}
+              className="se-go grid h-11 w-11 shrink-0 place-items-center rounded-field"
+            >
+              <Search size={17} aria-hidden />
+            </button>
+          </div>
+
+          {sugVisible ? (
+            <div className="absolute left-0 right-0 top-full z-20 mt-2 overflow-hidden rounded-field border border-line bg-panel shadow-pop">
+              <ul
+                id="home-suggest"
+                role="listbox"
+                aria-label="本地面板与文章"
+                className="max-h-[19rem] overflow-y-auto overscroll-contain py-1"
+              >
+                {rows.map((s, i) => (
+                  <li
+                    key={
+                      s.kind === 'tool'
+                        ? `t:${s.bookmark.id}`
+                        : s.kind === 'post'
+                          ? `p:${s.post.id}`
+                          : s.kind === 'suggest'
+                            ? `s:${s.word}`
+                            : 'search'
+                    }
+                    /* listbox 的子元素只该是 option，包一层的 li 交还给普通列表语义 */
+                    role="presentation"
+                  >
+                    <button
+                      type="button"
+                      id={`home-suggest-${i}`}
+                      role="option"
+                      aria-selected={i === sugActive}
+                      /* mousedown 而不是 click：click 之前输入框已经失焦，
+                         外面那层"点别处就收"会抢先关掉下拉，这一下就点空了 */
+                      onMouseDown={(ev) => {
+                        ev.preventDefault();
+                        pick(s);
+                      }}
+                      /* 44px 是触控目标的下限（22px 图标 + 上下各 11px 内边距正好够） */
+                      className={cls(
+                        'flex min-h-[44px] w-full items-center gap-2.5 px-3 py-2.5 text-left transition-colors',
+                        i === sugActive ? 'bg-accent-soft' : 'hover:bg-bg-2',
+                      )}
+                    >
+                      {s.kind === 'tool' ? (
+                        <>
+                          <SiteIcon bookmark={s.bookmark} size={22} />
+                          <span
+                            className={cls(
+                              'min-w-0 flex-1 truncate text-[13px]',
+                              i === sugActive ? 'text-accent' : 'text-ink',
+                            )}
+                          >
+                            {s.bookmark.name}
+                          </span>
+                          <span className="shrink-0 text-2xs text-faint">{groupName(s.bookmark.group)}</span>
+                        </>
+                      ) : s.kind === 'post' ? (
+                        <>
+                          {/* 图标占位与 SiteIcon 的 22px 对齐，一行行才会齐 */}
+                          <span aria-hidden className="grid h-[22px] w-[22px] shrink-0 place-items-center text-faint">
+                            <BookOpen size={15} />
+                          </span>
+                          <span
+                            className={cls(
+                              'min-w-0 flex-1 truncate text-[13px]',
+                              i === sugActive ? 'text-accent' : 'text-ink',
+                            )}
+                          >
+                            {s.post.title}
+                          </span>
+                          <span className="shrink-0 text-2xs text-faint">{POST_TYPE_LABEL[s.post.type] ?? '文章'}</span>
+                        </>
+                      ) : s.kind === 'suggest' ? (
+                        <>
+                          <span aria-hidden className="grid h-[22px] w-[22px] shrink-0 place-items-center text-faint">
+                            <TrendingUp size={15} />
+                          </span>
+                          <span
+                            className={cls(
+                              'min-w-0 flex-1 truncate text-[13px]',
+                              i === sugActive ? 'text-accent' : 'text-ink',
+                            )}
+                          >
+                            {s.word}
+                          </span>
+                          {/* 标出来源：这几行是外面给的，和上面"自己的东西"不是一回事 */}
+                          <span className="shrink-0 text-2xs text-faint">
+                            {remoteLabel ? `${remoteLabel} 建议` : '搜索建议'}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <span aria-hidden className="grid h-[22px] w-[22px] shrink-0 place-items-center text-faint">
+                            <Search size={15} />
+                          </span>
+                          <span
+                            className={cls(
+                              'min-w-0 flex-1 truncate text-[13px]',
+                              i === sugActive ? 'text-accent' : 'text-ink',
+                            )}
+                          >
+                            用 {engine.name} 搜索「{q.trim()}」
+                          </span>
+                          <span className="shrink-0 text-2xs text-faint">回车</span>
+                        </>
+                      )}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <p className="border-t border-line px-3 py-1 text-2xs text-faint">↑↓ 选择 · Enter 选中 · Esc 关掉</p>
+            </div>
+          ) : null}
+        </div>
+      </form>
+      </div>
+    </section>
   );
 }
 
@@ -564,15 +998,16 @@ function QuickLinks() {
   const [editing, setEditing] = useState<Bookmark | null>(null);
   const [creating, setCreating] = useState(false);
 
-  /* 只显示标了星（常用）的入口。
+  /* 只显示标记为常用的入口。
      但一个都没标过时退回"全部" —— 否则这块会突然空掉，看上去像数据丢了。
-     一旦有人开始标记，就只认标记，这才是"常用"的意义。 */
+     一旦有人开始标记，就只认标记，这才是"常用"的意义。
+     标记本身在「编辑工具」弹窗里的「设为常用」开关上（工具箱那边也一样），
+     这一页只负责把标过的东西摆出来。 */
   const pinned = bookmarks.filter((b) => b.pinned);
   const fallback = pinned.length === 0;
   const scoped = fallback ? bookmarks : pinned;
 
   const filtered = activeGroup === 'all' ? scoped : scoped.filter((b) => b.group === activeGroup);
-  const groupName = (id: string) => groups.find((g) => g.id === id)?.name ?? '未分组';
 
   return (
     <Card>
@@ -580,8 +1015,8 @@ function QuickLinks() {
         title="常用网站"
         hint={
           fallback
-            ? `${bookmarks.length} 个入口 · 还没标记常用，去工具箱点星标挑选`
-            : `${pinned.length} 个常用 · 在工具箱点星标可增减`
+            ? `${bookmarks.length} 个入口 · 还没标记常用，编辑工具时打开「设为常用」即可挑选`
+            : `${pinned.length} 个常用 · 编辑工具里的「设为常用」可增减`
         }
         right={
           <Button size="sm" variant="soft" onClick={() => setCreating(true)}>
@@ -618,53 +1053,55 @@ function QuickLinks() {
           }
         />
       ) : (
-        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-          {filtered.map((bm) => (
-            <div key={bm.id} className="group relative">
-              <a
-                href={bm.url}
-                target="_blank"
-                rel="noreferrer noopener"
-                className="flex items-center gap-3 rounded-field bg-bg-2/70 p-2.5 pr-16 transition-colors hover:bg-accent-soft"
-              >
-                <SiteIcon bookmark={bm} />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13px] font-medium">{bm.name}</span>
-                  <span className="num block truncate text-2xs text-faint">
-                    {hostOf(bm.url)}
-                    {bm.note ? ` · ${bm.note}` : ''}
-                  </span>
-                </span>
-              </a>
-              <div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-                <button
-                  type="button"
-                  onClick={() => setEditing(bm)}
-                  aria-label={`编辑 ${bm.name}`}
-                  className="rounded-field p-1.5 text-faint transition-colors hover:bg-panel hover:text-ink"
-                >
-                  <Pencil size={12} />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void bookmarksApi.remove(bm.id)}
-                  aria-label={`删除 ${bm.name}`}
-                  className="rounded-field p-1.5 text-faint transition-colors hover:bg-panel hover:text-crit"
-                >
-                  <Trash2 size={12} />
-                </button>
+        /* 正方形磁贴：图标在上、名字在下，一眼扫过去就是"一排入口"。
+           配色直接借工具箱那套 tb-card（品牌色 / 糖纸色）—— 首页与工具箱
+           于是是同一族磁贴，不会出现"首页一种、工具箱另一种"。
+           列数按"一张约 90~100px"定：再大，一屏就放不下几个。
+           间距给到 gap-4（16px）—— 原来的 8px 正好压在"相邻可点元素
+           最小间距"的下限上，磁贴一大就显得挤在一起。 */
+        <div className="grid grid-cols-3 gap-4 sm:grid-cols-5 md:grid-cols-7 lg:grid-cols-9 xl:grid-cols-13">
+          {filtered.map((bm) => {
+            const brand = brandTint(bm.color);
+            return (
+              <div key={bm.id} className="group relative">
                 <a
                   href={bm.url}
                   target="_blank"
                   rel="noreferrer noopener"
-                  aria-label={`打开 ${bm.name}`}
-                  className="rounded-field p-1.5 text-faint transition-colors hover:bg-panel hover:text-ink"
+                  title={bm.note ? `${bm.name} · ${hostOf(bm.url)} · ${bm.note}` : `${bm.name} · ${hostOf(bm.url)}`}
+                  data-brand={brand ? '' : undefined}
+                  style={brand ? ({ '--tb-h': brand.h, '--tb-s': `${brand.s}%` } as CSSProperties) : undefined}
+                  className={cls(
+                    'tb-card flex aspect-square flex-col items-center justify-center gap-1.5 rounded-xl2 p-1.5',
+                    brand ? '' : `tb-tint-${paletteTint(bm.id || bm.name)}`,
+                  )}
                 >
-                  <ExternalLink size={12} />
+                  <span className="tb-icon grid place-items-center">
+                    <SiteIcon bookmark={bm} size={30} fill />
+                  </span>
+                  <span className="w-full truncate px-1 text-center text-xs font-medium text-ink">{bm.name}</span>
                 </a>
+                <div className="absolute right-1 top-1 flex items-center gap-0.5 rounded-field bg-panel/85 p-0.5 backdrop-blur-sm opacity-100 transition-opacity focus-within:opacity-100 sm:opacity-0 sm:group-hover:opacity-100">
+                  <button
+                    type="button"
+                    onClick={() => setEditing(bm)}
+                    aria-label={`编辑 ${bm.name}`}
+                    className="rounded-field p-1.5 text-faint transition-colors hover:bg-panel hover:text-ink"
+                  >
+                    <Pencil size={12} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void bookmarksApi.remove(bm.id)}
+                    aria-label={`删除 ${bm.name}`}
+                    className="rounded-field p-1.5 text-faint transition-colors hover:bg-panel hover:text-crit"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -679,7 +1116,7 @@ function QuickLinks() {
         }}
         onSave={async (payload) => {
           if (editing) await bookmarksApi.patch(editing.id, payload);
-          else await bookmarksApi.add(payload as { name: string; url: string });
+          else await bookmarksApi.add(payload as Partial<Bookmark> & { name: string; url: string });
           setCreating(false);
           setEditing(null);
         }}
@@ -689,27 +1126,26 @@ function QuickLinks() {
 }
 
 /* ── 骨架 ─────────────────────────────────────────────────────────── */
-/* 形状照着真实布局摆：两栏头图 + 四张小卡 + 两张大卡 + 一张通栏。
+/* 形状照着真实布局摆：搜索条 + 四张监控小卡 + 常用网站 + 两张大卡。
    骨架的价值就是"数据到达时高度不跳"，所以这里不用一套通用形状糊过去。
    末尾原本还跟着一行「转圈 + 正在加载工作台数据…」，已删：上面的块已经在说
    同一件事，再挂一行等于把"加载中"说了两遍。读屏播报交给 sr-only 那句。 */
 function PageSkeleton() {
   return (
     <div className="mx-auto w-full max-w-[1440px] space-y-4" role="status" aria-busy="true">
-      <div className="grid gap-5 lg:grid-cols-[minmax(0,2.1fr)_minmax(0,1fr)]">
-        <Skeleton className="h-[220px]" />
-        <Skeleton className="h-[220px]" />
-      </div>
+      {/* 搜索条：浅蓝焦点面 = 上下内边距 + 一行 32px 引擎标签 + 一条 56px 输入框 */}
+      <Skeleton className="h-[136px] sm:h-[152px]" />
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {[0, 1, 2, 3].map((i) => (
           <Skeleton key={i} className="h-[86px]" />
         ))}
       </div>
+      {/* 常用网站：一排正方形磁贴（约 132px 一档：卡头 + 标签行 + 一行磁贴） */}
+      <Skeleton className="h-[132px]" />
       <div className="grid gap-4 lg:grid-cols-3">
         <Skeleton className="h-72 lg:col-span-2" />
         <Skeleton className="h-72" />
       </div>
-      <Skeleton className="h-44" />
       <span className="sr-only">正在加载工作台数据…</span>
     </div>
   );

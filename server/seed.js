@@ -191,6 +191,25 @@ export function defaultData() {
     settings: {
       // 首页问候语里的称呼。留空则只显示「早上好」，不带名字。
       profile: { name: '' },
+      /* 首页那个搜索框。engines 是一串搜索引擎，url 里的 %s 是查询词的占位符
+         （提交时用 encodeURIComponent 填进去）。在「设置 → 搜索」里增删改，
+         所以这里只是初始的四个，不是白名单。 */
+      search: {
+        engines: [
+          { id: 'se_baidu', name: '百度', url: 'https://www.baidu.com/s?wd=%s' },
+          { id: 'se_google', name: 'Google', url: 'https://www.google.com/search?q=%s' },
+          { id: 'se_duck', name: 'DuckDuckGo', url: 'https://duckduckgo.com/?q=%s' },
+          { id: 'se_github', name: 'GitHub', url: 'https://github.com/search?q=%s' },
+        ],
+        // 默认选中的引擎 id。留空则用列表里的第一个。
+        defaultEngine: 'se_baidu',
+        /* 联想：把词发给搜索引擎取它的候选词（设置页可关）。
+           只在映射表里认得出的引擎（百度 / Google / Bing / 360）才有，
+           其余（DuckDuckGo、GitHub…）只是没有候选词，搜索照常。 */
+        suggest: true,
+        // 结果在新标签页打开。关掉就是当前页跳走——会离开工作台，默认开着。
+        newTab: true,
+      },
       // 背景图。none = 用主题自带的 canvas 网格渐变。
       //   url    —— 填一个外链地址
       //   upload —— 上传的图，存在 server/data/background/ 下，经 /api/background 提供

@@ -80,6 +80,13 @@ export type Bookmark = {
   group: string;
   note: string;
   color?: string;
+  /**
+   * 自定义图标（base64 data URL）。**只用于提交**——
+   * 列表接口不回本体（几十张图 base64 会把首屏顶得很难看），只给 hasIcon。
+   */
+  icon?: string;
+  /** 服务端告知「这个书签有自定义图标」，本体走 /bookmarks/:id/icon 取 */
+  hasIcon?: boolean;
   /** 标记为常用：会出现在首页「常用网站」里 */
   pinned?: boolean;
 };
@@ -604,9 +611,25 @@ export type LoginBackground = {
   size?: number | null;
 };
 
+/** 一个搜索引擎：url 里的 %s 是查询词占位符，提交时用 encodeURIComponent 填进去 */
+export type SearchEngine = { id: string; name: string; url: string };
+
 export type Settings = {
   /** 首页问候语里的称呼；为空则只显示「早上好」 */
   profile: { name: string };
+  /** 首页搜索框：引擎列表 + 默认项 + 是否新标签页打开 */
+  search: {
+    engines: SearchEngine[];
+    /** 默认选中的引擎 id；为空则用列表第一个 */
+    defaultEngine: string;
+    newTab: boolean;
+    /**
+     * 联想：把输入发给所选搜索引擎，取它的候选词。
+     * 缺省视为开启（老配置里没有这个字段），这是本站唯一会把输入
+     * 转发给第三方的功能，所以设置页给了开关和说明。
+     */
+    suggest?: boolean;
+  };
   background: BackgroundSettings;
   /** 登录页自己的背景图 */
   loginBackground: LoginBackground;
@@ -833,6 +856,9 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return payload.data as T;
 }
 
+/** 自定义图标的地址。列表里只给 hasIcon，本体走这个接口取（可协商缓存） */
+export const bookmarkIconUrl = (id: string) => `${BASE}/bookmarks/${encodeURIComponent(id)}/icon`;
+
 const send = (method: string, body?: unknown) => ({
   method,
   body: body === undefined ? undefined : JSON.stringify(body),
@@ -1024,6 +1050,13 @@ export const api = {
         colors: { id: string; name: string; color: string; source: 'theme-color' | 'icon' }[];
         failed: { id: string; name: string; error: string }[];
       }>('/bookmarks/refresh-colors', send('POST', body)),
+    /**
+     * 重排磁贴顺序：传整份 id 顺序（工具箱那面墙的顺序），服务端按下标写回。
+     * `moved` 只在跨分类拖动时才带 —— 被拖到别的分类邻居之间的那张，
+     * 顺带把分类一起改掉，两件事在服务端是同一次写入。
+     */
+    reorder: (ids: string[], moved: { id: string; group: string }[] = []) =>
+      req<{ bookmarks: Bookmark[] }>('/bookmarks/reorder', send('POST', { ids, moved })),
     createGroup: (name: string) => req<Group>('/groups', send('POST', { name })),
     /** 改分类名。书签按 id 关联分组，所以改名不会动到任何书签 */
     renameGroup: (id: string, name: string) => req<Group>(`/groups/${id}`, send('PATCH', { name })),
@@ -1143,6 +1176,21 @@ export const api = {
   settings: {
     get: () => req<Settings>('/settings'),
     save: (patch: DeepPartial<Settings>) => req<Settings>('/settings', send('PUT', patch)),
+  },
+
+  search: {
+    /**
+     * 外部搜索建议（首页大搜索框的联想词）。由服务端代取 ——
+     * 这几家都不给 CORS 头，浏览器直连读不到响应。
+     *
+     * `supported: false` 表示当前引擎在服务端的映射表里认不出来
+     * （自建搜索引擎、GitHub 这类），页面就不必再问了；
+     * `enabled: false` 表示用户在设置里把联想关了，服务端也不会去取。
+     */
+    suggest: (engine: string, q: string) =>
+      req<{ items: string[]; source: string | null; label?: string; supported: boolean; enabled: boolean }>(
+        `/search/suggest?engine=${encodeURIComponent(engine)}&q=${encodeURIComponent(q)}`,
+      ),
   },
 
   backup: {

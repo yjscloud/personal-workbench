@@ -25,6 +25,12 @@ export function paletteTint(seed: string): Tint {
   return PALETTE[h % PALETTE.length];
 }
 
+/** 没有品牌色可用的对象（没探测到 / 本来就是灰的），按 seed 稳定散列出一个色相。
+    与糖纸色板同源，所以它兜出来的颜色不会和有品牌色的那些打架。 */
+export function fallbackHue(seed: string): number {
+  return PALETTE_HUE[paletteTint(seed)];
+}
+
 const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
 
 /** '#abc' / '#aabbcc' → [r,g,b]；认不出来返回 null */

@@ -145,7 +145,7 @@ const ENTITIES = [
     set: (d, list) => {
       d.bookmarks = list;
     },
-    columns: ['id', 'name', 'url', 'group_id', 'note', 'color', 'sort_order'],
+    columns: ['id', 'name', 'url', 'group_id', 'note', 'color', 'icon', 'pinned', 'sort_order'],
     toRow: (b, i) => ({
       id: str(b.id, 48),
       name: str(b.name, 60),
@@ -153,9 +153,24 @@ const ENTITIES = [
       group_id: str(b.group, 48),
       note: str(b.note, 120),
       color: str(b.color, 16),
+      /* 自定义图标（data URL）。空串写NULL，别给列留一个空字符串 */
+      icon: str(b.icon, 400000) || null,
+      // 标星（首页「常用网站」就是按它筛的）。曾经这一项**根本没落库**：
+      // 接口照收 pinned、内存里也改了，可这张表既没有这一列，写入的行里也不带它
+      // —— 于是它只活在内存镜像里，每次重启服务就被读回一堆"未标星"。
+      pinned: b.pinned ? 1 : 0,
       sort_order: i,
     }),
-    fromRow: (r) => ({ id: r.id, name: r.name, url: r.url, group: r.group_id, note: r.note, color: r.color }),
+    fromRow: (r) => ({
+      id: r.id,
+      name: r.name,
+      url: r.url,
+      group: r.group_id,
+      note: r.note,
+      color: r.color,
+      icon: r.icon || '',
+      pinned: Boolean(r.pinned),
+    }),
   },
   {
     name: 'knowledge',
@@ -554,6 +569,8 @@ export async function loadAll(base) {
       ...data.settings,
       ...stored,
       theme: { ...data.settings.theme, ...(stored.theme || {}) },
+      // engines 是数组，整份取库里的；老库里没有 search 时由上面的基础数据兜住
+      search: { ...data.settings.search, ...(stored.search || {}) },
       pve: { ...data.settings.pve, ...(stored.pve || {}) },
       power: { ...data.settings.power, ...(stored.power || {}) },
       ha,
