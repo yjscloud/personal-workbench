@@ -1027,6 +1027,8 @@ export const api = {
     createGroup: (name: string) => req<Group>('/groups', send('POST', { name })),
     /** 改分类名。书签按 id 关联分组，所以改名不会动到任何书签 */
     renameGroup: (id: string, name: string) => req<Group>(`/groups/${id}`, send('PATCH', { name })),
+    /** 重排分类顺序：传拖动（或按名称排序）之后的完整 id 顺序，服务端按下标写回 */
+    reorderGroups: (ids: string[]) => req<{ groups: Group[] }>('/groups/reorder', send('POST', { ids })),
   },
 
   knowledge: {

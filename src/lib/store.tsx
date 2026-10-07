@@ -73,6 +73,12 @@ type StoreValue = {
     createGroup: (name: string) => Promise<void>;
     /** 改分类名。重名会被后端拒绝，这里整批回滚并报错 */
     renameGroup: (id: string, name: string) => Promise<void>;
+    /**
+     * 重排分类顺序：传拖动或「按名称排序」之后的完整 id 顺序。
+     * 成功返回 true —— 调用方据此决定要不要报「已按名称排序」，
+     * 失败时这里已经回滚并弹过错误了。
+     */
+    reorderGroups: (ids: string[]) => Promise<boolean>;
   };
   knowledgeApi: {
     /** 成功时返回落库后的条目（编辑器要拿它的 id 跳转到阅读页） */
@@ -467,6 +473,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         } catch (err) {
           setGroups(prev);
           notify(err instanceof Error ? err.message : '改名失败', 'crit');
+        }
+      },
+      /* 拖动排序是高频动作（一次拖拽只有一次调用，松手即提交），
+         所以成功不弹 toast —— 顺序变了本身就在眼前。失败才回滚并报错。 */
+      async reorderGroups(ids: string[]) {
+        const prev = groups;
+        const byId = new Map(groups.map((g) => [g.id, g]));
+        const seen = new Set(ids);
+        const next = [
+          ...ids.filter((id) => byId.has(id)).map((id) => byId.get(id) as Group),
+          ...groups.filter((g) => !seen.has(g.id)),
+        ].map((g, i) => ({ ...g, order: i }));
+        setGroups(next);
+        try {
+          const res = await api.bookmarks.reorderGroups(ids);
+          setGroups(res.groups);
+          return true;
+        } catch (err) {
+          setGroups(prev);
+          notify(err instanceof Error ? err.message : '排序失败', 'crit');
+          return false;
         }
       },
     }),

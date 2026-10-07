@@ -1042,6 +1042,30 @@ router.patch(
   }),
 );
 
+/**
+ * 重排分类顺序：前端把拖动（或「按名称排序」）之后的完整 id 顺序传过来。
+ *
+ * 传的是**整份顺序**而不是"把 A 挪到 B 前面"这类增量指令：一次落库就把
+ * 所有 sort_order 写死成下标，不留需要靠时间戳去猜的相对位置。没出现在
+ * ids 里的分类（正常不会发生）按原相对顺序追加到末尾，避免"漏传即丢序"。
+ */
+router.post(
+  '/groups/reorder',
+  wrap(async (req, res) => {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((x) => String(x)) : null;
+    if (!ids) return fail(res, 400, 'ids 必须是数组');
+    let groups = null;
+    update((d) => {
+      const byId = new Map(d.groups.map((g) => [g.id, g]));
+      const ordered = ids.filter((id) => byId.has(id));
+      for (const g of d.groups) if (!ordered.includes(g.id)) ordered.push(g.id);
+      d.groups = ordered.map((id, i) => ({ ...byId.get(id), order: i }));
+      groups = d.groups;
+    });
+    ok(res, { groups });
+  }),
+);
+
 /* ── 知识库 ───────────────────────────────────────────────────────── */
 
 /**

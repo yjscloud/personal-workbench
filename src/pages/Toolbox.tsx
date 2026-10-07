@@ -1,5 +1,18 @@
 import { useMemo, useState, type CSSProperties } from 'react';
-import { FolderPlus, Palette, Pencil, Plus, Search, Star, Trash2, X } from 'lucide-react';
+import {
+  ArrowDownAZ,
+  ChevronDown,
+  ChevronUp,
+  FolderPlus,
+  GripVertical,
+  Palette,
+  Pencil,
+  Plus,
+  Search,
+  Star,
+  Trash2,
+  X,
+} from 'lucide-react';
 import { useStore } from '@/lib/store';
 import { type Bookmark, type Group } from '@/lib/api';
 import { cls, hostOf } from '@/lib/format';
@@ -19,6 +32,13 @@ import { BookmarkModal, SiteIcon } from '@/components/bookmarks';
  * 磁贴的颜色默认跟随站点自己的品牌色（见 lib/tint.ts 与后端
  * services/sitecolor.js）：能取到就按它染色，取不到才退回糖纸色板。
  */
+
+/**
+ * 分类名排序器。「按名称排序」用它，中文按**拼音**而不是码点 ——
+ * 码点序会把「运维」排到「开发」「文档」前面，用户看到的是一份谁也没法预期的顺序。
+ * numeric 让「阶段 2」排在「阶段 10」前面。
+ */
+const nameCollator = new Intl.Collator('zh-Hans-CN', { numeric: true, sensitivity: 'base' });
 
 /** 这一页的画布：柔彩波浪底（样式见 index.css 的 .tb-canvas）。
     用 fixed 铺满主区（lg 起跳过 228px 的左轨），页面再长也不会断在半路。 */
@@ -243,6 +263,15 @@ export default function Toolbox() {
             setNewGroup('');
           }}
           onRename={(id, name) => void bookmarksApi.renameGroup(id, name)}
+          onReorder={(ids) => void bookmarksApi.reorderGroups(ids)}
+          onSortByName={() => {
+            const ids = [...groups]
+              .sort((a, b) => nameCollator.compare(a.name, b.name))
+              .map((g) => g.id);
+            void bookmarksApi.reorderGroups(ids).then((done) => {
+              if (done) notify('已按名称重新排列');
+            });
+          }}
         />
       </div>
     </div>
@@ -352,7 +381,7 @@ function ToolTile({
 }
 
 /**
- * 分类管理：改名与新增。
+ * 分类管理：改名、新增与排序。
  *
  * 书签里存的是分组 id 而不是名字，所以改名不必回头改任何一条书签 ——
  * 这正是当初用 id 关联的意义。
@@ -361,6 +390,14 @@ function ToolTile({
  * 分类一多，那列按钮会把弹窗挤成一根竖条，而且逐行点保存很烦。
  * 用 defaultValue（非受控）是因为分组列表会被外部改写（新增/改名后重渲染），
  * 受控值反而会把用户正在输入的内容顶掉。
+ *
+ * 排序给两条路，因为拖拽不是人人可用：
+ * · **拖抓手**（HTML5 DnD）是主路径，阔屏顺手；
+ * · **上/下箭头**兜住触屏与键盘 —— 触屏压根没有 HTML5 拖拽，
+ *   键盘用户也没法"拖"，只做拖拽等于把这两类人挡在门外。
+ * 两者都只是把新的 id 顺序交给 onReorder，落库与乐观更新统一在 store 里。
+ * 「按名称排序」是一次性的自动排列：点一下按名称（中文按拼音）重排，
+ * 之后仍可继续手动拖 —— 它不是一种"锁定"的模式。
  */
 function GroupManager({
   open,
@@ -371,6 +408,8 @@ function GroupManager({
   onClose,
   onCreate,
   onRename,
+  onReorder,
+  onSortByName,
 }: {
   open: boolean;
   groups: Group[];
@@ -380,8 +419,42 @@ function GroupManager({
   onClose: () => void;
   onCreate: (name: string) => void;
   onRename: (id: string, name: string) => void;
+  /** 排序后的完整 id 顺序 */
+  onReorder: (ids: string[]) => void;
+  onSortByName: () => void;
 }) {
+  /* 这两个 state 必须声明在 early return 之前：弹窗是常驻挂载、
+     只在 open 为假时返回 null，hook 一旦落到 return 后面就违反了调用顺序 */
+  const [dragId, setDragId] = useState<string | null>(null);
+  const [drop, setDrop] = useState<{ id: string; after: boolean } | null>(null);
+
   if (!open) return null;
+
+  /** 松手落位。插到目标行之前 / 之后由光标落在它的上/下半区决定 */
+  const commitDrop = () => {
+    const from = dragId;
+    const target = drop;
+    setDragId(null);
+    setDrop(null);
+    if (!from || !target || from === target.id) return;
+    const ids = groups.map((g) => g.id).filter((id) => id !== from);
+    const at = ids.indexOf(target.id);
+    if (at < 0) return;
+    ids.splice(target.after ? at + 1 : at, 0, from);
+    onReorder(ids);
+  };
+
+  /** 上 / 下移一格。给触屏与键盘用的兜底（见上面注释） */
+  const move = (index: number, delta: number) => {
+    const to = index + delta;
+    if (to < 0 || to >= groups.length) return;
+    const ids = groups.map((g) => g.id);
+    const [id] = ids.splice(index, 1);
+    ids.splice(to, 0, id);
+    onReorder(ids);
+  };
+
+  const canSort = groups.length > 1;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -391,13 +464,14 @@ function GroupManager({
         role="dialog"
         aria-modal="true"
         aria-label="管理分类"
-        className="panel relative z-10 w-full max-w-[24rem] p-5 shadow-pop animate-dialog-in"
+        className="panel relative z-10 w-full max-w-[26rem] p-5 shadow-pop animate-dialog-in"
       >
         <div className="flex items-start justify-between gap-3">
           <div>
             <h2 className="text-[15px] font-semibold">管理分类</h2>
             <p className="mt-1 text-2xs text-faint">
               改名后该类下的工具会自动跟着变，不用重新归类。名字里可以带 emoji。
+              拖动左侧抓手可调整顺序，也可用右侧箭头微调。
             </p>
           </div>
           <button
@@ -410,25 +484,114 @@ function GroupManager({
           </button>
         </div>
 
-        <ul className="mt-3.5 max-h-[15rem] space-y-2 overflow-y-auto overscroll-contain pr-0.5">
-          {groups.map((g) => (
-            <li key={g.id} className="flex items-center gap-2">
-              <Input
-                defaultValue={g.name}
-                aria-label={`分类名称 ${g.name}`}
-                className="min-w-0 flex-1"
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === 'Escape') e.currentTarget.blur();
+        <div className="mt-3.5 flex items-center justify-end">
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={!canSort}
+            onClick={onSortByName}
+            title="按名称自动排列（中文按拼音）"
+          >
+            <ArrowDownAZ size={13} />
+            按名称排序
+          </Button>
+        </div>
+
+        <ul className="mt-1.5 max-h-[15rem] space-y-2 overflow-y-auto overscroll-contain pr-0.5">
+          {groups.map((g, i) => {
+            /* 拖到这一行时，在被拖项落点那一侧画一条强调色细线。
+               只标"这一行是落点"不够 —— 分不出会落在它上面还是下面 */
+            const mark = dragId && drop?.id === g.id && dragId !== g.id ? drop : null;
+            return (
+              <li
+                key={g.id}
+                onDragOver={(e) => {
+                  if (!dragId || dragId === g.id) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = 'move';
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  setDrop({ id: g.id, after: e.clientY > rect.top + rect.height / 2 });
                 }}
-                onBlur={(e) => {
-                  const next = e.target.value.trim();
-                  if (!next || next === g.name) return;
-                  onRename(g.id, next);
+                onDrop={(e) => {
+                  e.preventDefault();
+                  commitDrop();
                 }}
-              />
-              <span className="num shrink-0 text-2xs text-faint">{countOf(g.id)}</span>
-            </li>
-          ))}
+                className="relative flex items-center gap-1.5"
+              >
+                {mark ? (
+                  <span
+                    aria-hidden
+                    className={cls(
+                      'pointer-events-none absolute inset-x-0 h-0.5 rounded-full bg-accent',
+                      mark.after ? 'bottom-0' : 'top-0',
+                    )}
+                  />
+                ) : null}
+
+                {/* 抓手是**唯一**可拖的地方：整行 draggable 会让输入框里的
+                    选词也变成拖拽，改个名字就先把这一行拖走了 */}
+                <span
+                  draggable={canSort}
+                  aria-hidden
+                  title={canSort ? '拖动调整顺序' : undefined}
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData('text/plain', g.id);
+                    e.dataTransfer.effectAllowed = 'move';
+                    setDragId(g.id);
+                  }}
+                  onDragEnd={() => {
+                    setDragId(null);
+                    setDrop(null);
+                  }}
+                  className={cls(
+                    'shrink-0 p-0.5 text-faint transition-colors',
+                    canSort ? 'cursor-grab hover:text-muted active:cursor-grabbing' : 'opacity-40',
+                  )}
+                >
+                  <GripVertical size={14} />
+                </span>
+
+                <Input
+                  defaultValue={g.name}
+                  aria-label={`分类名称 ${g.name}`}
+                  className="min-w-0 flex-1"
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === 'Escape') e.currentTarget.blur();
+                  }}
+                  onBlur={(e) => {
+                    const next = e.target.value.trim();
+                    if (!next || next === g.name) return;
+                    onRename(g.id, next);
+                  }}
+                />
+
+                <span className="num shrink-0 text-2xs text-faint">{countOf(g.id)}</span>
+
+                <div className="flex shrink-0 items-center">
+                  <button
+                    type="button"
+                    onClick={() => move(i, -1)}
+                    disabled={i === 0}
+                    aria-label={`上移「${g.name}」`}
+                    title="上移"
+                    className="rounded-field p-1 text-faint transition-colors hover:bg-bg-2 hover:text-ink disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-faint"
+                  >
+                    <ChevronUp size={13} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => move(i, 1)}
+                    disabled={i === groups.length - 1}
+                    aria-label={`下移「${g.name}」`}
+                    title="下移"
+                    className="rounded-field p-1 text-faint transition-colors hover:bg-bg-2 hover:text-ink disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-faint"
+                  >
+                    <ChevronDown size={13} />
+                  </button>
+                </div>
+              </li>
+            );
+          })}
         </ul>
 
         <form
