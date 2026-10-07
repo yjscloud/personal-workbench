@@ -20,6 +20,17 @@ export const BROWSER_UA =
 const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_REDIRECTS = 3;
 
+/**
+ * 响应头的体积上限，放宽到 64KB。
+ *
+ * Node 默认只给 16KB，而 Google 这类站点的响应头能到 26KB（一大串
+ * CSP / Report-To / Set-Cookie），超了直接抛 `Parse Error: Header overflow`
+ * —— 表现是"这个站点的页面根本读不出来"，连它声明在 HTML 里的图标地址
+ * 都拿不到。实测 gemini.google.com 就是这么挂的。
+ * 这只是解析缓冲，不常用的大头上限换一次可用性，划算。
+ */
+const MAX_HEADER_BYTES = 64 * 1024;
+
 function decodeBody(buf, encoding) {
   const enc = String(encoding || '').toLowerCase();
   if (!enc || enc === 'identity') return buf;
@@ -57,6 +68,7 @@ export function fetchBytes(
         method: 'GET',
         headers: { 'User-Agent': BROWSER_UA, Accept: accept, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
         rejectUnauthorized: !insecure,
+        maxHeaderSize: MAX_HEADER_BYTES,
         timeout,
       },
       (res) => {

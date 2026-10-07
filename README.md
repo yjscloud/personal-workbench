@@ -100,6 +100,20 @@ systemctl enable --now personal-workbench
 > **放在 nginx 后面时**：若用 AI 助手的流式问答，`proxy_read_timeout` 必须大于 `AI_TIMEOUT_MS`，
 > 否则连接会先被反代掐断，前端只能收到 504。另外 `index.html` 不要设长缓存
 > （`/assets/` 下的文件带哈希，长缓存是安全的）。
+>
+> 还有一处**必须单独放行**：书签图标的地址要允许长缓存，它的语义和 `/api/` 的 `no-store`
+> 正好相反。漏了这一步，每次刷新每个磁贴都要重新下载一遍图标，界面上就是"图标闪一下"
+> （地址带内容版本号，所以长缓存是安全的）。它得写成正则、放在 `/api/` 之前才对得上：
+>
+> ```nginx
+> location ~ ^/api/bookmarks/[^/]+/icon$ {
+>     proxy_pass        http://127.0.0.1:8787;
+>     proxy_set_header  Host $host;
+>     # 上游会发自己的 Cache-Control，丢弃后只保留下面这个（否则会叠成两个头）
+>     proxy_hide_header Cache-Control;
+>     add_header Cache-Control "public, max-age=31536000, immutable" always;
+> }
+> ```
 
 ## 环境变量
 

@@ -75,6 +75,14 @@ type StoreValue = {
       updated: number;
       failed: { id: string; name: string; error: string }[];
     }>;
+    /** 抓取并固化站点图标。返回汇总，口径与 syncColors 一致 */
+    syncIcons: (opts?: { force?: boolean; ids?: string[] }) => Promise<{
+      total: number;
+      updated: number;
+      failed: { id: string; name: string; error: string }[];
+    }>;
+    /** 单个：新增工具之后顺手抓一次。取不到就静默（图标没有不是错误） */
+    fetchIcon: (id: string) => Promise<void>;
     /** 新建分类 */
     createGroup: (name: string) => Promise<void>;
     /** 改分类名。重名会被后端拒绝，这里整批回滚并报错 */
@@ -443,10 +451,33 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
         return { total: res.total, updated: res.updated, failed: res.failed };
       },
+      async syncIcons(opts = {}) {
+        const res = await api.bookmarks.refreshIcons(opts);
+        /* 图标本体不在这里传（磁贴仍走 /bookmarks/:id/icon 取），
+           但"这个书签现在有图标了"这个事实一到，页面就能立刻换图 ——
+           否则要等下一次全量刷新才看得见刚抓到的图标 */
+        if (res.icons.length) {
+          const ids = new Set(res.icons.map((i) => i.id));
+          setBookmarks((prev) => prev.map((b) => (ids.has(b.id) ? { ...b, hasIcon: true } : b)));
+        }
+        return { total: res.total, updated: res.updated, failed: res.failed };
+      },
+      async fetchIcon(id: string) {
+        try {
+          const bm = await api.bookmarks.fetchIcon(id);
+          setBookmarks((prev) => prev.map((b) => (b.id === id ? { ...b, ...bm } : b)));
+        } catch {
+          /* 静默：站点没有可取的图标是常事，页面会退回首字色块，
+             为它弹一条错误只会让"保存成功了没有"变得可疑 */
+        }
+      },
       async patch(id: string, patch: Partial<Bookmark>) {
         setBookmarks((prev) => prev.map((b) => (b.id === id ? { ...b, ...patch } : b)));
         try {
-          await api.bookmarks.update(id, patch);
+          /* 落库后用服务端那份收口：它会带上重算过的 iconV 之类派生字段，
+             只合并本地这份就会让它们停在旧值上（换了图标却仍指向旧的缓存 URL）。 */
+          const bm = await api.bookmarks.update(id, patch);
+          setBookmarks((prev) => prev.map((b) => (b.id === id ? { ...b, ...bm } : b)));
         } catch (err) {
           notify(err instanceof Error ? err.message : '更新失败', 'crit');
         }

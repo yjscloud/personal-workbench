@@ -18,6 +18,7 @@ import { askAboutArticle } from './services/knowledge-ai.js';
 import { askAboutNews, cachedBody, unreadableHosts } from './services/reader.js';
 import { usageSnapshot } from './services/ai-usage.js';
 import { probeSiteColor } from './services/sitecolor.js';
+import { fetchSiteIcon } from './services/siteicon.js';
 import { suggestSource, fetchSuggest } from './services/suggest.js';
 import {
   applyBackupSchedule,
@@ -977,10 +978,23 @@ function checkIcon(raw) {
  * 一张位图 base64 后几百 KB，几十条书签就能把 /bootstrap 顶成几百 KB ——
  * 而那个接口是每次打开面板都要走一遍的首屏数据。改成只给一个
  * hasIcon 布尔，图标本体由 /bookmarks/:id/icon 单独取（可缓存、可协商）。
+ *
+ * hasIcon 把"自动抓来的"也算进去：对页面来说只要那个地址有图可拿就行，
+ * 哪来的不影响渲染；而编辑弹窗要知道**这张图是不是用户自己传的**
+ * （"清除"这颗按钮只在有自定义图标时才有意义），所以另给 hasCustomIcon。
  */
 function publicBookmark(b) {
-  const { icon, ...rest } = b;
-  return { ...rest, hasIcon: Boolean(icon) };
+  const { icon, iconAuto, ...rest } = b;
+  const stored = icon || iconAuto || '';
+  return {
+    ...rest,
+    hasIcon: Boolean(stored),
+    hasCustomIcon: Boolean(icon),
+    /* 图标内容的短指纹，给前端拼一个可长缓存的地址。
+       图标一换这里就变，于是"长缓存"不会让人看了旧图 ——
+       代价是每次列表都要算一遍：几十条几 KB 的图标算下来不到 1ms。 */
+    iconV: stored ? createHash('sha1').update(stored).digest('base64url').slice(0, 8) : '',
+  };
 }
 
 /** 把 data URL 拆成 (mime, 字节)，拆不出来返回 null */
@@ -1005,12 +1019,16 @@ router.get('/bookmarks', (_req, res) => {
  */
 router.get('/bookmarks/:id/icon', (_req, res) => {
   const bm = db().bookmarks.find((b) => b.id === _req.params.id);
-  const decoded = bm ? decodeIcon(bm.icon) : null;
+  /* 自定义的优先于自动抓来的：用户传那张图就是因为不满意自动取的那张 */
+  const decoded = bm ? decodeIcon(bm.icon || bm.iconAuto) : null;
   if (!decoded) return fail(res, 404, '这个书签没有自定义图标');
   const etag = `W/"${decoded.buf.length}-${createHash('sha1').update(decoded.buf).digest('base64url').slice(0, 12)}"`;
   if (_req.headers['if-none-match'] === etag) return res.status(304).end();
   res.setHeader('Content-Type', decoded.mime);
-  res.setHeader('Cache-Control', 'private, no-cache');
+  /* 带版本参数的请求可以长缓存：那个 v 就是内容指纹（见 publicBookmark），
+     图标一变 URL 就变，所以不会有人拿到旧图。
+     不带 v 的（直接访问这个地址、或还没拿到版本号的预览）保持协商缓存。 */
+  res.setHeader('Cache-Control', _req.query.v ? 'public, max-age=31536000, immutable' : 'private, no-cache');
   res.setHeader('ETag', etag);
   res.send(decoded.buf);
 });
@@ -1069,6 +1087,97 @@ router.post(
   }),
 );
 
+/**
+ * 抓取并固化一个书签的站点图标（单个）。
+ *
+ * 前端在"新增工具"之后会顺手调它一次：新加的入口立刻就有自己的图标，
+ * 不必等用户去点「同步站点图标与配色」。失败就静默 —— 图标没有不算错，
+ * 页面上退回首字色块即可，弹一条"取图标失败"只会让人以为保存出了问题。
+ */
+router.post(
+  '/bookmarks/:id/icon/fetch',
+  wrap(async (req, res) => {
+    const bm = db().bookmarks.find((b) => b.id === req.params.id);
+    if (!bm) return fail(res, 404, '书签不存在');
+    /* 用户自己传过图标的不用抓：那张就是他要的 */
+    if (bm.icon) return ok(res, publicBookmark(bm));
+    const hit = await fetchSiteIcon(bm.url).catch(() => null);
+    if (!hit) return ok(res, publicBookmark(bm));
+    update((d) => {
+      const b = d.bookmarks.find((x) => x.id === bm.id);
+      if (b) b.iconAuto = hit.dataUrl;
+    });
+    ok(res, publicBookmark(db().bookmarks.find((b) => b.id === bm.id)));
+  }),
+);
+
+/**
+ * 批量固化站点图标。
+ *
+ * 默认只补"还没有图标的"（含自动抓来的），`force` 才会连已有的一起重抓。
+ * 与 refresh-colors 同一套：并发 4、逐条记录失败原因。
+ *
+ * 为什么要批量：面板里几十个入口，一个一个点开编辑太慢；而这件事
+ * 只要做一次（结果落库），之后刷新页面就再也不去访问那些站点了。
+ */
+router.post(
+  '/bookmarks/refresh-icons',
+  wrap(async (req, res) => {
+    const { force = false, ids } = req.body || {};
+    const wanted = Array.isArray(ids) && ids.length ? new Set(ids) : null;
+    const queue = db().bookmarks.filter(
+      /* 有自定义图标的跳过：那个地址已经能取到图，再去抓站点是白跑一次 */
+      (b) => !b.icon && (wanted ? wanted.has(b.id) : true) && (force || !b.iconAuto),
+    );
+
+    const found = [];
+    const failed = [];
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < queue.length) {
+        const bm = queue[cursor];
+        cursor += 1;
+        try {
+          const hit = await fetchSiteIcon(bm.url);
+          /* dataUrl 只留在服务端的内存里（下面要写库）：响应里不带它 ——
+             图标本体走 /bookmarks/:id/icon，别让这个接口背上几十 KB 的 base64 */
+          if (hit) found.push({ id: bm.id, name: bm.name, dataUrl: hit.dataUrl, from: hit.source });
+          else failed.push({ id: bm.id, name: bm.name, error: '站点没有可用的图标（或图标太大、格式不收）' });
+        } catch (err) {
+          failed.push({ id: bm.id, name: bm.name, error: err.message || '抓取失败' });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(COLOR_PROBE_CONCURRENCY, queue.length) }, worker));
+
+    if (found.length) {
+      const byId = new Map(found.map((f) => [f.id, f]));
+      update((d) => {
+        for (const b of d.bookmarks) {
+          const hit = byId.get(b.id);
+          if (hit) {
+            /* 抓一遍要几百毫秒到几秒，期间用户可能已经自己传了图标：
+               那就把抓来的丢掉，别盖掉他刚传的那张 */
+            const current = d.bookmarks.find((x) => x.id === b.id);
+            if (current && current.icon) continue;
+            b.iconAuto = hit.dataUrl;
+          }
+        }
+      });
+    }
+
+    /* icons 一并回给页面：它据此把 hasIcon 标上，磁贴立刻换图，
+       不必等下一次全量刷新（与 refresh-colors 回 colors 同一个理由）。
+       只回 id / name —— 图标本体走 /bookmarks/:id/icon。 */
+    ok(res, {
+      total: queue.length,
+      updated: found.length,
+      icons: found.map(({ id, name }) => ({ id, name })),
+      failed,
+    });
+  }),
+);
+
 router.post(
   '/bookmarks',
   wrap(async (req, res) => {
@@ -1097,9 +1206,14 @@ router.patch(
     update((d) => {
       const b = d.bookmarks.find((x) => x.id === req.params.id);
       if (!b) return;
+      /* 地址换了，抓来的那张图标就是上一个站点的东西了，直接丢掉 ——
+         由保存方随后重新抓一次（见 Toolbox 的 onSave）。自定义图标不动：
+         那是用户自己传的，跟地址无关。 */
+      const repointed = patch.url !== undefined && String(patch.url) !== b.url;
       Object.assign(b, {
         ...(patch.name !== undefined ? { name: patch.name } : {}),
         ...(patch.url !== undefined ? { url: patch.url } : {}),
+        ...(repointed ? { iconAuto: '' } : {}),
         ...(patch.group !== undefined ? { group: patch.group } : {}),
         ...(patch.note !== undefined ? { note: patch.note } : {}),
         ...(patch.color !== undefined ? { color: patch.color } : {}),

@@ -64,6 +64,12 @@ const ADDITIVE_COLUMNS = [
      COS 备份（见 services/backup.js，那份快照只导出内存里的对象），
      存文件就得额外写一套"备份时打包、恢复时落盘"的流程，不值当。 */
   ['bookmarks', 'icon', "MEDIUMTEXT NULL COMMENT '自定义图标（base64 data URL）' AFTER `color`"],
+  /* 自动抓取并固化下来的站点图标。
+     为什么要落库：以前每次刷新页面，每个磁贴都去现场取一遍 favicon
+     （站点自己的 + 第三方聚合服务兜底），于是"首字色块→真图标"那次切换
+     每次刷新都要重演一遍，看上去就是图标在闪。固化之后它变成本站的一个
+     稳定资源，刷新时直接命中浏览器缓存。 */
+  ['bookmarks', 'icon_auto', "MEDIUMTEXT NULL COMMENT '自动抓取的站点图标（base64 data URL）' AFTER `icon`"],
   /* 回收站。口径与 tickets.deleted_at 完全一致：非空即在回收站里，
      默认列出去掉这些行；满 7 天由 services/retention.js 收走。
      老库补上这一列后所有条目都是 NULL，也就是"一篇都没删过" —— 不会被误判 */

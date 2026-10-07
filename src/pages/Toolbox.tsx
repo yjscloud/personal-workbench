@@ -67,25 +67,32 @@ export default function Toolbox() {
   const [sorting, setSorting] = useState(false);
 
   /**
-   * 让磁贴去问各家站点"你是什么颜色"。
+   * 让磁贴去问各家站点"你是什么颜色、图标长什么样"，两件事一起做。
    *
-   * 传 ids 是新增工具后的静默补色，成与不成都不出声 —— 用户刚点完"保存"，
+   * 传 ids 是新增 / 改址之后的静默补全，成与不成都不出声 —— 用户刚点完"保存"，
    * 再弹一条"取色失败"只会让人以为保存也出了问题。
-   * 不传 ids 是手动点"同步配色"，这时要把结果说清楚：取到几个、几个没取到。
+   * 不传 ids 是手动点「同步站点图标与配色」，这时要把结果说清楚：各取到几个。
+   *
+   * 两个请求并发发出去（它们都是去同一批站点取东西）：串起来等于把等待时间
+   * 翻倍，而各自都只是不带凭据的 GET，服务端那边也各自限了并发 4。
+   *
+   * force 用于"地址改了"这种情形：抓来的图标和探测到的配色都属于上一个站点，
+   * 必须重来一遍，而默认口径是"只补没有的"。
    */
-  async function syncColors(ids?: string[]) {
+  async function syncSiteMeta(ids?: string[], force = false) {
     setSyncing(true);
     try {
-      const res = await bookmarksApi.syncColors(ids ? { ids } : undefined);
+      const opts = { ids, force };
+      const [colors, icons] = await Promise.all([bookmarksApi.syncColors(opts), bookmarksApi.syncIcons(opts)]);
       if (ids) return;
+      const failed = colors.failed.length + icons.failed.length;
+      const done = `已更新 ${colors.updated} 个配色、${icons.updated} 个图标`;
       notify(
-        res.failed.length
-          ? `已更新 ${res.updated} 个配色，${res.failed.length} 个没取到（纯灰图标或打不开的站点）`
-          : `已更新 ${res.updated} 个配色`,
-        res.failed.length ? 'warn' : 'ok',
+        failed ? `${done}，${failed} 个没取到（打不开的站点、纯灰图标或站点没有图标）` : done,
+        failed ? 'warn' : 'ok',
       );
     } catch (err) {
-      if (!ids) notify(err instanceof Error ? err.message : '同步配色失败', 'crit');
+      if (!ids) notify(err instanceof Error ? err.message : '同步站点信息失败', 'crit');
     } finally {
       setSyncing(false);
     }
@@ -432,11 +439,11 @@ export default function Toolbox() {
                 variant="soft"
                 size="sm"
                 disabled={syncing}
-                onClick={() => void syncColors()}
-                title="去各站点读它们的主题色 / 图标主色，给磁贴换成本站的颜色"
+                onClick={() => void syncSiteMeta()}
+                title="去各站点读它们的主题色与站点图标，写进书签。图标会存下来，之后刷新页面不再去访问那些站点"
               >
                 {syncing ? <Spinner /> : <Palette size={13} />}
-                {syncing ? '取色中…' : '同步站点配色'}
+                {syncing ? '同步中…' : '同步站点图标与配色'}
               </Button>
               <Button variant="soft" size="sm" onClick={() => setGroupMgr(true)}>
                 <FolderPlus size={13} />
@@ -535,12 +542,15 @@ export default function Toolbox() {
           }}
           onSave={async (payload) => {
             if (editing) {
+              /* 地址改了：抓来的图标与探测到的配色都属于上一个站点，重来一遍 */
+              const repointed = editing.url !== payload.url;
               await bookmarksApi.patch(editing.id, payload);
+              if (repointed) void syncSiteMeta([editing.id], true);
             } else {
               const added = await bookmarksApi.add(payload as Partial<Bookmark> & { name: string; url: string });
-              // 新增的入口顺手问一次它自己的颜色。放到后台跑，不挡弹窗关闭；
-              // 颜色晚一瞬到位，用户不用为此再点一次「同步站点配色」。
-              if (added) void syncColors([added.id]);
+              // 新增的入口顺手问一次它自己的颜色与图标。放到后台跑，不挡弹窗关闭；
+              // 这两样晚一瞬到位，用户不用为此再点一次「同步站点图标与配色」。
+              if (added) void syncSiteMeta([added.id]);
             }
             setCreating(false);
             setEditing(null);

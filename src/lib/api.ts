@@ -85,8 +85,21 @@ export type Bookmark = {
    * 列表接口不回本体（几十张图 base64 会把首屏顶得很难看），只给 hasIcon。
    */
   icon?: string;
-  /** 服务端告知「这个书签有自定义图标」，本体走 /bookmarks/:id/icon 取 */
+  /**
+   * 服务端告知「这个书签有图标可用」（自定义的或从站点抓来固化下来的），
+   * 本体走 /bookmarks/:id/icon 取。
+   *
+   * 它在页面上只意味着一件事：**不必再现场去站点取 favicon**。图标已经固化，
+   * 刷新时直接从同源缓存里出来，所以首帧就能画对，不再有"色块→图标"那一下。
+   */
   hasIcon?: boolean;
+  /** 这张图标是用户自己传的（决定编辑弹窗里那颗「清除」要不要出现） */
+  hasCustomIcon?: boolean;
+  /**
+   * 图标内容的短版本号。图标一变它就变，所以图标地址可以长缓存 ——
+   * 换了图标之后 URL 跟着换，不会让浏览器继续拿旧的那张。
+   */
+  iconV?: string;
   /** 标记为常用：会出现在首页「常用网站」里 */
   pinned?: boolean;
 };
@@ -856,8 +869,16 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return payload.data as T;
 }
 
-/** 自定义图标的地址。列表里只给 hasIcon，本体走这个接口取（可协商缓存） */
-export const bookmarkIconUrl = (id: string) => `${BASE}/bookmarks/${encodeURIComponent(id)}/icon`;
+/**
+ * 书签图标的地址。列表里只给 hasIcon，本体走这个接口取。
+ *
+ * `v` 是服务端按图标内容算出来的短版本号：图标一换它就变，于是这个 URL
+ * 可以放心地长缓存（nginx 那边对这个路径专门开了 immutable）——
+ * 刷新时图标直接从浏览器缓存里出来，不再有"先画色块再等图标"那一下。
+ * 不带 v（比如编辑弹窗里的即时预览）就退回可协商缓存。
+ */
+export const bookmarkIconUrl = (id: string, v?: string) =>
+  `${BASE}/bookmarks/${encodeURIComponent(id)}/icon${v ? `?v=${encodeURIComponent(v)}` : ''}`;
 
 const send = (method: string, body?: unknown) => ({
   method,
@@ -1057,6 +1078,23 @@ export const api = {
      */
     reorder: (ids: string[], moved: { id: string; group: string }[] = []) =>
       req<{ bookmarks: Bookmark[] }>('/bookmarks/reorder', send('POST', { ids, moved })),
+    /**
+     * 抓取并固化单个书签的站点图标，返回更新后的书签。
+     * 新增工具之后顺手调一次；站点取不到图标时也返回 200（原样返回），
+     * 页面退回首字色块，不把它当错误。
+     */
+    fetchIcon: (id: string) => req<Bookmark>(`/bookmarks/${id}/icon/fetch`, send('POST', {})),
+    /**
+     * 批量固化站点图标。默认只补还没有图标的，`force` 才会连已有的一起重抓。
+     * 抓一遍要逐个访问站点，属于"做一次就够"的动作（结果落库）。
+     */
+    refreshIcons: (body: { force?: boolean; ids?: string[] } = {}) =>
+      req<{
+        total: number;
+        updated: number;
+        icons: { id: string; name: string }[];
+        failed: { id: string; name: string; error: string }[];
+      }>('/bookmarks/refresh-icons', send('POST', body)),
     createGroup: (name: string) => req<Group>('/groups', send('POST', { name })),
     /** 改分类名。书签按 id 关联分组，所以改名不会动到任何书签 */
     renameGroup: (id: string, name: string) => req<Group>(`/groups/${id}`, send('PATCH', { name })),

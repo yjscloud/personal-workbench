@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Upload } from 'lucide-react';
 import { bookmarkIconUrl, type Bookmark } from '@/lib/api';
 import { cls, faviconSources } from '@/lib/format';
@@ -8,8 +8,20 @@ import { Button, Field, Input, Led, Modal, Select, Spinner, Toggle } from './ui'
 /* 书签相关的公共件：首页「常用网站」和「工具箱」页共用同一套，
    避免两处各写一份表单和图标回落逻辑。 */
 
-/** 网站图标：底层永远是首字母色块，favicon 加载成功才盖上去。
-   取不到就留首字母，不会出现裂图或空方块。 */
+/**
+ * 网站图标：底层永远是首字母色块，真图标就绪后盖上去（并让色块退场）。
+ * 取不到就留首字母，不会出现裂图或空方块。
+ *
+ * ── 两条路，走哪条取决于服务端有没有固化图标（bookmark.hasIcon）──────
+ *
+ * **有（常态）**：只渲染 /bookmarks/:id/icon 这一张。它在本站、URL 带版本，
+ * 刷新时直接命中浏览器缓存，所以首帧就能画对。这一条路也是"图标不再闪"
+ * 的关键 —— 原来无论有没有缓存，都要先画色块、等 onLoad、再淡入，
+ * 那一下切换每次刷新都要重演一遍。
+ *
+ * **没有**：现场去站点取 favicon，拿不到再由聚合服务兜底（下面那两档）。
+ * 只在新加的、还没同步过图标的入口上短暂出现。
+ */
 export function SiteIcon({
   bookmark,
   size = 36,
@@ -22,20 +34,25 @@ export function SiteIcon({
       "小图挤在大框里"的效果，一屏几十个看起来全是空框。 */
   fill?: boolean;
 }) {
+  /* 服务端固化的图标（自定义的或从站点抓来的）**优先于现场探测**：
+     hasIcon 为真时下面那两档候选直接不生成 —— 一个请求都不发。 */
+  const saved = bookmark.hasIcon && bookmark.id ? bookmarkIconUrl(bookmark.id, bookmark.iconV) : '';
   /* 两档候选同时加载：
      · own      —— 站点自己的图标，内网面板只有这条路走得通，而且是真图标；
      · fallback —— 聚合服务，公网站点常常连不上自己的图标（GitHub 的实测 6 秒超时），靠它兜底。
      串行试是不行的，总有一类要白等一次超时。 */
-  /* 用户自己上传的图标**优先于 favicon**：他传这张图就是因为不满意自动取的那张，
-     再去猜一次站点的心意只会盖掉刚上传的东西。 */
-  const custom = bookmark.hasIcon && bookmark.id ? bookmarkIconUrl(bookmark.id) : '';
-  const { own, fallback } = useMemo(() => faviconSources(bookmark.url), [bookmark.url]);
+  const { own, fallback } = useMemo(
+    () => (saved ? { own: [], fallback: [] } : faviconSources(bookmark.url)),
+    [saved, bookmark.url],
+  );
   const ownRefs = useRef<(HTMLImageElement | null)[]>([]);
   const fbRefs = useRef<(HTMLImageElement | null)[]>([]);
-  const customRef = useRef<HTMLImageElement | null>(null);
+  const savedRef = useRef<HTMLImageElement | null>(null);
   const [ownHit, setOwnHit] = useState(-1);
   const [fbHit, setFbHit] = useState(-1);
-  const [customHit, setCustomHit] = useState(-1);
+  /** 固化图标是否已就绪（决定下面那层色块要不要退场） */
+  const [savedReady, setSavedReady] = useState(false);
+  const [savedFailed, setSavedFailed] = useState(false);
   /* 优先窗口：own 通常几十毫秒就有结果，而聚合服务对内网域名不会失败，
      而是回一张通用"地球"图 —— 它要是立刻算数，就会把人家自己的真图标顶掉。
      缓 1.2 秒，给 own 一个先手。 */
@@ -51,21 +68,42 @@ export function SiteIcon({
 
   /* own 一旦有结果就永远优先，哪怕它比 fallback 晚到 —— 真图标值得等。
      那一次切换在实际观感里几乎看不见（内网的 own 都在百毫秒内回来）。 */
-  const shown: { kind: 'custom' | 'own' | 'fb'; i: number } | null =
-    customHit >= 0
-      ? { kind: 'custom', i: 0 }
-      : ownHit >= 0
+  const shown: { kind: 'saved' | 'own' | 'fb'; i: number } | null = saved
+    ? savedFailed
+      ? ownHit >= 0
         ? { kind: 'own', i: ownHit }
         : grace && fbHit >= 0
           ? { kind: 'fb', i: fbHit }
-          : null;
+          : null
+      : { kind: 'saved', i: 0 }
+    : ownHit >= 0
+      ? { kind: 'own', i: ownHit }
+      : grace && fbHit >= 0
+        ? { kind: 'fb', i: fbHit }
+        : null;
   const loaded = shown !== null;
+
+  /**
+   * 固化好的图标：**在绘制之前**就把"其实已经好了"认出来。
+   *
+   * 这里必须是 layout effect 而不是普通 effect —— 普通 effect 跑在浏览器
+   * 绘制之后，于是"图片已就绪"这件事至少要晚一帧生效，而那一帧露出来的
+   * 就是首字色块。命中缓存的图标（同源、URL 带版本，绝大多数刷新都属于这种）
+   * 在挂载时 complete 就已经是 true，layout effect 里直接把它认掉，
+   * 色块连一帧都不会出现。
+   */
+  useLayoutEffect(() => {
+    const el = savedRef.current;
+    if (el && el.complete && el.naturalWidth > 0) setSavedReady(true);
+    else setSavedReady(false);
+    setSavedFailed(false);
+  }, [saved]);
 
   useEffect(() => {
     setOwnHit(-1);
     setFbHit(-1);
-    setCustomHit(-1);
     setGrace(false);
+    if (saved) return; // 走固化图标那条路，不必再排优先级窗口
     const timer = window.setTimeout(() => setGrace(true), 1200);
     /* 还要主动查一遍已完成的图片：它可能在本组件挂载之前就加载好了
        （列表复用、浏览器缓存都会这样），此时 onLoad 不会再触发，
@@ -75,7 +113,7 @@ export function SiteIcon({
     const fi = fbRefs.current.findIndex((el) => el !== null && el.complete && el.naturalWidth > 0);
     if (fi >= 0) setFbHit(fi);
     return () => window.clearTimeout(timer);
-  }, [bookmark.url, custom, own, fallback]);
+  }, [bookmark.url, saved, own, fallback]);
 
   /** 两档共用的图片渲染：都挂上，各自记录命中 */
   const tier = (list: string[], refs: typeof ownRefs, setHit: typeof setOwnHit, kind: 'own' | 'fb') =>
@@ -103,34 +141,35 @@ export function SiteIcon({
       // 满铺模式下不画底框：图标自己撑满，favicon 一到就直接落在磁贴的柔彩底上
       style={{ width: size, height: size, borderRadius: radius, background: fill ? 'transparent' : 'var(--accent-soft)' }}
     >
-      {/* 生成图标：favicon 没到（或根本取不到）时它就是最终形态，
-          一旦真图标加载出来就淡出 —— 两层的切换只在 opacity 上，不重排 */}
+      {/* 生成图标：真图标没到（或根本取不到）时它就是最终形态。
+          走固化图标那条路时**不做过渡** —— 图片一画出来就由它盖住，
+          淡出只会把"色块→图标"变成一次看得见的切换，而那正是要消掉的观感 */}
       <span
         aria-hidden
-        className="absolute inset-0 grid place-items-center transition-opacity duration-200"
-        style={{ borderRadius: 'inherit', opacity: loaded ? 0 : 1, ...avatarGradient(hue) }}
+        className={cls('absolute inset-0 grid place-items-center', !saved && 'transition-opacity duration-200')}
+        style={{ borderRadius: 'inherit', opacity: (saved ? savedReady : loaded) ? 0 : 1, ...avatarGradient(hue) }}
       >
         <span className="num font-semibold text-white" style={{ fontSize: glyphSize, letterSpacing: '0.02em' }}>
           {glyph}
         </span>
       </span>
-      {/* 自定义图标不走 tier()：它只有一张，且没有"候选列表"那回事 */}
-      {custom ? (
+
+      {/* 服务端固化好的图标：从第一帧就以不透明渲染，不参与 own/fallback 的竞争。
+          同源 + URL 带版本，刷新时命中缓存，浏览器能画多早就画多早 */}
+      {saved ? (
         <img
-          ref={(el) => {
-            customRef.current = el;
-          }}
-          src={custom}
+          ref={savedRef}
+          src={saved}
           alt=""
           width={inner}
           height={inner}
-          loading="lazy"
-          onLoad={() => setCustomHit(0)}
-          onError={() => setCustomHit(-1)}
-          className="absolute inset-0 m-auto object-contain transition-opacity duration-150"
-          style={{ opacity: shown?.kind === 'custom' ? 1 : 0 }}
+          onLoad={() => setSavedReady(true)}
+          onError={() => setSavedFailed(true)}
+          className="absolute inset-0 m-auto object-contain"
+          style={{ opacity: savedFailed ? 0 : 1 }}
         />
       ) : null}
+
       {tier(own, ownRefs, setOwnHit, 'own')}
       {tier(fallback, fbRefs, setFbHit, 'fb')}
     </span>
@@ -249,7 +288,7 @@ export function BookmarkModal({
   /* 图标那一格的预览：刚选的直接看data URL，已存的走接口取，
      两者都没有就拿当前名称/网址渲染一次自动取图的样子 */
   const preview: Bookmark = { id: '', name: name || '?', url: url || '', group, note: '', color };
-  const savedIcon = !icon && bookmark?.hasIcon && bookmark.id ? bookmarkIconUrl(bookmark.id) : '';
+  const savedIcon = !icon && bookmark?.hasIcon && bookmark.id ? bookmarkIconUrl(bookmark.id, bookmark.iconV) : '';
 
   return (
     <Modal
@@ -342,8 +381,11 @@ export function BookmarkModal({
         </div>
       </Field>
 
-      {/* 自定义图标。留空 = 自动取站点 favicon，取不到就是首字母色块 */}
-      <Field label="图标" hint="支持 PNG / JPG / GIF / WebP / AVIF，超过 256KB 会自动缩到 128px。不上传则自动取 favicon">
+      {/* 自定义图标。留空 = 用同步下来的站点图标，取不到就是首字母色块 */}
+      <Field
+        label="图标"
+        hint="支持 PNG / JPG / GIF / WebP / AVIF，超过 256KB 会自动缩到 128px。不上传就用「同步站点图标」抓下来的那张"
+      >
         <div className="flex items-center gap-2">
           <span className="grid h-9 w-9 shrink-0 place-items-center">
             {icon || savedIcon ? (
@@ -382,8 +424,10 @@ export function BookmarkModal({
             {iconBusy ? <Spinner /> : <Upload size={13} aria-hidden />}
             上传图片
           </Button>
-          {icon !== null || bookmark?.hasIcon ? (
-            <Button size="sm" variant="ghost" onClick={() => setIcon('')} title="清除自定义图标，回到自动 favicon">
+          {/* 只在**自定义图标**存在时给"清除"：同步下来的那张是自动的，
+              清它没有意义（下次同步又回来），而且这里的语义是"回到自动那张" */}
+          {icon !== null || bookmark?.hasCustomIcon ? (
+            <Button size="sm" variant="ghost" onClick={() => setIcon('')} title="清除自定义图标，回到自动取到的那张">
               清除
             </Button>
           ) : null}

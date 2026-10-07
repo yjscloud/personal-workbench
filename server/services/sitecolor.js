@@ -103,8 +103,9 @@ function metaThemeColor(html) {
 }
 
 /** 候选图标：apple-touch-icon 优先（通常是一张实心方图，取色最准），
-    其次是 sizes 最大的 icon，最后兜底 /favicon.ico */
-function iconCandidates(html, baseUrl) {
+    其次是 sizes 最大的 icon，最后兜底 /favicon.ico。
+    siteicon.js（固化图标）也用它 —— 同一份解析，取色和取图不会各认一套。 */
+export function iconCandidates(html, baseUrl) {
   const found = [];
   for (const tag of html.match(/<link\b[^>]*>/gi) || []) {
     const a = attrsOf(tag);
