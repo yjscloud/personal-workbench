@@ -60,6 +60,7 @@ function normalize(input) {
     ...seed.settings,
     ...stored,
     profile: { ...seed.settings.profile, ...(stored.profile || {}) },
+    hermes: { ...seed.settings.hermes, ...(stored.hermes || {}) },
     // engines 是数组，整份取库里的；缺字段（老备份没有 search）时上面的 ...seed 已经兜住
     search: { ...seed.settings.search, ...(stored.search || {}) },
     background: { ...seed.settings.background, ...(stored.background || {}) },

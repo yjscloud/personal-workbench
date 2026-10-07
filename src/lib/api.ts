@@ -630,6 +630,24 @@ export type SearchEngine = { id: string; name: string; url: string };
 export type Settings = {
   /** 首页问候语里的称呼；为空则只显示「早上好」 */
   profile: { name: string };
+  /**
+   * 智能办公室。「打开完整办公室」跳去哪 —— 留空表示用服务端 .env 的
+   * HERMES_BASE_URL；同一台机器在内网里可能有多个入口（IP / 主机名 / 反代域名），
+   * 从哪个进由这里定。只影响那个按钮的链接，不影响服务端怎么调它的接口。
+   */
+  hermes: {
+    officeUrl: string;
+    /**
+     * 智能办公室四块面板摆在哪一列、各自什么次序（存 key，不是文案）。
+     * 空对象 / 缺项 = 用默认摆法。
+     *
+     * 之所以是"两列"而不是一个顺序数组：两列数量可以不等（默认是 3 + 1），
+     * 单个顺序数组没法表达 —— 只能靠"前一半/后一半"这种硬规则，切不出 3+1。
+     * 前端负责补齐缺的、丢掉不认识的：对面加减面板时旧值要还能用，
+     * 所以**不要**假设这里总有四块、也没有未知 key。
+     */
+    officeLayout: { left: string[]; right: string[] };
+  };
   /** 首页搜索框：引擎列表 + 默认项 + 是否新标签页打开 */
   search: {
     engines: SearchEngine[];
@@ -732,6 +750,263 @@ export type BackupSettings = {
   lastError: string;
 };
 
+/**
+ * Hermes Agent Office 的工位状态。
+ * 网关自己给的是下划线那套字段名，后端 services/hermes.js 已经归一化过。
+ */
+export type HermesSeats = {
+  baseUrl: string;
+  gatewayVersion: string | null;
+  /** 工位总数 */
+  seats: number | null;
+  /** 在编（已入驻的智能员工） */
+  staffed: number | null;
+  /** 待入驻的空位 */
+  vacant: number | null;
+  online: number | null;
+  items: { id: string; name: string; en: string; online: boolean }[];
+  /** 网关最近一次探测员工的时间 */
+  checkedAt: string | null;
+  /** 服务端有没有配 Hermes 口令（决定登录墙后面那些数据能不能接） */
+  credentials: boolean;
+};
+
+/**
+ * 智能工位里的一位员工。
+ *
+ * 服务端把"网关给的在线状态"和"岗位档案"合并好了。岗位职责、工位号、立绘文件名
+ * 只存在于那台控制台自己的前端常量里（没有接口可取），所以由服务端照抄一份 ——
+ * 见 server/services/office.js 顶部那段说明。
+ */
+export type OfficeEmployee = {
+  id: string;
+  name: string;
+  en: string;
+  role: string;
+  /** 工位号，如 A-02 */
+  seat: string;
+  /** 立绘地址：已指向本服务的代理（/api/office/avatar/xxx.png），不是内网地址 */
+  avatar: string;
+  online: boolean;
+  /** agent = 有真正的对话通道（白饭）；null = 工具集 / 守望 / 采集子系统，没有对话概念 */
+  chat: 'agent' | null;
+};
+
+/** 工位状态 + 员工档案。工位那几个数与 /hermes/seats 同一套口径 */
+export type OfficeRoster = Omit<HermesSeats, 'items'> & {
+  items: OfficeEmployee[];
+  /** 网关回里有、服务端档案没跟上的 id（正常为空；不为空说明对面加了人） */
+  unknown: string[];
+};
+
+/** 全局待办工作表（那台控制台的 /local/board） */
+export type OfficeBoard = {
+  conversations: {
+    total: number;
+    /** 进行中 = 尚未结束的会话 */
+    active: number;
+    done: number;
+    today_new: number;
+    by_source: Record<string, number>;
+    end_reasons: string[];
+    definition: string;
+  };
+  jobs: {
+    id: string;
+    name: string;
+    enabled: boolean;
+    state: string;
+    schedule: string;
+    next_run_at: string | null;
+    last_run_at: string | null;
+    last_status: string;
+    failure_streak: number;
+    runs_completed: number;
+  }[];
+  runs: {
+    id: string;
+    job_id: string;
+    job_name: string;
+    status: string;
+    source: string;
+    started_at: string | null;
+    finished_at: string | null;
+    duration_s: number | null;
+    error: string;
+  }[];
+  incidents: {
+    id: string;
+    job_id: string;
+    job_name: string;
+    state: string;
+    failure_type: string;
+    error: string;
+    first_seen_at: string;
+    last_seen_at: string;
+  }[];
+  generated_at: string;
+};
+
+/** 一天的 token 用量。数字来自网关的真实记账，不是估算 */
+export type OfficeUsageDay = {
+  day: string;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+  reasoning: number;
+  total: number;
+  api_calls: number;
+  sessions?: number;
+  sources?: Record<string, number>;
+  top_sessions?: { id: string; title: string; source: string; token: number }[];
+};
+
+/** 今日 / 昨日 / 近 7 日 token 用量与预算 */
+export type OfficeUsage = {
+  today: OfficeUsageDay;
+  yesterday: OfficeUsageDay;
+  series: OfficeUsageDay[];
+  budget_tokens: number;
+  budget_label: string;
+  models: string[];
+  gateway: { version: string; pid: number; uptime_s: number };
+  generated_at: string;
+};
+
+/**
+ * 一次对话（会话级）。注意 started_at / last_active 是 **unix 秒**（带小数），
+ * 不是 ISO 串 —— 直接交给 new Date() 会得到 1970 年。
+ */
+export type OfficeSession = {
+  id: string;
+  source: string;
+  title: string;
+  model: string;
+  started_at: number;
+  ended_at: number | null;
+  end_reason: string | null;
+  message_count: number;
+  tool_call_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  reasoning_tokens: number;
+  api_call_count: number;
+  last_active: number;
+  preview: string | null;
+  pinned: boolean;
+};
+
+/** 对话里的一条消息。role 可能是 user / assistant / tool */
+export type OfficeMessage = {
+  id: number;
+  session_id: string;
+  role: string;
+  content: string;
+  tool_name: string | null;
+  timestamp: number;
+  token_count: number | null;
+};
+
+/**
+ * 与员工对话的流式事件。
+ *
+ * 服务端已经把网关那套私有帧名（assistant.delta / tool.started / run.completed …）
+ * 翻成这套口径，所以这里跟工作台助手是同一个写法，前端不必知道上游长什么样。
+ */
+export type OfficeChatEvent =
+  | { type: 'delta'; text: string }
+  | { type: 'tool'; name: string }
+  | { type: 'done'; usage: { total: number; input: number; output: number } | null; model: string | null }
+  | { type: 'error'; message: string };
+
+/* ── 工位详情（点开工位后那个弹窗）─────────────────────────────────── */
+
+/**
+ * 抬头那一排小标签。每个岗位的口径不同（本体看网关记账、司册看 MCP 进程、
+ * 拾贝看它自己的模型消耗、值守看定时任务），所以图标与文案都由服务端给，
+ * 前端只负责画 —— 口径是上游定的，抄到前端就会分叉。
+ */
+export type OfficeSeatChip = {
+  key: string;
+  icon: 'seat' | 'token' | 'clock' | 'target';
+  label: string;
+  /** 直接显示的文案（工位号、不适用、空闲待命…） */
+  value?: string;
+  /** 有时长时给秒数，由前端用同一套格式化（服务端不重复实现一份） */
+  seconds?: number;
+  /** 悬停说明 */
+  tip?: string;
+};
+
+/** 页签名。与上游控制台一致 */
+export type OfficeSeatTabKey = 'config' | 'skills' | 'evo' | 'memory' | 'chat';
+
+export type OfficeSeatDetail = {
+  profile: OfficeEmployee;
+  chips: OfficeSeatChip[];
+  /** 这个岗位有哪些页签，由服务端给（判断逻辑在上游） */
+  tabs: OfficeSeatTabKey[];
+};
+
+/** 配置文档：上游在浏览器里拼 Markdown，我们让服务端拼好，前端只管渲染与复制 */
+export type OfficeTabDoc = { kind: 'doc'; source: string; markdown: string };
+
+export type OfficeTabSkillItem = { name: string; description: string; meta: string; tags: string[] };
+export type OfficeTabSkills = {
+  kind: 'skills';
+  total: number;
+  groups: { label: string; count: number }[];
+  items: OfficeTabSkillItem[];
+};
+
+export type OfficeTabEvo = {
+  kind: 'evo';
+  source: string;
+  stats: { label: string; value: string }[];
+  timeline: { at: string; kind: string; title: string; text: string; right: string }[];
+};
+
+export type OfficeTabMemory = {
+  kind: 'memory';
+  records: { at: string; text: string }[];
+  memories: { tag: string; text: string }[];
+  note?: string;
+};
+
+export type OfficeSeatTab = OfficeTabDoc | OfficeTabSkills | OfficeTabEvo | OfficeTabMemory;
+
+/** 拾贝的一条历史抓取记录（按它当时的卡片样子回放） */
+export type OfficeHarvestItem = {
+  ts: number;
+  url: string;
+  host: string;
+  selector: string;
+  mode: string;
+  ok: boolean;
+  error: string;
+  status: number;
+  title: string;
+  note: string;
+  pages: number;
+  blocked: string;
+  field_names: string[];
+  count: number;
+  total: number;
+  elapsed_ms: number;
+  items: { text: string; values: string[] }[];
+};
+
+/** 给拾贝下指令的结果：要么它回一句话（不是抓取指令），要么一条真的抓取结果 */
+export type OfficeHarvestRun =
+  | { kind: 'reply'; reply: string; usage?: { tokens?: number; elapsed_ms?: number; cached?: boolean } }
+  | {
+      kind: 'scrape';
+      usage?: { tokens?: number; elapsed_ms?: number; cached?: boolean };
+      result: Partial<OfficeHarvestItem> & { columns?: string[]; rows?: string[][]; markdown?: string };
+    };
+
 export type Bootstrap = {
   todos: Todo[];
   tickets: Ticket[];
@@ -790,6 +1065,39 @@ export type AiUsage = {
   series: (AiUsageCounter & { key: string })[];
   /** 用途键 → 中文名，由服务端给，前端不维护第二份 */
   labels: Record<string, string>;
+  /**
+   * Hermes 网关的记账（含智能办公室里的员工）。
+   *
+   * 为什么要有它：面板自己只记得到"我调了几次模型"，而办公室那几位
+   * （定时任务、巡检、采集）的用量全在网关那边，面板看不见 ——
+   * 不并进来，顶栏那个数就漏掉了大部分消耗。
+   *
+   * 注意它**已经包含面板自己的调用**（面板走的就是网关的 /v1 接口，在
+   * 它的记账里归到 api_server 那一档），所以两个数不能相加，只能用它替代。
+   * null = 还没取到（首次读、或没配口令、或网关不通），此时退回本地记账。
+   */
+  gateway: AiGatewayUsage | null;
+};
+
+/** 网关侧的今日用量摘要 */
+export type AiGatewayUsage = {
+  today: {
+    total: number;
+    input: number;
+    output: number;
+    cache_read: number;
+    api_calls: number;
+    /** 按来源的 token 数：cron（员工定时任务）/ api_server（接口调用）… */
+    sources: Record<string, number>;
+  };
+  yesterday: { total: number; api_calls: number };
+  models: string[];
+  budget_tokens: number;
+  budget_label: string;
+  /** 这一份是什么时候取的（服务端缓存，最多一分钟旧） */
+  at: string;
+  /** 上次取失败的原因。有值时说明这份是旧的 */
+  error?: string;
 };
 
 /** AI 读的一条对话。**不落库** —— 热点条目会轮换，留着反而是垃圾数据 */
@@ -1214,6 +1522,58 @@ export const api = {
   settings: {
     get: () => req<Settings>('/settings'),
     save: (patch: DeepPartial<Settings>) => req<Settings>('/settings', send('PUT', patch)),
+  },
+
+  /**
+   * Hermes 智能工位（局域网那台 Agent Office 网关）。
+   * 只有工位状态是免登录的。
+   */
+  hermes: {
+    seats: () => req<HermesSeats>('/hermes/seats'),
+  },
+
+  /**
+   * 智能工位里"登录墙后面"的那部分。
+   *
+   * 浏览器不直接连那台网关（跨域 + 混合内容 + 不该把会话交给前端），
+   * 全部经服务端自己的会话代理，所以没配口令时这些接口是 503 而不是超时。
+   */
+  office: {
+    /** 员工档案 + 工位在线状态（立绘也在登录墙后面，没口令时图片取不到） */
+    roster: () => req<OfficeRoster>('/office/roster'),
+    /** 全局待办工作表：会话统计 + 定时任务 + 最近执行 + 异常 */
+    board: () => req<OfficeBoard>('/office/board'),
+    /** 今日与近 7 日 token 用量 */
+    usage: () => req<OfficeUsage>('/office/usage'),
+    /** 对话回溯列表 */
+    sessions: (limit = 20, offset = 0) =>
+      req<{ data: OfficeSession[]; has_more: boolean }>(`/office/sessions?limit=${limit}&offset=${offset}`),
+    /** 某次对话的逐条明细 */
+    messages: (id: string, limit = 30) =>
+      req<{ data: OfficeMessage[]; session_id: string }>(
+        `/office/sessions/${encodeURIComponent(id)}/messages?limit=${limit}`,
+      ),
+    /** 对话用那条会话的历史（就是控制台自己的网页端会话，两边看到的是同一份） */
+    chatHistory: (limit = 30) =>
+      req<{ data: OfficeMessage[]; session_id: string }>(`/office/chat/history?limit=${limit}`),
+    /** 发一条消息（SSE）。seat 决定"这条是问谁" */
+    chat: (seat: string, message: string, onEvent: (event: OfficeChatEvent) => void, signal?: AbortSignal) =>
+      streamSse<OfficeChatEvent>('/office/chat', { seat, message }, onEvent, signal),
+
+    /* ── 工位详情 ── */
+    /** 档案 + 抬头标签 + 该岗位的页签集合 */
+    seat: (id: string) => req<OfficeSeatDetail>(`/office/seat/${encodeURIComponent(id)}`),
+    /** 某个页签的内容（服务端已归一化，前端按 kind 画） */
+    seatTab: (id: string, tab: OfficeSeatTabKey) =>
+      req<OfficeSeatTab>(`/office/seat/${encodeURIComponent(id)}/tab/${tab}`),
+    /** 拾贝：历史抓取记录 */
+    harvestHistory: (limit = 200) =>
+      req<{ items: OfficeHarvestItem[]; total: number; file: string }>(`/office/harvest/history?limit=${limit}`),
+    /**
+     * 拾贝：下一条抓取指令。**这会真的去抓网页**（模型解析 → 本机采集器执行），
+     * 所以是 POST，且只有「即时交互」页签里那个发送按钮会调它。
+     */
+    harvest: (text: string) => req<OfficeHarvestRun>('/office/harvest', send('POST', { text })),
   },
 
   search: {

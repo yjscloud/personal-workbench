@@ -20,6 +20,8 @@ const Monitoring = lazy(() => import('./pages/Monitoring'));
 const News = lazy(() => import('./pages/News'));
 const Toolbox = lazy(() => import('./pages/Toolbox'));
 const Knowledge = lazy(() => import('./pages/Knowledge'));
+/* 智能工位：把局域网那台 Hermes「Agent Office」的工位状态接进来 */
+const Office = lazy(() => import('./pages/Office'));
 /* 阅读页与编辑器是同一份模块里的另外两个导出，所以它们仍然落在
    Knowledge 这一个 chunk 里 —— 不必为它们各切一份出来。 */
 const KnowledgeDoc = lazy(() => import('./pages/Knowledge').then((m) => ({ default: m.KnowledgeDoc })));
@@ -67,6 +69,7 @@ export default function App() {
                   <Route path="toolbox" element={<Toolbox />} />
                   <Route path="news" element={<News />} />
                   <Route path="knowledge" element={<Knowledge />} />
+                  <Route path="office" element={<Office />} />
                   {/* 顺序无关紧要：react-router 会把静态段 /new 排在 :id 之前，
                       所以它不会被当成一个 id 叫 "new" 的条目 */}
                   <Route path="knowledge/new" element={<KnowledgeEditor />} />

@@ -581,6 +581,66 @@
     -webkit-backdrop-filter: blur(12px);
   }
 
+  /* ── 智能办公室：工位场景 ──────────────────────────────────────────
+     一个工位 = 显示器（背面对着我们）+ 桌子 + 椅子 + 站在桌边的立绘。
+     家具画在组件的 SVG 里（形状要跟立绘的位置精确对上，写成 Tailwind
+     任意值会变成一坨读不懂的东西），这里只负责底色与两处光效。
+
+     不画"墙"和"地板带"：整块场景就应该是办公室里那种很亮、很空的底，
+     地面只用一片柔影交代（.office-shadow）。多画一条地板横线，画面立刻
+     变成"贴在墙上的示意图"。
+
+     颜色一律走主题变量：这套东西在浅色和深色下都要成立，写死一个木色或
+     天蓝会在另一套主题里变成突兀的色块。 */
+  /* 不过家具与屏幕这几个值**得单独定一组**，用现成的语义色凑不齐：
+     界面的 --line 在浅色下几乎是白的（231 238 248），拿它描桌面等于没描；
+     --line-strong 在浅色下又几乎是黑的（26 29 35），拿它描边会变成线框图。
+     而屏幕在浅色主题里该是深藏青、在深色主题里又得比面板更暗 —— 同一个
+     变量做不到。所以这组值是"这张插画自己的配色"，两套主题各给一次。 */
+  :root[data-theme='light'] {
+    --office-screen-rgb: 43 58 88; /* 显示器背壳：深藏青 */
+    --office-screen-dim-rgb: 209 218 233; /* 没人的工位：屏幕就是一块灰玻璃 */
+    --office-furniture-rgb: 255 255 255; /* 桌面与椅子：白 */
+    --office-furniture-2-rgb: 226 234 246; /* 桌腿、立柱、底座：浅灰蓝 */
+    --office-edge-rgb: 203 214 232; /* 家具轮廓：比界面线重一档，否则看不出边 */
+  }
+  :root[data-theme='dark'] {
+    --office-screen-rgb: 8 20 42; /* 比面板更暗，才像一块开着的屏幕 */
+    --office-screen-dim-rgb: 40 78 132;
+    --office-furniture-rgb: 30 72 130; /* 比面板略亮：深色下家具靠"被打光"读出来 */
+    --office-furniture-2-rgb: 20 52 96;
+    --office-edge-rgb: 70 120 190;
+  }
+
+  .office-scene {
+    position: relative;
+    overflow: hidden;
+    /* 极淡的一层底色：左下角略沉一点，和参考图那种"有空气感的白"一致 */
+    background:
+      radial-gradient(120% 90% at 12% 96%, rgb(var(--bg-3-rgb) / 0.75), transparent 62%),
+      linear-gradient(180deg, rgb(var(--panel-rgb) / 0.5), rgb(var(--bg-2-rgb) / 0.55));
+  }
+
+  /* 地面柔影：一片很淡的椭圆。桌椅与人都"站"在它上面 */
+  .office-shadow {
+    position: absolute;
+    left: 4%;
+    right: 4%;
+    bottom: 2.5%;
+    height: 6.5%;
+    border-radius: 999px;
+    background: radial-gradient(closest-side, rgb(var(--bg-3-rgb) / 0.95), rgb(var(--bg-3-rgb) / 0));
+  }
+
+  /* 显示器背后的光晕。用 CSS 的模糊（box-shadow）而不是 SVG 滤镜：
+     滤镜要给 id，一页十几张工位就会出现十几个同名 id */
+  .office-glow {
+    position: absolute;
+    border-radius: 16px;
+    background: rgb(var(--accent-rgb) / 0.13);
+    box-shadow: 0 0 22px 9px rgb(var(--accent-rgb) / 0.34), 0 0 52px 22px rgb(var(--accent-rgb) / 0.16);
+  }
+
   .scrim {
     background: var(--scrim);
   }

@@ -48,7 +48,20 @@ export function hasHermesCredentials() {
 }
 
 /* ── 极简 HTTP 客户端（与 ha.js 同款，但要把状态码和 Set-Cookie 交回调用方）── */
-function request(cfg, apiPath, { method = 'GET', body = null, cookie = '', timeout = 6000, maxBytes = 512 * 1024 } = {}) {
+
+/**
+ * 发出请求但**不读正文**，把响应流原样交出去。
+ *
+ * 拆出这一步是因为原来那个"一把读完"的写法做不到两件现在需要的事：
+ *
+ * · **字节**：员工立绘是 1MB 级的 PNG。按 utf8 解码会把非法字节改写，拿到的
+ *   "图片"直接是坏的（浏览器只会显示碎图），所以正文读取要能切到 Buffer 模式。
+ * · **流式**：对话是 SSE，网关边想边推、几十秒才完。缓冲式要等整段结束才返回，
+ *   用它接对话等于把流式体验抹掉 —— 界面会一直空着，直到全部生成完。
+ *
+ * 正文怎么读交给 readBody，这里只管把响应头拿回来（状态码是重登重放的依据）。
+ */
+function openRaw(cfg, apiPath, { method = 'GET', body = null, cookie = '', timeout = 6000, accept = 'application/json' } = {}) {
   return new Promise((resolve, reject) => {
     let target;
     try {
@@ -58,7 +71,7 @@ function request(cfg, apiPath, { method = 'GET', body = null, cookie = '', timeo
       return;
     }
     const payload = body === null ? null : Buffer.from(JSON.stringify(body));
-    const headers = { Accept: 'application/json' };
+    const headers = { Accept: accept };
     if (payload) {
       headers['Content-Type'] = 'application/json';
       headers['Content-Length'] = payload.length;
@@ -76,21 +89,61 @@ function request(cfg, apiPath, { method = 'GET', body = null, cookie = '', timeo
         headers,
         timeout,
       },
-      (res) => {
-        let raw = '';
-        res.setEncoding('utf8');
-        res.on('data', (chunk) => {
-          raw += chunk;
-          if (raw.length > maxBytes) req.destroy(new Error('响应过大'));
-        });
-        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: raw }));
-      },
+      (res) => resolve(res),
     );
     req.on('timeout', () => req.destroy(new Error('请求超时')));
     req.on('error', reject);
     if (payload) req.write(payload);
     req.end();
   });
+}
+
+/**
+ * 读正文。binary=true 交回 Buffer（图片这类），否则按 utf8 交回文本。
+ *
+ * 超限时**主动断开**而不是只记个标记：不掐断的话，那个几 MB 的响应还在一路推，
+ * 而调用方已经在报错了 —— 连接白占着，还会把内存吃掉。
+ */
+function readBody(res, { binary = false, maxBytes = 512 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
+
+    if (binary) {
+      const chunks = [];
+      let size = 0;
+      res.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > maxBytes) {
+          res.destroy();
+          done(reject, new Error('响应过大'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => done(resolve, { status: res.statusCode, headers: res.headers, buffer: Buffer.concat(chunks) }));
+    } else {
+      let raw = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => {
+        raw += chunk;
+        if (raw.length > maxBytes) {
+          res.destroy();
+          done(reject, new Error('响应过大'));
+        }
+      });
+      res.on('end', () => done(resolve, { status: res.statusCode, headers: res.headers, text: raw }));
+    }
+    res.on('error', (err) => done(reject, err));
+  });
+}
+
+function request(cfg, apiPath, opts = {}) {
+  return openRaw(cfg, apiPath, opts).then((res) => readBody(res, opts));
 }
 
 function parseJson(text) {
@@ -194,7 +247,7 @@ async function login(cfg) {
  * 调用「需要登录」的 Hermes 接口，返回原始响应 {status, headers, text}。
  * 探测脚本要靠状态码判断接口在不在，所以这一步不做 >=400 抛错。
  */
-export async function authedRequest(apiPath, { method = 'GET', body = null, timeout = 8000 } = {}) {
+export async function authedRequest(apiPath, { method = 'GET', body = null, timeout = 8000, binary = false, maxBytes } = {}) {
   const cfg = hermesConfig();
   if (session.cookie && Date.now() - session.at > SESSION_TTL) {
     session.cookie = '';
@@ -203,13 +256,48 @@ export async function authedRequest(apiPath, { method = 'GET', body = null, time
   if (!session.cookie) await login(cfg);
 
   try {
-    let res = await request(cfg, apiPath, { method, body, cookie: session.cookie, timeout });
+    const opts = { method, body, cookie: session.cookie, timeout, binary, maxBytes };
+    let res = await request(cfg, apiPath, opts);
     if (res.status === 401) {
       // 会话被顶掉或过期：重登一次再试，只有一次，避免把错误口令反复往外送
       session.cookie = '';
       session.at = 0;
       await login(cfg);
-      res = await request(cfg, apiPath, { method, body, cookie: session.cookie, timeout });
+      res = await request(cfg, apiPath, { ...opts, cookie: session.cookie });
+    }
+    return res;
+  } catch (err) {
+    throw new Error(friendlyError(err, cfg));
+  }
+}
+
+/**
+ * 打开一条**流式**响应（SSE），把响应流原样交给调用方，由它边收边转发。
+ *
+ * 与 authedRequest 的区别只在"什么时候判定失败"：会话过期必须在**响应头到达时**
+ * 就补救 —— 那一刻还没开始推正文，重登一次重放是干净的；一旦流起来就没法回头，
+ * 重放会得到两份正文（用户会看到回答被写两遍）。所以这里撞到 401 就丢掉这一份
+ * （res.resume 把响应体排空，连接才不会被挂住）、重登、再放一次，与 authedRequest 同款。
+ *
+ * timeout 默认 0（不限）：对话一次可能想几十秒，套 8 秒超时会让长回答必被掐断。
+ */
+export async function openHermesStream(apiPath, { method = 'POST', body = null, timeout = 0, accept = 'text/event-stream' } = {}) {
+  const cfg = hermesConfig();
+  if (session.cookie && Date.now() - session.at > SESSION_TTL) {
+    session.cookie = '';
+    session.at = 0;
+  }
+  if (!session.cookie) await login(cfg);
+
+  const attempt = () => openRaw(cfg, apiPath, { method, body, cookie: session.cookie, timeout, accept });
+  try {
+    let res = await attempt();
+    if (res.statusCode === 401) {
+      res.resume();
+      session.cookie = '';
+      session.at = 0;
+      await login(cfg);
+      res = await attempt();
     }
     return res;
   } catch (err) {

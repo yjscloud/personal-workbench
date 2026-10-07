@@ -19,7 +19,7 @@ import { Activity, CircuitBoard, Cpu, HardDrive, Info, Leaf, MemoryStick, Networ
 import { api, type DiskHealth, type PowerSource } from '@/lib/api';
 import { useMonitor } from '@/lib/monitor';
 import { useChartColors, timeLabel, GRID_DASH } from '@/lib/useChartColors';
-import { fmtTokens, useAiUsage, usedTokens } from '@/lib/ai-usage';
+import { fmtTokens, gatewaySourceLabel, useAiUsage, usedTokens } from '@/lib/ai-usage';
 import { cls, energyParts, fmtBytes, fmtDuration, fmtEnergy, fmtMoney, fmtRate } from '@/lib/format';
 import { Badge, Button, Card, CardHead, Empty, LiveDot, Meter, PageHead, Section, Segmented, Select, Skeleton, Spinner, toneByRatio } from '@/components/ui';
 import { RatioStat, Stat, ToneLed } from '@/components/bits';
@@ -950,6 +950,14 @@ function TokenPanel() {
      把两者并排摆出来，比单说"一共花了多少"更能说明钱花在哪儿 */
   const outShare = usage.today.prompt > 0 ? (usage.today.completion / usage.today.prompt) * 100 : 0;
   const sources = Object.entries(usage.sources).sort((a, b) => usedTokens(b[1]) - usedTokens(a[1]));
+  /* 网关侧按来源拆：cron（员工定时任务）与 api_server（接口调用，含面板自己）分得开，
+     一眼能看出"是不是员工那边在花" */
+  const gatewaySplit = usage.gateway
+    ? Object.entries(usage.gateway.today.sources)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `${gatewaySourceLabel(k)} ${fmtTokens(v)}`)
+        .join(' · ')
+    : '';
 
   return (
     /* h-full：与旁边那张一起被栅格拉成等高，不留白 */
@@ -1028,6 +1036,17 @@ function TokenPanel() {
             ? ` · ${sources.map(([k, v]) => `${usage.labels[k] ?? k} ${fmtTokens(usedTokens(v))}`).join(' · ')}`
             : ' · 还没有调用记录'}
         </p>
+        {/* 上面那些都是**面板自己**的调用。办公室里那几位（定时任务、巡检、采集）
+            的消耗全在网关那边，不看这一行就会以为一天的消耗就这么点。
+            它是个超集（面板的调用在网关账上归到 api_server），所以不加进上面的数。 */}
+        {usage.gateway ? (
+          <p className="text-2xs leading-relaxed text-muted">
+            Hermes 网关记账（含智能办公室的员工）今日{' '}
+            <b className="num font-medium text-ink">{fmtTokens(usage.gateway.today.total)}</b>
+            {usage.gateway.budget_label ? ` / 预算 ${usage.gateway.budget_label}` : ''}
+            {gatewaySplit ? ` · ${gatewaySplit}` : ''}
+          </p>
+        ) : null}
       </div>
     </Card>
   );

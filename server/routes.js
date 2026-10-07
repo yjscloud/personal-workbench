@@ -8,6 +8,21 @@ import { getOverview, getGrowth, listNodes, pveConfig, isConfigured } from './se
 import { accumulate, estimateWatts, powerReport, applyEco, recordMeter } from './services/power.js';
 import { haReadings, haConfig, isHaConfigured, listEntityOptions, normalizeSockets } from './services/ha.js';
 import { hermesSeats, testHermes, isHermesConfigured, hasHermesCredentials } from './services/hermes.js';
+import {
+  officeRoster,
+  officeBoard,
+  officeUsage,
+  officeSessions,
+  officeMessages,
+  officeUsageBrief,
+  chatHistory,
+  avatarFile,
+  chatStream,
+  seatDetail,
+  seatTab,
+  harvestHistory,
+  harvestRun,
+} from './services/office.js';
 import { readGovernor, GOVERNORS } from './services/cpu.js';
 import { backgroundStatus, saveBackground, clearBackground } from './services/background.js';
 import { sampleOnce, samplerStatus } from './services/sampler.js';
@@ -268,9 +283,16 @@ router.get('/version', (_req, res) => ok(res, { version: frontendVersion() }));
 
 /**
  * 全站大模型 token 用量。给顶栏那个统计用 —— 它挂在每个页面都看得见的位置，
- * 所以必须是个便宜接口：这里只是把内存里那个对象读出来，不查库。
+ * 所以必须是个便宜接口：本地那份只是把内存里的对象读出来（不查库），
+ * 网关那份读 office 服务的内存缓存（不在这条路径上等网络，见 officeUsageBrief）。
+ *
+ * gateway 为什么要有：面板只记得到自己调了几次模型，而智能办公室里那几位
+ * （定时任务、巡检、采集）的消耗全在网关那边。不并进来，顶栏这个数就漏掉大头。
  */
-router.get('/ai/usage', (_req, res) => ok(res, usageSnapshot(db())));
+router.get(
+  '/ai/usage',
+  wrap(async (_req, res) => ok(res, { ...usageSnapshot(db()), gateway: await officeUsageBrief() })),
+);
 
 /* ── 登录 ─────────────────────────────────────────────────────────── */
 
@@ -1932,6 +1954,47 @@ router.put(
     const nextSearch = incoming.search ? normalizeSearch(db().settings.search, incoming.search) : null;
     if (nextSearch && !nextSearch.ok) return fail(res, 400, nextSearch.error);
 
+    /* 智能办公室那个"打开完整办公室"的链接。
+       同样先校验再落库：地址会被塞进 href，不是 http(s) 的一律拒掉
+       （javascript: 之类在这里没有正当用途）。空字符串是合法的 ——
+       它的意思是"用服务端 .env 里那份"。 */
+    const nextOfficeUrl = incoming.hermes ? String(incoming.hermes.officeUrl ?? '').trim().slice(0, 500) : null;
+    if (nextOfficeUrl && !/^https?:\/\//i.test(nextOfficeUrl)) {
+      return fail(res, 400, '办公室地址要以 http:// 或 https:// 开头（留空则用服务端配置的地址）');
+    }
+
+    /* 智能办公室两侧边栏里那三块面板的摆放顺序（工位墙钉在中间那列，不在这儿）。
+       这里只做"收窄"，不做"凑齐"：对面加减面板时，前端要把旧的顺序补全
+       （补哪些、缺的放哪）——那是界面的知识，服务端不知道。
+       所以这里只保证存进去的一定是"一串互不重复的短标识"，最多 8 个。 */
+    let nextOfficeLayout = null;
+    if (incoming.hermes && incoming.hermes.officeLayout != null) {
+      const src = incoming.hermes.officeLayout;
+      /* 收窄成"两列各一串互不重复的短标识"。这里刻意**不**去补齐、也不去检查
+         两列有没有重叠：对面加减面板时补哪些、缺的放哪，是界面的知识。
+         老的扁平数组（一版里用过）也照收，按对半切开 —— 免得升级后布局被清空。 */
+      const seen = [];
+      const pick = (arr) => {
+        const out = [];
+        if (!Array.isArray(arr)) return out;
+        for (const raw of arr.slice(0, 16)) {
+          const k = String(raw ?? '').trim();
+          if (/^[a-z][a-z0-9]{0,15}$/.test(k) && !seen.includes(k)) {
+            seen.push(k);
+            out.push(k);
+          }
+        }
+        return out;
+      };
+      if (Array.isArray(src)) {
+        const flat = pick(src);
+        const half = Math.ceil(flat.length / 2);
+        nextOfficeLayout = { left: flat.slice(0, half), right: flat.slice(half) };
+      } else if (src && typeof src === 'object') {
+        nextOfficeLayout = { left: pick(src.left), right: pick(src.right) };
+      }
+    }
+
     update((d) => {
       const s = d.settings;
       if (incoming.theme) s.theme = { ...s.theme, ...incoming.theme };
@@ -1939,6 +2002,12 @@ router.put(
         // 称呼会直接渲染进首页的 h1，所以落库前先裁掉首尾空白并限长——
         // 前后带空格会把问候语的排版撑开，过长的名字也会把标题挤换行。
         s.profile = { ...s.profile, name: String(incoming.profile.name ?? '').trim().slice(0, 24) };
+      }
+      if (nextOfficeUrl !== null || nextOfficeLayout !== null) {
+        // 逐层合并：这两格是各自的覆盖位，不是整段配置的替换
+        s.hermes = { ...(s.hermes || {}) };
+        if (nextOfficeUrl !== null) s.hermes.officeUrl = nextOfficeUrl;
+        if (nextOfficeLayout !== null) s.hermes.officeLayout = nextOfficeLayout;
       }
       if (incoming.background) {
         const b = incoming.background;
@@ -2370,7 +2439,10 @@ router.post(
 router.get(
   '/hermes/seats',
   wrap(async (_req, res) => {
-    ok(res, await hermesSeats());
+    /* credentials 告诉页面"要不要提示去配 Hermes 口令"：
+       工位状态是免登录的，而待办 / 对话回溯 / 记忆 / 技能都在登录墙后面。
+       把这件事跟着同一个响应带回去，页面就不必再单独问一次。 */
+    ok(res, { ...(await hermesSeats()), credentials: hasHermesCredentials() });
   }),
 );
 
@@ -2384,6 +2456,184 @@ router.post(
       return fail(res, 401, result.auth.error, { baseUrl: result.baseUrl, public: result.public });
     }
     ok(res, result);
+  }),
+);
+
+/* ── 智能工位 · 登录墙后面那半 ─────────────────────────────────────── */
+
+/**
+ * 需要口令的那几个接口共用的前置。
+ *
+ * 单独拎出来是因为这几种失败长得完全不一样，页面要分开说：
+ * 没配口令是"服务端还没准备好"（503，去改 .env），配错了是"登录失败"
+ * （401，口令不对 / 账号被锁），网络不通是 502。糊成一句"读取失败"，
+ * 用户只能猜。没配就**当场回**，别等一次注定超时的网络往返。
+ */
+function needsHermes(res) {
+  if (hasHermesCredentials()) return true;
+  fail(res, 503, '服务端没有配置 Hermes 口令（.env 里的 HERMES_USER / HERMES_PASSWORD），登录墙后面的数据读不到');
+  return false;
+}
+
+/**
+ * 员工档案 + 工位在线状态。
+ *
+ * 与 /hermes/seats 的区别：这里把"岗位职责 / 工位号 / 立绘"也带上，
+ * 并把立绘换成本服务代理出来的地址。在线与否仍然是那个免登录接口给的，
+ * 所以**没配口令也能画出工位**（只是立绘取不到）。
+ */
+router.get(
+  '/office/roster',
+  wrap(async (_req, res) => {
+    ok(res, { ...(await officeRoster()), credentials: hasHermesCredentials() });
+  }),
+);
+
+/** 全局待办工作表：会话统计 + 定时任务 + 最近执行 + 异常 */
+router.get(
+  '/office/board',
+  wrap(async (_req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await officeBoard());
+  }),
+);
+
+/** 今日与近 7 日 token 用量（含预算、模型、采集器用量） */
+router.get(
+  '/office/usage',
+  wrap(async (_req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await officeUsage());
+  }),
+);
+
+/** 对话回溯列表 */
+router.get(
+  '/office/sessions',
+  wrap(async (req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await officeSessions({ limit: req.query.limit, offset: req.query.offset }));
+  }),
+);
+
+/** 某次对话的逐条明细 */
+router.get(
+  '/office/sessions/:id/messages',
+  wrap(async (req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await officeMessages(req.params.id, { limit: req.query.limit }));
+  }),
+);
+
+/**
+ * 对话用那条会话的历史。抽屉打开时先读它，免得一进来就是空白。
+ * 放在 /office/chat（POST）旁边 —— 同一个资源，一个是读历史，一个是接着说。
+ */
+router.get(
+  '/office/chat/history',
+  wrap(async (req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await chatHistory({ limit: req.query.limit }));
+  }),
+);
+
+/* ── 工位详情（点开工位后那个弹窗）────────────────────────────────── */
+
+/**
+ * 一位员工的详情骨架：档案 + 抬头四个标签 + 该岗位有哪些页签。
+ * 页签集合由服务端给，前端不自己判断 —— 判断逻辑在上游那儿，
+ * 抄一份到前端，两边迟早会不一致。
+ */
+router.get(
+  '/office/seat/:id',
+  wrap(async (req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await seatDetail(req.params.id));
+  }),
+);
+
+/** 某个页签的内容。页签名是白名单，值不是前端能传的路径 */
+router.get(
+  '/office/seat/:id/tab/:tab',
+  wrap(async (req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await seatTab(req.params.id, req.params.tab));
+  }),
+);
+
+/** 拾贝：历史抓取记录（按当时的卡片样子回放） */
+router.get(
+  '/office/harvest/history',
+  wrap(async (req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await harvestHistory(req.query.limit));
+  }),
+);
+
+/**
+ * 拾贝：下一条抓取指令。
+ *
+ * 这条是**会真的去抓网页**的（先让模型解析成计划，再交给本机采集器执行），
+ * 所以挂在 POST 上、也照旧需要面板自己的登录。不用流式：抓一次几秒到几十秒，
+ * 前端给个转圈就够了，为它做一条 SSE 不划算。
+ */
+router.post(
+  '/office/harvest',
+  wrap(async (req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await harvestRun(req.body?.text));
+  }),
+);
+
+/**
+ * 员工立绘。字节原样转发，走服务端缓存（见 services/office.js 的 avatarFile）。
+ *
+ * 文件名有白名单，且**不是**把请求路径拼到内网地址上 —— 这个路由对浏览器开放，
+ * 拼路径等于给人一个"用面板的会话去打内网"的跳板。
+ */
+router.get(
+  '/office/avatar/:file',
+  wrap(async (req, res) => {
+    try {
+      const { buffer, contentType } = await avatarFile(req.params.file);
+      res.setHeader('Content-Type', contentType);
+      /* 立绘是静态美术、内容基本不变，但文件名里没有版本号，
+         所以给一天缓存 + ETag：命中后这一页不再为那 4MB 发请求，
+         换成新图时（改了内容）ETag 会变，浏览器立刻拿到新的。 */
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('ETag', `"${buffer.length.toString(16)}-${buffer.length ? buffer[buffer.length - 1] : 0}"`);
+      res.send(buffer);
+    } catch (err) {
+      fail(res, err.message === '没有这张立绘' ? 404 : 502, err.message);
+    }
+  }),
+);
+
+/**
+ * 与员工对话（SSE）。转发到那台网关的会话上，边收边推。
+ *
+ * 岗位与对话能力的关系是**如实**的：只有白饭（网关那个智能体本体）有真正的
+ * 对话通道；其余三位是工具集 / 守望 / 采集子系统，没有对话概念。向它们提问时
+ * 由白饭代答 —— 消息里会带上"问的是谁"（见 services/office.js 的 chatBody），
+ * 界面上也会标明，不装作在与那个子系统对话。
+ *
+ * 口令没配时先回一个普通 JSON 错误，**不**开流：一旦发出 200 + text/event-stream，
+ * 前端就只能看到"流断了"，看不到原因。
+ */
+router.post(
+  '/office/chat',
+  wrap(async (req, res) => {
+    if (!needsHermes(res)) return;
+    const { message, seat } = req.body || {};
+    const sse = openSse(res);
+    try {
+      await chatStream(seat, message, (event) => sse.send(event));
+    } catch (err) {
+      /* 流已经开着，错误只能从流里出去（登录失败、建会话失败都走这里） */
+      sse.send({ type: 'error', message: err.message });
+    } finally {
+      sse.close();
+    }
   }),
 );
 

@@ -11,10 +11,11 @@ import {
   Settings as SettingsIcon,
   Sparkles,
   Sun,
+  Users,
   Wrench,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { fmtTokens, usageTip, useAiUsage, usedTokens } from '@/lib/ai-usage';
+import { fmtTokens, todayTokens, usageTip, useAiUsage } from '@/lib/ai-usage';
 import { useStore } from '@/lib/store';
 import { useMonitor } from '@/lib/monitor';
 import { useAuth } from '@/lib/auth';
@@ -26,10 +27,26 @@ import { SlideHighlight, useSlideBox } from './SlideHighlight';
 import { Assistant } from './Assistant';
 
 /* ── 导航定义 ─────────────────────────────────────────────────────── */
-export const NAV = [
+
+/** 一项导航。单独定类型是为了 `short` 可选：不加的话，数组里只要有一项带了它，
+ *  TypeScript 会把每一项推成"有的有、有的没有"的联合类型，读 item.short 就报错 */
+type NavItem = {
+  to: string;
+  label: string;
+  /** 手机底栏的短名（那一格只放得下两个汉字）。没给就用 label */
+  short?: string;
+  hint: string;
+  icon: typeof LayoutGrid;
+  end: boolean;
+  group: string;
+};
+
+export const NAV: NavItem[] = [
   { to: '/', label: '导航', hint: '今日待办与常用入口', icon: LayoutGrid, end: true, group: '工作台' },
   { to: '/week', label: '任务', hint: '项目、分类与截止', icon: CheckSquare, end: false, group: '工作台' },
   { to: '/toolbox', label: '工具箱', hint: '分类工具网站', icon: Wrench, end: false, group: '工作台' },
+  /* 智能办公室紧挨着工具箱：这两处都是"我的入口"——一个是网站，一个是替我干活的员工 */
+  { to: '/office', label: '智能办公室', short: '办公室', hint: 'Hermes 员工与工位', icon: Users, end: false, group: '工作台' },
   { to: '/monitoring', label: '监控数据', hint: 'PVE 硬件与功耗', icon: Activity, end: false, group: '监控与信息' },
   { to: '/news', label: 'AI 热点', hint: '每日自动更新', icon: Sparkles, end: false, group: '监控与信息' },
   { to: '/knowledge', label: '知识库', hint: 'SOP 与 Runbook', icon: BookOpen, end: false, group: '监控与信息' },
@@ -415,10 +432,16 @@ function TopBar({
  * 干什么"，而不是某张卡片里的业务数据。
  *
  * 显示**今日**而不是累计：累计只增不减，看久了等于没看。
+ *
+ * 这个数是**网关记账**（含智能办公室里那几位员工：定时任务、巡检、采集），
+ * 不是面板自己调了几次 —— 面板自己那点只是其中一小块，光看它会以为一天没花什么。
+ * 读到网关那份时在数后面缀一句「含员工」：否则"面板没怎么用过，怎么这么多"
+ * 会让人以为数错了。悬停能看到按来源的拆分。网关那份还没读到时退回本地记账。
  */
 function TokenUsage() {
   const usage = useAiUsage();
   if (!usage) return null;
+  const gateway = usage.gateway;
 
   return (
     <span
@@ -427,7 +450,8 @@ function TokenUsage() {
     >
       <Activity size={11} aria-hidden className="shrink-0 text-accent" />
       今日消耗 Token
-      <span className="num font-medium text-ink">{fmtTokens(usedTokens(usage.today))}</span>
+      <span className="num font-medium text-ink">{fmtTokens(todayTokens(usage))}</span>
+      {gateway ? <span className="hidden text-faint lg:inline">含员工</span> : null}
     </span>
   );
 }
@@ -464,7 +488,11 @@ function MobileNav() {
   return (
     <nav
       ref={ref}
-      className="glass fixed inset-x-0 bottom-0 z-30 grid grid-cols-7 border-t border-line pb-[env(safe-area-inset-bottom)] shadow-[0_-6px_20px_-12px_rgba(20,40,80,.24)] lg:hidden"
+      className="glass fixed inset-x-0 bottom-0 z-30 grid border-t border-line pb-[env(safe-area-inset-bottom)] shadow-[0_-6px_20px_-12px_rgba(20,40,80,.24)] lg:hidden"
+      /* 列数按 NAV 的长度算，不写死。原来写的是 grid-cols-7：
+         导航一多一项，第 8 项就换到第二行去，整个底栏跟着错位 ——
+         而"加一个导航项"是再正常不过的改动。 */
+      style={{ gridTemplateColumns: `repeat(${NAV.length}, minmax(0, 1fr))` }}
     >
       {/* 原本每项自己画的那道 2px 顶条撤掉了：一块圆角底已经说清"当前项"，
           再压一道实色条就成了两个各说一半的指示器。
@@ -484,7 +512,10 @@ function MobileNav() {
           }
         >
           <item.icon size={17} aria-hidden />
-          <span className="w-full truncate text-center">{item.label}</span>
+          {/* 底栏一格在手机上只有 ~48px，放得下两个汉字。左轨用完整名字，
+              这里用 short（没给就退回全名）—— 否则"智能办公室"会被截成
+              "智能办…"这种既读不通、又占两行的东西 */}
+          <span className="w-full truncate text-center">{item.short ?? item.label}</span>
         </NavLink>
       ))}
     </nav>
