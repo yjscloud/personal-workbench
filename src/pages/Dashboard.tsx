@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { ArrowUpRight, BookOpen, Check, Cpu,  MemoryStick, Pencil, Plus, Receipt, Search, Trash2, TrendingUp, Zap } from 'lucide-react';
+import { ArrowUpRight, BookOpen, Check, Cpu,  MemoryStick, Plus, Receipt, Search, Trash2, TrendingUp, Zap } from 'lucide-react';
 import { useStore } from '@/lib/store';
-import { BookmarkModal, SiteIcon } from '@/components/bookmarks';
+import { SiteIcon } from '@/components/bookmarks';
 import { useMonitor } from '@/lib/monitor';
 import { api, type Bookmark, type KnowledgeItem, type Priority } from '@/lib/api';
 import { cls, fmtBytes, fmtEnergy, fmtMoney, hostOf, todayStr } from '@/lib/format';
 import { brandTint, paletteTint } from '@/lib/tint';
 import { engineLetters, engineTint, isBrightHue } from '@/lib/engine-color';
-import { Button, Card, CardHead, Empty, Input, Select, Skeleton } from '@/components/ui';
+import { Button, buttonClass, Card, CardHead, Empty, Input, Select, Skeleton } from '@/components/ui';
 import { PriorityBadge, STATUS_META, Stat, Tag } from '@/components/bits';
 
 const PRIORITY_OPTIONS: Priority[] = ['P0', 'P1', 'P2', 'P3'];
@@ -991,12 +991,14 @@ function TodayTodos() {
 
 /* ══════════════════════════════════════════════════════════════════
    常用网站
+
+   这一块是**只读**的：点一下就跳走，仅此而已。
+   增删改一律在工具箱 —— 那边才有分类管理、拖动排序、图标上传这些要看上下文的
+   动作。两处都能改，就是两套入口要同步维护，而用户还会问"到底该在哪边改"。
    ══════════════════════════════════════════════════════════════════ */
 function QuickLinks() {
-  const { bookmarks, groups, bookmarksApi } = useStore();
+  const { bookmarks, groups } = useStore();
   const [activeGroup, setActiveGroup] = useState<string>('all');
-  const [editing, setEditing] = useState<Bookmark | null>(null);
-  const [creating, setCreating] = useState(false);
 
   /* 只显示标记为常用的入口。
      但一个都没标过时退回"全部" —— 否则这块会突然空掉，看上去像数据丢了。
@@ -1014,15 +1016,13 @@ function QuickLinks() {
       <CardHead
         title="常用网站"
         hint={
-          fallback
-            ? `${bookmarks.length} 个入口 · 还没标记常用，编辑工具时打开「设为常用」即可挑选`
-            : `${pinned.length} 个常用 · 编辑工具里的「设为常用」可增减`
-        }
-        right={
-          <Button size="sm" variant="soft" onClick={() => setCreating(true)}>
-            <Plus size={13} />
-            添加
-          </Button>
+          /* 一个入口都没有时别写成「0 个入口 · 还没标记常用」——
+             那种时候下面那块空状态已经把话说完了，这里再数一遍只会显得啰嗦 */
+          bookmarks.length === 0
+            ? '工具箱里还没有入口'
+            : fallback
+              ? `${bookmarks.length} 个入口 · 还没标记常用，到工具箱编辑工具时打开「设为常用」`
+              : `${pinned.length} 个常用 · 到工具箱编辑工具时增减`
         }
       />
 
@@ -1042,14 +1042,19 @@ function QuickLinks() {
       </div>
 
       {filtered.length === 0 ? (
+        /* 空状态给一条**去工具箱**的路（那是纯导航，不是在这里改东西）：
+           只说"去别处加"而不给入口，等于把人扔在原地 */
         <Empty
-          title="这个分组还是空的"
-          hint="把每天都要打开的面板加进来，之后一键直达。"
+          title={scoped.length === 0 ? '工具箱里还没有入口' : '这个分组下没有常用项'}
+          hint={
+            scoped.length === 0
+              ? '到工具箱把常用的面板加进来，之后一键直达。'
+              : '到工具箱编辑工具时打开「设为常用」，它就会出现在这里；也可以切到别的分组看看。'
+          }
           action={
-            <Button size="sm" variant="primary" onClick={() => setCreating(true)}>
-              <Plus size={13} />
-              添加网站
-            </Button>
+            <Link to="/toolbox" className={buttonClass('soft', 'sm')}>
+              去工具箱
+            </Link>
           }
         />
       ) : (
@@ -1063,64 +1068,30 @@ function QuickLinks() {
           {filtered.map((bm) => {
             const brand = brandTint(bm.color);
             return (
-              <div key={bm.id} className="group relative">
-                <a
-                  href={bm.url}
-                  target="_blank"
-                  rel="noreferrer noopener"
-                  title={bm.note ? `${bm.name} · ${hostOf(bm.url)} · ${bm.note}` : `${bm.name} · ${hostOf(bm.url)}`}
-                  data-brand={brand ? '' : undefined}
-                  style={brand ? ({ '--tb-h': brand.h, '--tb-s': `${brand.s}%` } as CSSProperties) : undefined}
-                  className={cls(
-                    'tb-card flex aspect-square flex-col items-center justify-center gap-1.5 rounded-xl2 p-1.5',
-                    brand ? '' : `tb-tint-${paletteTint(bm.id || bm.name)}`,
-                  )}
-                >
-                  <span className="tb-icon grid place-items-center">
-                    <SiteIcon bookmark={bm} size={30} fill />
-                  </span>
-                  <span className="w-full truncate px-1 text-center text-xs font-medium text-ink">{bm.name}</span>
-                </a>
-                <div className="absolute right-1 top-1 flex items-center gap-0.5 rounded-field bg-panel/85 p-0.5 backdrop-blur-sm opacity-100 transition-opacity focus-within:opacity-100 sm:opacity-0 sm:group-hover:opacity-100">
-                  <button
-                    type="button"
-                    onClick={() => setEditing(bm)}
-                    aria-label={`编辑 ${bm.name}`}
-                    className="rounded-field p-1.5 text-faint transition-colors hover:bg-panel hover:text-ink"
-                  >
-                    <Pencil size={12} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void bookmarksApi.remove(bm.id)}
-                    aria-label={`删除 ${bm.name}`}
-                    className="rounded-field p-1.5 text-faint transition-colors hover:bg-panel hover:text-crit"
-                  >
-                    <Trash2 size={12} />
-                  </button>
-                </div>
-              </div>
+              /* 磁贴就是整个网格子项，外面不再套一层"为了挂操作条"的容器：
+                 这块不提供编辑，也就没有悬浮操作条要定位 */
+              <a
+                key={bm.id}
+                href={bm.url}
+                target="_blank"
+                rel="noreferrer noopener"
+                title={bm.note ? `${bm.name} · ${hostOf(bm.url)} · ${bm.note}` : `${bm.name} · ${hostOf(bm.url)}`}
+                data-brand={brand ? '' : undefined}
+                style={brand ? ({ '--tb-h': brand.h, '--tb-s': `${brand.s}%` } as CSSProperties) : undefined}
+                className={cls(
+                  'tb-card flex aspect-square flex-col items-center justify-center gap-1.5 rounded-xl2 p-1.5',
+                  brand ? '' : `tb-tint-${paletteTint(bm.id || bm.name)}`,
+                )}
+              >
+                <span className="tb-icon grid place-items-center">
+                  <SiteIcon bookmark={bm} size={30} fill />
+                </span>
+                <span className="w-full truncate px-1 text-center text-xs font-medium text-ink">{bm.name}</span>
+              </a>
             );
           })}
         </div>
       )}
-
-      <BookmarkModal
-        open={creating || Boolean(editing)}
-        bookmark={editing}
-        groups={groups}
-        defaultGroup={activeGroup === 'all' ? groups[0]?.id : activeGroup}
-        onClose={() => {
-          setCreating(false);
-          setEditing(null);
-        }}
-        onSave={async (payload) => {
-          if (editing) await bookmarksApi.patch(editing.id, payload);
-          else await bookmarksApi.add(payload as Partial<Bookmark> & { name: string; url: string });
-          setCreating(false);
-          setEditing(null);
-        }}
-      />
     </Card>
   );
 }
