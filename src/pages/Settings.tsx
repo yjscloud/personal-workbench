@@ -112,7 +112,7 @@ export default function Settings() {
         原来只渲染一张细条卡，数据一到整页几乎全部重排。 */
     return (
       <div className="mx-auto w-full max-w-[1080px] space-y-4" role="status" aria-busy="true">
-        <PageHead title="设置" hint="外观、连接、功耗与备份，改动会同步保存到服务端。" />
+        <PageHead title="系统设置" hint="外观、连接、功耗与备份，改动会同步保存到服务端。" />
         <SkeletonCard lines={4} />
         <SkeletonCard lines={3} />
         <SkeletonCard lines={5} />
@@ -568,7 +568,7 @@ export default function Settings() {
       {/* 这一页原先整页没有 h1 —— 第一个标题就是卡片头渲染出来的 h3，
           文档大纲从 h3 起跳。补上页面名，卡片头降一级成 h2
           （见下面各处的 level={2}） */}
-      <PageHead title="设置" hint="外观、连接、功耗与备份，改动会同步保存到服务端。" />
+      <PageHead title="系统设置" hint="外观、连接、功耗与备份，改动会同步保存到服务端。" />
 
       {/* 个人 */}
       <Card>

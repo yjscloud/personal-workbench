@@ -235,7 +235,7 @@ export default function Toolbox() {
       <div className="relative">
         <PageCanvas />
         <div className="mx-auto w-full max-w-[1600px]" role="status" aria-busy="true">
-          <PageHead title="工具箱" hint="内网面板、开发工具与文档入口，按用途分类。" />
+          <PageHead title="常用工具" hint="内网面板、开发工具与文档入口，按用途分类。" />
           {/* 磁贴骨架用真实那一套网格与尺寸（见下面 <ul> 的 grid-cols 与磁贴的
               h-[54px]），数据到位时才不会重排 */}
           {[0, 1].map((g) => (
@@ -260,7 +260,7 @@ export default function Toolbox() {
 
       <div className="mx-auto w-full max-w-[1600px]">
         <PageHead
-          title="工具箱"
+          title="常用工具"
           hint={`日常要用的内网面板、开发工具与文档入口都收在这里，按用途分成 ${groups.length} 类，共 ${bookmarks.length} 个。点图标直接在新标签页打开；要让某个入口出现在首页的「常用网站」，编辑它时打开「设为常用」。磁贴颜色默认跟随站点自己的品牌色，取不到的退回糖纸色板。`}
           actions={
             <>

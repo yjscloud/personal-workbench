@@ -33,7 +33,8 @@ import { Assistant } from './Assistant';
 type NavItem = {
   to: string;
   label: string;
-  /** 手机底栏的短名（那一格只放得下两个汉字）。没给就用 label */
+  /** 手机底栏的短名（那一格只放得下两个汉字）。侧栏标签统一四个字之后，
+   *  底栏那八格全都放不下，所以每一项都得给；没给就退回 label */
   short?: string;
   hint: string;
   icon: typeof LayoutGrid;
@@ -42,15 +43,19 @@ type NavItem = {
 };
 
 export const NAV: NavItem[] = [
-  { to: '/', label: '导航', hint: '今日待办与常用入口', icon: LayoutGrid, end: true, group: '工作台' },
-  { to: '/week', label: '任务', hint: '项目、分类与截止', icon: CheckSquare, end: false, group: '工作台' },
-  { to: '/toolbox', label: '工具箱', hint: '分类工具网站', icon: Wrench, end: false, group: '工作台' },
-  /* 智能办公室紧挨着工具箱：这两处都是"我的入口"——一个是网站，一个是替我干活的员工 */
-  { to: '/office', label: '智能办公室', short: '办公室', hint: 'Hermes 员工与工位', icon: Users, end: false, group: '工作台' },
-  { to: '/monitoring', label: '监控数据', hint: 'PVE 硬件与功耗', icon: Activity, end: false, group: '监控与信息' },
-  { to: '/news', label: 'AI 热点', hint: '每日自动更新', icon: Sparkles, end: false, group: '监控与信息' },
-  { to: '/knowledge', label: '知识库', hint: 'SOP 与 Runbook', icon: BookOpen, end: false, group: '监控与信息' },
-  { to: '/settings', label: '设置', hint: '主题与备份', icon: SettingsIcon, end: false, group: '系统' },
+  /* 名字统一四字：侧栏那八行看起来是一组，而不是"两字、三字、五字"混着排。
+     四字在手机底栏放不下（那一格只够两个汉字），所以每一项都配了 short；
+     原名里被压掉的信息（AI 热点、智能办公室）留在 hint 与页面自己的 <h1> 里。 */
+  { to: '/', label: '今日概览', short: '概览', hint: '今日待办与常用入口', icon: LayoutGrid, end: true, group: '每天' },
+  { to: '/week', label: '任务计划', short: '任务', hint: '项目、分类与截止', icon: CheckSquare, end: false, group: '每天' },
+  /* 智能办公紧挨着任务：这两处都是"今天要处理的"；工具是翻一次就走的目录，排在后面 */
+  { to: '/office', label: '智能办公', short: '办公', hint: '智能办公室 · Hermes 员工与工位', icon: Users, end: false, group: '每天' },
+  { to: '/toolbox', label: '常用工具', short: '工具', hint: '分类工具网站', icon: Wrench, end: false, group: '每天' },
+  { to: '/monitoring', label: '监控数据', short: '监控', hint: 'PVE 硬件与功耗', icon: Activity, end: false, group: '看与查' },
+  /* 知识文库往前：查 SOP 是带目的的，刷热点是随手——常用的排前面 */
+  { to: '/knowledge', label: '知识文库', short: '知识', hint: 'SOP 与 Runbook', icon: BookOpen, end: false, group: '看与查' },
+  { to: '/news', label: '每日热点', short: '热点', hint: 'AI 热点，每日自动更新', icon: Sparkles, end: false, group: '看与查' },
+  { to: '/settings', label: '系统设置', short: '设置', hint: '主题与备份', icon: SettingsIcon, end: false, group: '系统' },
 ];
 
 /**
@@ -196,7 +201,7 @@ export function AppShell() {
         </div>
 
         {/* 品牌区与导航之间压一道分隔线：立柱内容其实分两块，
-            没有这条线，品牌、AI 入口和下面 7 个导航项连成一片 */}
+            没有这条线，品牌、AI 入口和下面那排导航项连成一片 */}
         <div aria-hidden className="mx-3 mt-3 h-px bg-gradient-to-r from-transparent via-line to-transparent" />
 
         {/* 侧栏不再有滑动高亮块：当前页只由「强调色字重 + 左缘刻度条」标出

@@ -333,7 +333,7 @@ export default function Knowledge() {
   return (
     <div className={cls('mx-auto w-full space-y-4', PAGE_MAX)}>
       <PageHead
-        title={bin ? '回收站' : '知识库'}
+        title={bin ? '回收站' : '知识文库'}
         hint={
           bin
             ? `删掉的文章先放这里，保留 ${keepDays} 天，期间随时可以恢复；到期由服务端自动永久删除`

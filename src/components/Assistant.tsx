@@ -176,7 +176,7 @@ export function Assistant({ open, onClose }: { open: boolean; onClose: () => voi
                     ? '本地执行 · 未调用大模型'
                     : engine === 'rule'
                       ? '本地规则引擎'
-                      : '可读待办 / 任务 / 监控 / 知识库'}
+                      : '可读待办 / 任务 / 监控 / 知识文库'}
               </p>
             </div>
           </div>

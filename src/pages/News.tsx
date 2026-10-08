@@ -334,7 +334,7 @@ export default function News() {
   return (
     <div className="mx-auto w-full max-w-[1720px] space-y-4">
       <PageHead
-        title="AI 热点"
+        title="每日热点"
         hint={
           updatedAt
             ? `数据来自 AIHOT，已按来源的模型评分筛过 · 上次同步 ${fmtRelative(updatedAt)} · ${scopeLabel}`
