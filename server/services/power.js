@@ -156,8 +156,14 @@ export function accumulate(watts, settings, { eco, load } = {}) {
     let dtHours = 0;
     if (prevTs) {
       const dtSec = (now - prevTs) / 1000;
-      // 只累计合理区间（20s ~ 30min），避免服务停机造成虚增
-      if (dtSec >= 10 && dtSec <= 1800) dtHours = dtSec / 3600;
+      /* 下限放到 1 秒：本函数被前端轮询与服务端采样器共用，两边共用同一个
+         lastTs，所以每次调用只结算"距上一次调用"这一段 —— 页面刷得越快，
+         单段越短，总和不。曾经的 10 秒下限会让 5~9 秒的刷新把这一段**直接
+         丢掉**（lastTs 照样往前推），结果是页面一开着、电量就不涨，
+         而监控页正是最爱刷的那一页。
+         上限 30 分钟保留：停机造成的大空档没有读数可用，不能拿前后两个
+         瞬时值把它补出来（要补只能靠插座自己的累计读数，见 meterDaily）。 */
+      if (dtSec >= 1 && dtSec <= 1800) dtHours = dtSec / 3600;
     }
 
     const kwh = (watts * dtHours) / 1000;

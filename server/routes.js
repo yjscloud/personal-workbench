@@ -2320,9 +2320,16 @@ router.get(
       ? { watts: ha.watts, cpuWatts: null, baseWatts: null, source: 'ha' }
       : estimateWatts({ ...overview.status, disks: overview.disks }, overview.sensors, data.settings);
 
-    // 电量累计是一次真实写入，返回前落库，避免"界面涨了、库里没涨"
-    // 带上 CPU 负载：实测统计要按负载档分桶，否则"平均功率"里混的是当期在忙什么
-    accumulate(wattsInfo.watts, data.settings, { eco: data.settings.power.eco, load: overview.status?.cpu });
+    /* 电量累计只认**实测**功率：HA 配了却读不到时（它重启、网络抖一下），
+       上一步会退到 estimateWatts —— 那个数若也累加进当日电量，就是拿模型
+       数污染实测记录，而采样器那条路是"读不到就跳过"，两条路必须同口径。
+       完全没配 HA 的安装（不接插座）是另一回事：没有实测可用，这一页的
+       电量本来就只有模型那一路，界面上也标着"回退到估算"。
+       带上 CPU 负载：模式实测要按负载档分桶，否则"平均功率"里混的是当期在忙什么 */
+    if (wattsInfo.source === 'ha' || wattsInfo.source === 'sensor' || !isHaConfigured(data.settings)) {
+      // 电量累计是一次真实写入，返回前落库，避免"界面涨了、库里没涨"
+      accumulate(wattsInfo.watts, data.settings, { eco: data.settings.power.eco, load: overview.status?.cpu });
+    }
     // 插座累计读数的每日快照：今日/近一月用电都由它推导
     recordMeter(ha.counterKwh);
     /* 电量落库不挡在响应前面。实测同步 await 要为它付 400ms（写 energy_* 表），
