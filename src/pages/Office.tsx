@@ -217,7 +217,7 @@ export default function Office() {
       api.office.roster(),
       api.office.board(),
       api.office.usage(),
-      api.office.sessions(16),
+      api.office.sessions(20),
     ]);
 
     if (rosterRes.status === 'fulfilled') {
@@ -492,7 +492,14 @@ export default function Office() {
             !!drag && drag.to.col === col && (drag.to.i === i || (drag.to.i === keys.length && i === keys.length - 1));
           const isTail = !!drag && drag.to.col === col && drag.to.i === keys.length && i === keys.length - 1;
           return (
-            <div key={key} data-slot={flat} className="flex flex-col gap-1.5">
+            /* 收口要**连着两层**给：这层槽位包裹 + 里面那张卡。只给卡（外层不
+               长）的话卡再怎么 flex 也长不出来 —— 右列就是这么短了一截的。
+               编辑态时这层里还有个手柄条，它保持自然高度，不参与拉伸 */
+            <div
+              key={key}
+              data-slot={flat}
+              className={cls('flex flex-col gap-1.5', i === keys.length - 1 && 'flex-auto')}
+            >
               {editingLayout ? (
                 /* 把手放在卡片**外面**的一条窄条里，而不是压在卡片右上角：
                    那几个位置已经有徽标（"16 条"、"无未闭环异常"），压上去
@@ -567,7 +574,7 @@ export default function Office() {
   return (
     <div className="mx-auto w-full max-w-[1600px] space-y-5">
       <PageHead
-        title="智能办公室"
+        title="智能办公"
         hint={
           roster
             ? `Hermes 智能员工办公室（${roster.baseUrl}${roster.gatewayVersion ? ` · 网关 ${roster.gatewayVersion}` : ''}）。工位 ${interval} 秒对一次；点员工可以直接说话。`

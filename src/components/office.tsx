@@ -481,9 +481,9 @@ export function FacilitiesPanel({
       {head}
       {error ? <PanelError text={error} /> : null}
 
-      {/* mt-auto：这一列要靠它收口，多出来的几十像素落在标题与格子之间 ——
-          分摊成"这张卡比较松"，而不是在卡底留一块白 */}
-      <ul className={cls('grid grid-cols-1 gap-3 sm:grid-cols-3', error ? 'mt-3.5' : 'mt-auto')}>
+      {/* my-auto：这一列要靠它收口，余量**上下各摊一半** —— 与其在卡底留一块白，
+          不如把三格放得"居中一点"，看着是这张卡比较松 */}
+      <ul className={cls('grid grid-cols-1 gap-3 sm:grid-cols-3', error ? 'mt-3.5' : 'my-auto')}>
         <FacilityTile
           name="茶水间"
           en="COFFEE BAR"
@@ -761,9 +761,11 @@ export function BoardPanel({
         定时任务 {board.jobs.length} 个 · 最近执行 {board.runs.length} 条
       </p>
       {/* 单列：这块与用量同处右栏（360px），摊两列会把周期那行挤碎。
-          条数是"让右栏底边与中间那列齐平"定的（调度任务 7 条 + 最近执行 5 条），
-          要再高/再矮，改这两个数字即可 */}
-      <ul className="space-y-1.5">
+          两个清单都挂 flex-auto + justify-between：这一栏比中间那列矮多少，
+          余量就按"两半"摊进两个清单的行距里 —— 卡底不留白，也不在两张清单
+          之间留一大块（那正是"内页有留白"的来源）。条数只是上限：定时任务 7、
+          最近执行 8（对面这份就是最近 8 条），数据少就用实际条数 */}
+      <ul className="flex flex-auto flex-col justify-between gap-1.5">
         {board.jobs.slice(0, 7).map((j) => (
           <li key={j.id} className="flex items-center gap-2 rounded-field bg-bg-2 px-2.5 py-2">
             <Led tone={j.enabled ? 'ok' : 'neutral'} />
@@ -786,8 +788,8 @@ export function BoardPanel({
       </ul>
 
       {board.runs.length ? (
-        <ul className="mt-auto space-y-1 border-t border-line pt-3">
-          {board.runs.slice(0, 5).map((r) => (
+        <ul className="mt-3 flex flex-auto flex-col justify-between gap-1 border-t border-line pt-3">
+          {board.runs.slice(0, 8).map((r) => (
             <li key={r.id} className="flex items-center gap-2 text-2xs">
               <Led tone={r.status === 'completed' ? 'ok' : r.status === 'failed' ? 'crit' : 'warn'} />
               <span className="min-w-0 flex-1 truncate text-muted">{r.job_name}</span>
@@ -860,7 +862,9 @@ export function SessionsPanel({
     );
   }
   return (
-    <Card className={className}>
+    /* flex 列：下面那个清单要用 flex-auto 收口（把余量摊进行距），
+       卡片本身得先是弹性容器 */
+    <Card className={cls('flex flex-col', className)}>
       <CardHead
         /* level=2：这三块是直接铺在页面上的一级区块（和「办公室」那张同级），
            它们外面没有 Section。用 h3 会让文档大纲从 h1 跳到 h3，
@@ -871,10 +875,11 @@ export function SessionsPanel({
         right={<Badge tone="neutral">{sessions.length} 条</Badge>}
       />
       {error ? <PanelError text={error} /> : null}
-      {/* 只铺十条：这一栏（本月之星 + 明细）是三列里最高的一列，十几条会把整页
-          拉得比工位墙那列长出一大截。十条是让三列底边大致齐平的那个数 ——
-          要再短/再长，改这一个数字即可（取回的还是 16 条，右上角徽标按取回的算） */}
-      <ul className={cls('space-y-1.5', error && 'mt-3.5')}>
+      {/* 铺 10 条（取回 20 条，徽标按取回的算）。这一栏是三列里最高的一列，
+          条数与行高（一条 ~61px）算下来会正好落在三列的公共高度附近；剩下的
+          零头由下面那个 justify-between 摊到行距里 —— **卡底不留白**，行距
+          均不均匀看余量，余量大了就是"这份清单比较松"，而不是"卡里缺一块" */}
+      <ul className={cls('flex flex-auto flex-col justify-between gap-1.5', error && 'mt-3.5')}>
         {sessions.slice(0, 10).map((s) => (
           <li key={s.id}>
             <button
