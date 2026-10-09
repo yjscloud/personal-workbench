@@ -836,11 +836,16 @@ function GrowthPanel() {
           曲线本身做成弹性的（flex-1 + 100% 高）：两张卡由栅格拉成等高，
           谁的自然高度高就由谁定行高，另一个的图长高补上，底下不会留白 */}
       <div className="flex flex-1 flex-col gap-4">
-        <div className="flex min-h-[190px] flex-1">
+        {/* 图放在 absolute 层：ResponsiveContainer 会把 svg 撑成"实测到的父容器像素高"，
+            若让 svg 参与父级的弹性内容高度，grid 行高就跟着 svg 涨，下一轮实测更大 ——
+            页面开得越久图越高且永不回落（每 30/60 秒数据轮询都会再量一次）。
+            absolute 定位不参与内容高度计算，这条反馈链在这里断掉。 */}
+        <div className="relative min-h-[190px] flex-1">
           {data.length < 4 ? (
             <Empty title="样本还不够" hint="切换到「1 周」或「1 月」可以拿到更长的历史曲线。" />
           ) : (
-            <ResponsiveContainer width="100%" height="100%">
+            <div className="absolute inset-0">
+              <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={data} margin={{ top: 6, right: 6, left: -14, bottom: 0 }}>
                 <defs>
                   {/* 容量属于存储域：和根分区环形、IO 曲线同色 */}
@@ -856,6 +861,7 @@ function GrowthPanel() {
                 <Area type="monotone" dataKey="rootGb" name="已用容量" stroke={colors.store} strokeWidth={1.8} fill="url(#gradRoot)" />
               </AreaChart>
             </ResponsiveContainer>
+            </div>
           )}
         </div>
 
@@ -1001,18 +1007,24 @@ function TokenPanel() {
           上一版内容比旁边的容量卡短一截，卡片底部空着一块 */}
       <div className="mt-5 flex min-h-[186px] flex-1 flex-col">
         <p className="mb-1.5 text-2xs text-faint">近 14 天用量</p>
-        {/* min-h-0：弹性的 grid/柱状图容器里，子项默认 min-height:auto 会撑着不缩，
-            高度算不准 */}
-        <div className="min-h-0 flex-1">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={series} margin={{ top: 4, right: 4, left: -18, bottom: 0 }}>
+        {/* min-h-0 + absolute 层，理由见上面容量卡的说明：
+            ResponsiveContainer 的 svg 高度不能参与父级内容高度的计算，
+            否则"实测→撑大→再实测"循环下去，页面开得越久柱状图越高 */}
+        <div className="relative min-h-0 flex-1">
+          <div className="absolute inset-0">
+            <ResponsiveContainer width="100%" height="100%">
+            {/* left 不能用负值：别的图刻度就两三个字符（"890G"），负边距把图往
+                卡片边收一点无妨；这张的刻度是"75.0 万"这种带"万"的长标签，
+                可见宽度不足时首位数字会被 SVG 视口裁掉，"75.0 万"看着就成了"5.0 万" */}
+            <BarChart data={series} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
               <CartesianGrid stroke={colors.line} strokeDasharray={GRID_DASH} strokeOpacity={0.55} vertical={false} />
               <XAxis dataKey="label" tick={{ fill: colors.faint, fontSize: 10 }} axisLine={false} tickLine={false} minTickGap={12} />
               <YAxis
                 tick={{ fill: colors.faint, fontSize: 10 }}
                 axisLine={false}
                 tickLine={false}
-                width={54}
+                /* 50px：装得下六位数时代的"75.0 万 / 1234 万"，不裁字 */
+                width={50}
                 tickFormatter={(v: number) => fmtTokens(v)}
               />
               <Tooltip
@@ -1024,6 +1036,7 @@ function TokenPanel() {
               <Bar dataKey="tokens" name="用量" fill={colors.bar} radius={[3, 3, 0, 0]} maxBarSize={22} />
             </BarChart>
           </ResponsiveContainer>
+          </div>
         </div>
       </div>
 
