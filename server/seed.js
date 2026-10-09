@@ -341,5 +341,9 @@ export function defaultData() {
        形状与 emptyUsage() 一致 —— 那个模块 import 了 store，seed 再去 import
        它会绕成一个环，所以这里的字面量是刻意重复的一份。 */
     aiUsage: { total: { prompt: 0, completion: 0, calls: 0 }, days: {}, sources: {} },
+
+    /* DeepSeek 余额的按天快照（见 services/deepseek.js）。
+       同样是空壳：谁第一次读到余额，谁往 days 里写第一笔。 */
+    petBalance: { days: {} },
   };
 }

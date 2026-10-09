@@ -32,6 +32,7 @@ import { importFromUrl } from './services/importer.js';
 import { askAboutArticle } from './services/knowledge-ai.js';
 import { askAboutNews, cachedBody, unreadableHosts } from './services/reader.js';
 import { usageSnapshot } from './services/ai-usage.js';
+import { balanceReport, deepseekConfigured } from './services/deepseek.js';
 import { probeSiteColor } from './services/sitecolor.js';
 import { fetchSiteIcon } from './services/siteicon.js';
 import { suggestSource, fetchSuggest } from './services/suggest.js';
@@ -272,6 +273,9 @@ router.get(
       haConfigured: isHaConfigured(db().settings),
       hermesConfigured: isHermesConfigured(),
       hermesCredentials: hasHermesCredentials(),
+      /* 桌宠头顶那颗余额标有没有数据源。放在这里是为了让"Key 到底读到没有"
+         有一个不用看日志就能问的地方 —— 自查时最先怀疑的总是它 */
+      deepseekConfigured: deepseekConfigured(),
       sampler: samplerStatus(),
       assistantEngine: process.env.AI_API_KEY ? 'llm' : 'rule',
     });
@@ -292,6 +296,20 @@ router.get('/version', (_req, res) => ok(res, { version: frontendVersion() }));
 router.get(
   '/ai/usage',
   wrap(async (_req, res) => ok(res, { ...usageSnapshot(db()), gateway: await officeUsageBrief() })),
+);
+
+/* ── 桌宠要看的 DeepSeek 余额 ──────────────────────────────────────── */
+
+/**
+ * 余额报告。API Key 只从环境变量读，浏览器侧拿不到它。
+ *
+ * 这是一条**会出门**的接口（读 DeepSeek 官方接口），但服务端有 60 秒
+ * 内存缓存，所以桌宠按时轮询也打不穿上游；没配 Key 时不发任何请求，
+ * 直接回 configured:false，由前端决定要不要提示去 .env 里补。
+ */
+router.get(
+  '/pet/balance',
+  wrap(async (_req, res) => ok(res, await balanceReport())),
 );
 
 /* ── 登录 ─────────────────────────────────────────────────────────── */

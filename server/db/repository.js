@@ -330,6 +330,14 @@ const SINGLETONS = [
     rows: (d) => [{ id: 1, payload: toJson(d.aiUsage ?? null), updated_at: toDate(d.aiUsage?.updatedAt) }],
   },
   {
+    /* DeepSeek 余额的按天快照。updatedAt 由 deepseek.js 每次记一笔时刷新 ——
+       指纹里带上它，余额变了才会触发写入 */
+    name: 'pet_balance',
+    table: 'pet_balance',
+    columns: ['id', 'payload', 'updated_at'],
+    rows: (d) => [{ id: 1, payload: toJson(d.petBalance ?? null), updated_at: toDate(d.petBalance?.updatedAt) }],
+  },
+  {
     name: 'energy_state',
     table: 'energy_state',
     columns: ['id', 'last_ts', 'last_watts', 'total_kwh', 'total_cost', 'eco_saved_kwh'],
@@ -618,6 +626,12 @@ export async function loadAll(base) {
   const [[aiUsageRow]] = await pool.query('SELECT `payload` FROM `ai_usage` WHERE `id` = 1');
   const aiUsage = parseJson(aiUsageRow?.payload, null);
   if (aiUsage && typeof aiUsage === 'object') data.aiUsage = aiUsage;
+
+  /* DeepSeek 余额快照。与 token 用量同理：它是历史记录，
+     解不出来就保持种子里的空壳，不能把攒下来的趋势清零。 */
+  const [[petBalanceRow]] = await pool.query('SELECT `payload` FROM `pet_balance` WHERE `id` = 1');
+  const petBalance = parseJson(petBalanceRow?.payload, null);
+  if (petBalance && typeof petBalance === 'object') data.petBalance = petBalance;
 
   data.energy = await loadEnergy(data.energy);
   return data;

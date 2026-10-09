@@ -207,6 +207,18 @@ CREATE TABLE IF NOT EXISTS `ai_usage` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='大模型 token 用量（单行）';
 
+/* 桌宠盯着的 DeepSeek 余额快照。
+   余额接口只回答"此刻还剩多少"，说不清"今天花掉多少" —— 那是存量，
+   能拿来判断该不该收着点的是消耗。所以按天记下读数，用相邻两天的差值
+   反推当日消耗（与 meter_daily 用累计值推导当日电量是同一个思路）。
+   单行 + JSON：它就是一份按天的读数表，不值得为它展开成一张明细表。 */
+CREATE TABLE IF NOT EXISTS `pet_balance` (
+  `id`         TINYINT     NOT NULL DEFAULT 1 COMMENT '固定为 1',
+  `payload`    JSON        NULL COMMENT 'DeepSeek 余额的按天快照（首末读数）',
+  `updated_at` DATETIME(3) NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='DeepSeek 余额快照（单行）';
+
 CREATE TABLE IF NOT EXISTS `energy_state` (
   `id`            TINYINT NOT NULL DEFAULT 1 COMMENT '固定为 1',
   `last_ts`       BIGINT  NULL COMMENT '上次采样时间戳（毫秒）',
