@@ -1100,6 +1100,47 @@ export type AiGatewayUsage = {
   error?: string;
 };
 
+/**
+ * DeepSeek 余额账户（接口按币种可能给多个：人民币 + 美元）。
+ * 三个金额在接口侧是**字符串**，服务端已经转成数字。
+ */
+export type PetBalanceAccount = { currency: string; total: number; granted: number; toppedUp: number };
+
+/**
+ * DeepSeek 余额报告。
+ *
+ * 由服务端代取 —— API Key 只从 .env 读，浏览器侧拿不到它，这也是这件事
+ * 必须走后端的原因。
+ *
+ * 字段恒定齐全：没配 Key、读失败时那一组就是 null / 空数组，所以前端
+ * 只在 configured 上分一次叉，不必猜"这次有没有这个字段"。
+ */
+export type PetBalance = {
+  /** 服务端 .env 里有没有 DEEPSEEK_API_KEY */
+  configured: boolean;
+  /** 这次读到的是不是新鲜数据。false 时 error 一定有值 */
+  ok: boolean;
+  error: string | null;
+  /** 这份数据是什么时候取的 */
+  at: string;
+  isAvailable: boolean | null;
+  currency: string | null;
+  /** 总可用余额（含赠金） */
+  total: number | null;
+  granted: number | null;
+  toppedUp: number | null;
+  accounts: PetBalanceAccount[];
+  /** 今天的读数。首次读到余额之前是 null */
+  today: { currency: string; first: number; last: number; at: string } | null;
+  /**
+   * 今日消耗：上一个有读数的那天的收盘值 − 今天最新值。
+   * null = 还没有可比的一天（刚装上），此时不该显示一个 0 冒充结论。
+   */
+  spend: { amount: number; baselineDay: string; toppedUp: boolean } | null;
+  /** 最近 14 天的读数（同币种、升序）。不足一屏时只有几天，前端按实际画 */
+  history: { day: string; total: number }[];
+};
+
 /** AI 读的一条对话。**不落库** —— 热点条目会轮换，留着反而是垃圾数据 */
 export type NewsReadTurn = { role: 'user' | 'ai'; text: string; task: string | null };
 
@@ -1517,6 +1558,13 @@ export const api = {
   ai: {
     /** 全站 token 用量。顶栏那个统计用 —— 服务端只读内存，很便宜 */
     usage: () => req<AiUsage>('/ai/usage'),
+  },
+
+  /* 桌宠：目前只有一件事要问后端 —— DeepSeek 还剩多少钱。
+     养成数值与偏好全在浏览器本地，不进这套接口。 */
+  pet: {
+    /** 服务端有 60 秒内存缓存，所以按时轮询也打不穿上游 */
+    balance: () => req<PetBalance>('/pet/balance'),
   },
 
   settings: {

@@ -25,6 +25,7 @@ import { cls } from '@/lib/format';
 import { Button, Led, LiveDot, Skeleton, Spinner } from './ui';
 import { SlideHighlight, useSlideBox } from './SlideHighlight';
 import { Assistant } from './Assistant';
+import { Pet } from './Pet';
 
 /* ── 导航定义 ─────────────────────────────────────────────────────── */
 
@@ -287,6 +288,10 @@ export function AppShell() {
       <MobileNav />
       <Toasts />
       <UpdateNotice show={staleVersion} />
+      {/* 桌宠挂在**助手之前**：助手那层是固定的全屏遮罩（z-40），
+          必须压在它上面 —— 否则打开助手时，右下角那只还在遮罩之上飘着，
+          点它还会摸头。同 z 的固定元素里，DOM 靠后的赢。 */}
+      <Pet />
       <Assistant open={assistantOpen} onClose={() => setAssistantOpen(false)} />
     </div>
   );

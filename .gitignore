@@ -15,3 +15,7 @@ server/data/background/
 
 # 浏览器自动化留下的无障碍树快照，里面是真实工单内容
 trash.yaml
+
+# 立绘的生成源料：候选图、每档原图、核对用的拼图。39MB 级，且都能按提示词重出，
+# 所以不入库。要重画立绘时用的角色描述见 src/components/PetWhale.tsx 顶部
+.pet-src/
