@@ -98,6 +98,17 @@ systemctl daemon-reload
 systemctl enable --now personal-workbench
 ```
 
+改完代码要上线，一条命令走完类型检查 → 构建 → 重启 → 探活：
+
+```bash
+scripts/build-restart.sh
+```
+
+容易漏的是**最后一步**：`dist/` 是服务直接从磁盘读的，所以 `npm run build` 一跑完界面就已经是新的了，
+而后端的新路由要等重启才生效 —— 漏了的表现是"页面上是新按钮，点下去 404"，看起来像前端坏了。
+脚本把这一串绑成一步，并且构建失败就不重启（线上仍是完整的旧版本）。`--no-build` 只重启，
+`--help` 看全部选项。
+
 > **放在 nginx 后面时**：若用 AI 助手的流式问答，`proxy_read_timeout` 必须大于 `AI_TIMEOUT_MS`，
 > 否则连接会先被反代掐断，前端只能收到 504。另外 `index.html` 不要设长缓存
 > （`/assets/` 下的文件带哈希，长缓存是安全的）。
