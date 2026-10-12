@@ -4,6 +4,7 @@ import {
   type Bookmark,
   type Group,
   type KnowledgeItem,
+  type MarkdownImportDoc,
   type Priority,
   type Project,
   type Settings,
@@ -98,6 +99,11 @@ type StoreValue = {
     /** 成功时返回落库后的条目（编辑器要拿它的 id 跳转到阅读页） */
     add: (body: Partial<KnowledgeItem> & { title: string }) => Promise<KnowledgeItem | null>;
     patch: (id: string, patch: Partial<KnowledgeItem>) => Promise<void>;
+    /**
+     * 直接导入一批 Markdown 文档（本地文件读出来的正文）。
+     * 成功返回新建的条目，失败返回 null —— 提示只发一条，不逐篇报。
+     */
+    importDocs: (docs: MarkdownImportDoc[]) => Promise<KnowledgeItem[] | null>;
     /** 标签批量改名 / 合并 / 删除。改名到已存在的名字 = 合并 */
     retag: (body: { renames?: { from: string; to: string }[]; removes?: string[] }) => Promise<boolean>;
     /** 移入回收站（软删除，可恢复） */
@@ -582,6 +588,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           return item;
         } catch (err) {
           notify(err instanceof Error ? err.message : '保存失败', 'crit');
+          return null;
+        }
+      },
+      /* 一次导入多篇。**服务端已经写完库了**，所以这里只把结果插到列表最前，
+         不做乐观更新 —— 导入不像置顶/星标那样要"立刻有反应"，它本来就是
+         一次要等一会儿的批量动作，先画上再回滚反而会闪 */
+      async importDocs(docs: MarkdownImportDoc[]) {
+        try {
+          const { list, skipped } = await api.knowledge.importMarkdown(docs);
+          setKnowledge((prev) => [...list, ...prev]);
+          notify(
+            skipped
+              ? `已导入 ${list.length} 篇，另有 ${skipped} 篇没有标题被跳过`
+              : `已导入 ${list.length} 篇文档`,
+          );
+          return list;
+        } catch (err) {
+          notify(err instanceof Error ? err.message : '导入失败', 'crit');
           return null;
         }
       },

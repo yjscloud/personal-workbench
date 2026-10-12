@@ -120,6 +120,24 @@ export type ImportedArticle = {
   warnings: string[];
 };
 
+/**
+ * 直接导入本地 Markdown 文档时的载荷。
+ *
+ * **正文由浏览器读好、随请求带上来**：文件本来就在用户机器上，让服务端再收一次
+ * 上传纯属多此一举（而导入的结果也要写进同一个库，读的人和写的人是同一个）。
+ * 于是这条路上没有 multipart，也没有临时文件 —— 与「导入网址」正相反：
+ * 那边必须服务端去抓，因为浏览器够不到。
+ */
+export type MarkdownImportDoc = {
+  /** 来源文件名。服务端不拿它入库，只让预览能说明"这篇是哪个文件" */
+  name?: string;
+  title: string;
+  type?: KnowledgeItem['type'];
+  tags?: string[];
+  summary?: string;
+  body: string;
+};
+
 /** 文章助手对话里的一轮。task 只有预设动作（总结/分析/解释）才有值 */
 export type KnowledgeAiTurn = { role: 'user' | 'ai'; text: string; task: string | null; at: string | null };
 
@@ -1489,6 +1507,15 @@ export const api = {
       req<{ list: KnowledgeItem[]; changed: number }>('/knowledge/tags', send('POST', body)),
     /** 抓一个外链文章转成 Markdown。只返回结果、不写库 —— 由编辑器预览后再保存 */
     importUrl: (url: string) => req<ImportedArticle>('/knowledge/import', send('POST', { url })),
+    /**
+     * 直接导入一批 Markdown 文档（本地文件）。
+     *
+     * 与 importUrl 的差别不只是"本地文件 / 外链"，还有**写不写库**：那边的正文是
+     * 猜出来的，必须先过编辑器；这边是文档原文，没有猜的成分，所以一次请求直接入库。
+     * 返回新建的条目（元信息形态）与被跳过的条数。
+     */
+    importMarkdown: (docs: MarkdownImportDoc[]) =>
+      req<{ list: KnowledgeItem[]; skipped: number }>('/knowledge/import-markdown', send('POST', { docs })),
     /**
      * 文章助手（SSE）。正文由**前端传出去**，不从库里读 ——
      * 编辑器里刚写、还没保存的那段也应该能拿来问。

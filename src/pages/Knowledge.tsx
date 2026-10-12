@@ -20,6 +20,7 @@ import {
   Code,
   Copy,
   Download,
+  FileText,
   Globe,
   Heading1,
   Heading2,
@@ -44,11 +45,13 @@ import {
   Terminal,
   Trash2,
   Undo2,
+  Upload,
   Wrench,
   X,
 } from 'lucide-react';
 import { useStore } from '@/lib/store';
-import { api, type ImportedArticle, type KnowledgeItem } from '@/lib/api';
+import { api, type ImportedArticle, type KnowledgeItem, type MarkdownImportDoc } from '@/lib/api';
+import { MARKDOWN_ACCEPT, readDrafts, toPayload, type DraftDoc } from '@/lib/markdown-import';
 import { cls, fmtDateTime, fmtRelative } from '@/lib/format';
 import { armBeforeUnload, armLeaveGuard } from '@/lib/nav-guard';
 import { copyText } from '@/lib/clipboard';
@@ -81,6 +84,20 @@ const TYPE_META: Record<
 /** 列表页与编辑器都用满宽度：前者要信息密度，后者要写得开。
  *  阅读页相反，见下面的 READER_MAX。 */
 const PAGE_MAX = 'max-w-[1720px]';
+
+/**
+ * 导入弹窗上的类型选择：整批**共用**一个类型。
+ *
+ * 为什么不逐篇选：一批文件的类型几乎总是一样的（"把这些运维笔记导进来"），
+ * 逐篇给一个下拉只会让预览变长、让"导入"这个动作多出十几个决定。
+ * 顺序与列表页的筛选一致；默认「摘录」—— 从文件导进来的多半是别处读来的素材，
+ * 而不是自己排出来、要照着动手的流程。
+ */
+const DOC_TYPES: { value: KnowledgeItem['type']; label: string }[] = [
+  { value: 'sop', label: TYPE_META.sop.label },
+  { value: 'runbook', label: TYPE_META.runbook.label },
+  { value: 'excerpt', label: TYPE_META.excerpt.label },
+];
 
 /* ── 置顶 / 星标 ────────────────────────────────────────────────────── */
 
@@ -204,6 +221,17 @@ export default function Knowledge() {
       setImporting(false);
     }
   }
+
+  /* ── 导入 Markdown 文档 ──────────────────────────────────────────────
+     和上面那条路的最大差别是**写不写库**：网址导入只抓草稿（正文是猜出来的，
+     必须过一眼编辑器），这里是文件原文，选文件时就能在预览里核对标题和标签，
+     所以直接入库。
+
+     预览的知识全在弹窗组件里，页面只管"开不开"和"导完把结果收进列表"。 */
+  const [docsOpen, setDocsOpen] = useState(false);
+  /* 已有的标题（归一化）。只用来提示"这条库里已经有了" —— 不拦、不自动去掉，
+     因为重名有时就是想要的（同一篇的另一版），拦下来反而要人去绕着走 */
+  const knownTitles = useMemo(() => new Set(knowledge.map((k) => normalizeTitle(k.title))), [knowledge]);
 
   const tags = useMemo(() => {
     const map = new Map<string, number>();
@@ -345,6 +373,10 @@ export default function Knowledge() {
               <Network size={13} />
               图谱
             </Button>
+            <Button size="sm" variant="soft" onClick={() => setDocsOpen(true)}>
+              <Upload size={13} />
+              导入文档
+            </Button>
             <Button size="sm" variant="soft" onClick={() => setImportOpen(true)}>
               <Globe size={13} />
               导入网址
@@ -464,10 +496,20 @@ export default function Knowledge() {
             }
             action={
               bin ? undefined : (
-                <Button size="sm" variant="primary" onClick={() => navigate('/knowledge/new')}>
-                  <Plus size={13} />
-                  新建条目
-                </Button>
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  <Button size="sm" variant="primary" onClick={() => navigate('/knowledge/new')}>
+                    <Plus size={13} />
+                    新建条目
+                  </Button>
+                  {/* 空库才给"导入文档"：库里已经有东西时，"没有匹配的条目"只是
+                      筛选的结果 —— 那时该做的是清筛选，而不是再导一批进来 */}
+                  {knowledge.length ? null : (
+                    <Button size="sm" variant="soft" onClick={() => setDocsOpen(true)}>
+                      <Upload size={13} />
+                      导入文档
+                    </Button>
+                  )}
+                </div>
               )
             }
           />
@@ -499,6 +541,19 @@ export default function Knowledge() {
           ))}
         </div>
       )}
+
+      <DocsImportModal
+        open={docsOpen}
+        onClose={() => setDocsOpen(false)}
+        knownTitles={knownTitles}
+        onImport={async (docs) => {
+          const created = await knowledgeApi.importDocs(docs);
+          /* 只在**全部失败**时留在弹窗里：那时留下的东西还有意义（重新点一次）。
+             只要进去了几篇就收摊 —— 这里没有逐条重试的机制，把成功的和失败的
+             混在一张表里，用户根本不知道该拿剩下那几行怎么办 */
+          return created ? created.length : null;
+        }}
+      />
 
       <Modal
         open={importOpen}
@@ -576,6 +631,193 @@ export default function Knowledge() {
         onApply={(renames, removes) => knowledgeApi.retag({ renames, removes })}
       />
     </div>
+  );
+}
+
+/* ── 导入 Markdown 文档 ────────────────────────────────────────────────
+   两步：选文件（点选或拖进来）→ 在预览里核对标题 / 标签 → 一次入库。
+
+   为什么不复用「导入网址」那条"抓草稿 → 编辑器 → 保存"的路：那条路存在的唯一
+   理由是**正文是机器猜出来的**，所以要人核对一眼。这里读的是文件原文，正文没有
+   什么可核对的；真正可能不对的是标题和标签（来自 front matter / 一级标题 /
+   文件名），于是它们直接摆在预览里可以就地改 —— 再让人去编辑器里走一遍，
+   等于让他把同一件事做两遍，而第二遍只是多了几个更容易被忽略的字段。
+
+   解析全部在浏览器里（lib/markdown-import.ts）：文件本来就在这台机器上，
+   选完文件立刻就有预览，不必等一趟网络。 */
+function DocsImportModal({
+  open,
+  onClose,
+  onImport,
+  knownTitles,
+}: {
+  open: boolean;
+  onClose: () => void;
+  /** 返回落库的篇数；null = 一篇都没进去（失败提示由 store 发过了） */
+  onImport: (docs: MarkdownImportDoc[]) => Promise<number | null>;
+  /** 库里已有标题（归一化后），用来在预览里提示重名 */
+  knownTitles: Set<string>;
+}) {
+  const [docs, setDocs] = useState<DraftDoc[]>([]);
+  const [type, setType] = useState<KnowledgeItem['type']>('excerpt');
+  /* 上一批没能带上的文件。**必须说清是哪个文件、为什么** ——
+     拖十个进来只带了七个而一字不提的话，用户会以为十个都进去了 */
+  const [note, setNote] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  /* 关窗就清空。留在那儿的话，下次打开会看到上一批文件 —— 而它们已经导进去了，
+     用户很容易再点一次"导入"，于是库里多出一整套重复的条目 */
+  function close() {
+    setDocs([]);
+    setNote(null);
+    setType('excerpt');
+    setDragging(false);
+    onClose();
+  }
+
+  async function addFiles(files: FileList | null) {
+    const list = Array.from(files || []);
+    if (!list.length) return;
+    const { drafts, skipped } = await readDrafts(list);
+    /* 追加而不是替换（拖两次是常态）。按文件名去重：再拖一次同一个文件几乎
+       总是手滑，而不是"我确实想导两份" */
+    setDocs((prev) => {
+      const seen = new Set(prev.map((d) => d.name));
+      return [...prev, ...drafts.filter((d) => !seen.has(d.name))];
+    });
+    setNote(skipped.length ? skipped.join('；') : null);
+  }
+
+  const patch = (index: number, next: Partial<DraftDoc>) =>
+    setDocs((prev) => prev.map((doc, i) => (i === index ? { ...doc, ...next } : doc)));
+
+  async function submit() {
+    if (!docs.length || busy) return;
+    setBusy(true);
+    const created = await onImport(toPayload(docs, type));
+    setBusy(false);
+    if (created !== null) close();
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={close}
+      title="导入 Markdown 文档"
+      width="max-w-2xl"
+      footer={
+        <>
+          <Button variant="ghost" onClick={close}>
+            取消
+          </Button>
+          <Button variant="primary" disabled={!docs.length || busy} onClick={() => void submit()}>
+            {busy ? '导入中…' : docs.length ? `导入 ${docs.length} 篇` : '导入'}
+          </Button>
+        </>
+      }
+    >
+      <div
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragging(false);
+          void addFiles(e.dataTransfer.files);
+        }}
+        className={cls(
+          'rounded-card border border-dashed px-4 py-6 text-center transition-colors',
+          dragging ? 'border-accent bg-accent-soft' : 'border-line',
+        )}
+      >
+        <input
+          ref={fileRef}
+          type="file"
+          accept={MARKDOWN_ACCEPT}
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            void addFiles(e.target.files);
+            /* 清空 value：选过同一个文件之后，再选它就不会触发 change 了 */
+            e.target.value = '';
+          }}
+        />
+        <p className="text-xs text-muted">把 .md / .markdown / .txt 拖到这里</p>
+        <Button size="sm" variant="soft" className="mt-2.5" onClick={() => fileRef.current?.click()}>
+          <Upload size={13} />
+          选择文件
+        </Button>
+        <p className="mx-auto mt-2.5 max-w-md text-2xs leading-relaxed text-faint">
+          正文原样导入，不做改写。标题取 front matter 的 title、其次正文第一个一级标题、最后是文件名；
+          标签取 front matter 的 tags。读不出这些时会说明，改完直接入库 —— 和「导入网址」不同，这条路不进编辑器。
+        </p>
+      </div>
+
+      {note ? <p className="text-2xs leading-relaxed text-crit">没带上：{note}</p> : null}
+
+      {docs.length ? (
+        <>
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-line pt-3.5">
+            <span className="text-xs text-muted">
+              <span className="num">{docs.length}</span> 篇将存为
+            </span>
+            <Segmented size="sm" value={type} onChange={setType} options={DOC_TYPES} />
+          </div>
+
+          {/* 单独滚：文件名和标题都要能改，让列表自己滚，弹窗就不再长高 */}
+          <ul className="max-h-[46vh] space-y-2 overflow-y-auto pr-1">
+            {docs.map((doc, i) => {
+              const warns = [...doc.warnings];
+              if (doc.title.trim() && knownTitles.has(normalizeTitle(doc.title))) {
+                warns.push('知识库里有同名条目，导入后会并存两条');
+              }
+              return (
+                <li key={doc.name} className="rounded-card border border-line bg-bg-2/60 p-2.5">
+                  <div className="flex items-center gap-2">
+                    <FileText size={12} className="shrink-0 text-faint" aria-hidden />
+                    <span className="truncate text-2xs text-muted">{doc.name}</span>
+                    <span className="num ml-auto shrink-0 text-2xs text-faint">{doc.body.length} 字</span>
+                    <button
+                      type="button"
+                      aria-label={`不导入 ${doc.name}`}
+                      title="这次不导入这一个"
+                      onClick={() => setDocs((prev) => prev.filter((_, j) => j !== i))}
+                      className="shrink-0 rounded-field p-0.5 text-faint transition-colors hover:text-crit"
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                    <Input
+                      value={doc.title}
+                      onChange={(e) => patch(i, { title: e.target.value })}
+                      aria-label={`${doc.name} 的标题`}
+                      className="h-8 text-xs"
+                    />
+                    <Input
+                      value={doc.tags}
+                      onChange={(e) => patch(i, { tags: e.target.value })}
+                      aria-label={`${doc.name} 的标签`}
+                      placeholder="标签，逗号分隔"
+                      className="h-8 text-xs"
+                    />
+                  </div>
+                  {warns.map((w) => (
+                    <p key={w} className="mt-1.5 text-2xs leading-relaxed text-warn">
+                      {w}
+                    </p>
+                  ))}
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      ) : null}
+    </Modal>
   );
 }
 

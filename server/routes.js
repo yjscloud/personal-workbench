@@ -1631,29 +1631,83 @@ router.post(
   }),
 );
 
+/**
+ * 造一条新条目。**没有标题就返回 null**，由调用方决定怎么报错。
+ *
+ * POST /knowledge 与「导入 Markdown 文档」都走这里，因为"标题截断到几个字、
+ * 标签最多几个、正文化的纯文本从哪来"这些口径只能有一份实现 ——
+ * 两处各写一遍，漏掉一处的表现是"编辑器里存的搜得到，导入的搜不到"，
+ * 而这种不一致在界面上完全看不出来。
+ */
+function newKnowledge(input) {
+  const { type = 'sop', title, tags = [], summary = '', body = '', steps = [], pinned = false, starred = false } = input || {};
+  const clean = String(title ?? '').trim();
+  if (!clean) return null;
+  /* steps 是旧字段，只在没给 body 时用来兜底 —— 旧客户端和旧备份都还可能带它。
+     body_plain 统一由 withKnowledgeBody 派生，不在这里手搓。 */
+  return withKnowledgeBody({
+    id: uid('kb'),
+    type: normalizeType(type),
+    title: clean.slice(0, 160),
+    tags: Array.isArray(tags) ? tags.map((t) => String(t).slice(0, 24)).slice(0, 8) : [],
+    summary: String(summary ?? '').slice(0, 400),
+    body: String(body ?? '').slice(0, BODY_MAX),
+    steps: Array.isArray(steps) ? steps.map((s) => String(s).slice(0, 800)).slice(0, 40) : [],
+    pinned: Boolean(pinned),
+    starred: Boolean(starred),
+    ai: { turns: [] },
+    updatedAt: new Date().toISOString(),
+  });
+}
+
 router.post(
   '/knowledge',
   wrap(async (req, res) => {
-    const { type = 'sop', title, tags = [], summary = '', body = '', steps = [], pinned = false, starred = false } = req.body || {};
-    if (!title) return fail(res, 400, '标题不能为空');
-    /* steps 是旧字段，只在没给 body 时用来兜底 —— 旧客户端和旧备份都还可能带它。
-       body_plain 统一由 withKnowledgeBody 派生，不在这里手搓。 */
-    const item = withKnowledgeBody({
-      id: uid('kb'),
-      type: normalizeType(type),
-      title: String(title).slice(0, 160),
-      tags: Array.isArray(tags) ? tags.map((t) => String(t).slice(0, 24)).slice(0, 8) : [],
-      summary: String(summary).slice(0, 400),
-      body: String(body ?? '').slice(0, BODY_MAX),
-      steps: Array.isArray(steps) ? steps.map((s) => String(s).slice(0, 800)).slice(0, 40) : [],
-      pinned: Boolean(pinned),
-      starred: Boolean(starred),
-      ai: { turns: [] },
-      updatedAt: new Date().toISOString(),
-    });
+    const item = newKnowledge(req.body);
+    if (!item) return fail(res, 400, '标题不能为空');
     update((d) => d.knowledge.unshift(item));
     /* 回元信息形态：编辑器只要 id 去跳阅读页，正文它自己会按需取 */
     ok(res, publicOne(item));
+  }),
+);
+
+/**
+ * 直接导入一批 Markdown 文档。
+ *
+ * 和上面的「导入网址」是两条路，差别在**要不要过编辑器**：那边只解析不写库，
+ * 因为正文是从 HTML 里猜出来的，猜错是常态；这边拿到的是文档原文（标题、标签
+ * 由前端从 front matter / 一级标题 / 文件名读出来，用户在预览里已经看过），
+ * 没有"猜"的成分，所以一次请求直接入库。逐条再打 N 个 POST 只会把一次导入
+ * 变成 N 次可能的半途而废 —— 目录里出现一半，比一篇都没进去更难收拾。
+ *
+ * 正文是**前端读好带上来的**：文件本来就在用户机器上，没必要让服务端再收一次
+ * 上传（上传到临时目录再删掉，只是把工作搬到另一台机器上做）。也因此这里
+ * 没有 multipart，走的还是普通 JSON —— 上限由 express.json 的 4MB 兜着，
+ * 前端的体积检查（lib/markdown-import.ts）会在更早、更清楚的地方拦住。
+ */
+const IMPORT_DOC_MAX = 50;
+router.post(
+  '/knowledge/import-markdown',
+  wrap(async (req, res) => {
+    const docs = Array.isArray(req.body?.docs) ? req.body.docs : [];
+    if (!docs.length) return fail(res, 400, '没有要导入的文档');
+    if (docs.length > IMPORT_DOC_MAX) return fail(res, 400, `一次最多导入 ${IMPORT_DOC_MAX} 篇`);
+
+    const items = [];
+    let skipped = 0;
+    for (const doc of docs) {
+      /* 前端已经保证标题非空，这里仍要防一手：接口是公开的，
+         而"整批因为一条脏数据失败"是最差的结果 —— 那就跳过它，并如实报数 */
+      const item = newKnowledge(doc);
+      if (!item) skipped += 1;
+      else items.push(item);
+    }
+    if (!items.length) return fail(res, 400, '这些文档都没有标题，没法入库');
+
+    /* 一次性写回：unshift(...items) 保持文件顺序，而不是反的。
+       也**不给每篇发一次 update** —— 那是 N 次落库，中途断一次就是半批数据 */
+    update((d) => d.knowledge.unshift(...items));
+    ok(res, { list: publicKnowledge(items), skipped });
   }),
 );
 
