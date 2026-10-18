@@ -219,6 +219,18 @@ CREATE TABLE IF NOT EXISTS `pet_balance` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='DeepSeek 余额快照（单行）';
 
+/* 监控页那张 GitHub star 卡片的数据源：每 12 小时采一次，记下当时的
+   star 数与增量，外加一串历史点（12 小时一个）。
+   同样是单行 + JSON：一份随时间往前推的读数，不值得展开成明细表 ——
+   也就不必为它再写一条清理任务，历史点在 JSON 里自己截断（见
+   services/github-stars.js 的 HISTORY_MAX）。 */
+CREATE TABLE IF NOT EXISTS `github_stars` (
+  `id`         TINYINT     NOT NULL DEFAULT 1 COMMENT '固定为 1',
+  `payload`    JSON        NULL COMMENT '仓库 stars 的采样状态、增量与历史点',
+  `updated_at` DATETIME(3) NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='GitHub star 快照（单行）';
+
 CREATE TABLE IF NOT EXISTS `energy_state` (
   `id`            TINYINT NOT NULL DEFAULT 1 COMMENT '固定为 1',
   `last_ts`       BIGINT  NULL COMMENT '上次采样时间戳（毫秒）',

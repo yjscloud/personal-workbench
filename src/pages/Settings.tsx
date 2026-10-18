@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { CheckCircle2, CloudUpload, Database, Download, HardDriveDownload, History, ImageIcon, KeyRound, Leaf, Palette, Plug, Plus, RefreshCcw, Save, Search, Sun, Moon, Trash2, Upload, User, Zap } from 'lucide-react';
+import { CheckCircle2, CloudUpload, Database, Download, HardDriveDownload, History, ImageIcon, KeyRound, Leaf, Palette, Plug, Plus, RefreshCcw, Save, Search, Send, Sun, Moon, Trash2, Upload, User, Zap } from 'lucide-react';
 import {
   api,
   type HaEntityOption,
@@ -64,9 +64,11 @@ export default function Settings() {
   const [importing, setImporting] = useState(false);
   const [bgUploading, setBgUploading] = useState(false);
   const [loginBgUploading, setLoginBgUploading] = useState(false);
-  /* 两处密钥（PVE 令牌 / COS SecretKey）：空 = 不改动。见各自的保存函数 */
+  /* 三处密钥（PVE 令牌 / COS SecretKey / 飞书签名密钥）：空 = 不改动。见各自的保存函数 */
   const [newPveSecret, setNewPveSecret] = useState('');
   const [newSecretKey, setNewSecretKey] = useState('');
+  const [newFeishuSecret, setNewFeishuSecret] = useState('');
+  const [starsTest, setStarsTest] = useState<{ ok: boolean; text: string } | null>(null);
   const [backupBusy, setBackupBusy] = useState<'run' | 'test' | 'list' | 'restore' | null>(null);
   const [backupResult, setBackupResult] = useState<{ ok: boolean; text: string } | null>(null);
   /* 云上那份清单。不自动拉：打开这一页多数时候只是看看状态，
@@ -124,6 +126,8 @@ export default function Settings() {
   const patch = (next: Partial<SettingsShape>) => setDraft((prev) => (prev ? { ...prev, ...next } : prev));
   const patchPower = (next: Partial<SettingsShape['power']>) => setDraft((prev) => (prev ? { ...prev, power: { ...prev.power, ...next } } : prev));
   const patchPve = (next: Partial<SettingsShape['pve']>) => setDraft((prev) => (prev ? { ...prev, pve: { ...prev.pve, ...next } } : prev));
+  const patchStars = (next: Partial<SettingsShape['stars']>) =>
+    setDraft((prev) => (prev ? { ...prev, stars: { ...prev.stars, ...next } } : prev));
   const patchHa = (next: Partial<SettingsShape['ha']>) => setDraft((prev) => (prev ? { ...prev, ha: { ...prev.ha, ...next } } : prev));
   const patchAihot = (next: Partial<SettingsShape['news']['aihot']>) =>
     setDraft((prev) => (prev ? { ...prev, news: { ...prev.news, aihot: { ...prev.news.aihot, ...next } } } : prev));
@@ -227,6 +231,10 @@ export default function Settings() {
   /** 已确认非空，供下面的事件处理函数使用（避免闭包内的类型收窄丢失） */
   const current = draft;
 
+  /* 页面可能比服务端新（服务端还没重启），那一段就还不存在 —— 给个空壳兜底，
+     否则整页在白屏上抛一句很难看的 undefined */
+  const starsCfg = current.stars ?? { repo: '', feishuUrl: '', feishuSecret: '' };
+
   function pickTheme(mode: ThemeMode, accent: AccentName) {
     patch({ theme: { mode, accent } });
     switchTheme(mode, accent);
@@ -282,6 +290,49 @@ export default function Settings() {
     setDraft((prev) =>
       prev ? { ...prev, pve: { ...prev.pve, tokenSecret: next.pve.tokenSecret, hasSecret: next.pve.hasSecret } } : prev,
     );
+  }
+
+  /* ── GitHub star 监控 ───────────────────────────────────────────────
+     仓库和 webhook 地址都明文编辑：地址是一长串随机串，遮起来就没法核对
+     "是不是我想加的那个群"；而清空它正是"停止通知"的开关。
+     签名密钥则单独一个状态，空 = 不改动 —— 和 PVE 令牌同一套理由：
+     草稿里那位是服务端回的掩码，绑到输入框上，保存时就会被当成新密钥。 */
+  const starsDirty = dirtyOf('stars') || Boolean(newFeishuSecret);
+
+  async function saveStars() {
+    setSavingSection('stars');
+    const stars: Partial<SettingsShape['stars']> = { ...starsCfg };
+    /* hasFeishuSecret 是服务端推导的派生态，不该回传 */
+    delete stars.hasFeishuSecret;
+    if (newFeishuSecret) stars.feishuSecret = newFeishuSecret;
+    const next = await saveSection('stars', { stars } as Partial<SettingsShape>);
+    if (!next) return null;
+    setNewFeishuSecret('');
+    /* 同 PVE 那一栏：掩码与 hasFeishuSecret 要跟着服务端走，
+       否则脏检测永远显示「未保存」 */
+    setDraft((prev) =>
+      prev
+        ? { ...prev, stars: { ...prev.stars, feishuSecret: next.stars.feishuSecret, hasFeishuSecret: next.stars.hasFeishuSecret } }
+        : prev,
+    );
+    return next;
+  }
+
+  async function testStarsNotify() {
+    setStarsTest({ ok: true, text: '发送中…' });
+    /* 先保存再测：测的必须是"保存之后真正会用的那份配置"。
+       拿草稿去测，等于验证一个还没生效的地址 —— 通过了也不代表以后能发出去 */
+    const saved = await saveStars();
+    if (!saved) {
+      setStarsTest({ ok: false, text: '保存失败，没有测试' });
+      return;
+    }
+    try {
+      await api.github.testNotify();
+      setStarsTest({ ok: true, text: '测试通知已发出，去飞书群里看一眼' });
+    } catch (err) {
+      setStarsTest({ ok: false, text: err instanceof Error ? err.message : '发送失败' });
+    }
   }
 
   /* ── 知识库备份 ─────────────────────────────────────────────────────
@@ -522,7 +573,11 @@ export default function Settings() {
     setTesting(true);
     setTestResult(null);
     try {
-      const res = await api.pve.testConfig(current.pve);
+      /* 密钥单独传：草稿里那一位是服务端回的掩码，把它发上去会被当成密钥
+         （拼进 HTTP 头直接非法）。空串 = "没改过"，服务端会沿用库里存的那把；
+         真正想测新粘贴的密钥时，newPveSecret 才有值 —— 这本来就是这个按钮
+         该测的东西。 */
+      const res = await api.pve.testConfig({ ...current.pve, tokenSecret: newPveSecret });
       setTestResult(`连接成功，发现 ${res.count} 个节点：${res.nodes.map((n) => n.node).join('、')}`);
     } catch (err) {
       setTestResult(`连接失败：${err instanceof Error ? err.message : '未知错误'}`);
@@ -1042,6 +1097,77 @@ export default function Settings() {
             <span className="text-2xs text-faint">测试用的是当前填写的值，不必先保存</span>
           )}
           <SaveAction className="ml-auto" dirty={pveDirty} busy={savingSection === 'pve'} onSave={() => void savePve()} />
+        </div>
+      </Card>
+
+      {/* GitHub Star 监控 */}
+      <Card>
+        <CardHead
+          level={2}
+          title="GitHub Star 监控"
+          hint="监控页那张卡片的数据源：每 12 小时采一次 star 数，有新增时发一条飞书通知"
+          right={
+            starsCfg.feishuUrl ? (
+              <Badge tone="ok" dot>
+                已配通知
+              </Badge>
+            ) : (
+              <Badge tone="warn" dot>
+                仅记数
+              </Badge>
+            )
+          }
+        />
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="要监控的仓库" hint="owner/repo，也可以直接粘 GitHub 地址">
+            <Input value={starsCfg.repo} onChange={(e) => patchStars({ repo: e.target.value })} placeholder="yjscloud/ProxCenter" />
+          </Field>
+          <Field label="飞书 Webhook 地址" hint={starsCfg.feishuUrl ? '清空并保存即停止通知' : '留空则只记数、不发通知'}>
+            <Input
+              value={starsCfg.feishuUrl}
+              onChange={(e) => patchStars({ feishuUrl: e.target.value })}
+              placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </Field>
+        </div>
+
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <Field
+            label="签名密钥（可选）"
+            hint={starsCfg.hasFeishuSecret ? '已保存，留空表示不修改' : '机器人开了「签名校验」时才需要'}
+          >
+            <Input
+              type="password"
+              value={newFeishuSecret}
+              onChange={(e) => setNewFeishuSecret(e.target.value)}
+              placeholder={starsCfg.hasFeishuSecret ? '••••••••' : '留空即可'}
+              autoComplete="off"
+            />
+          </Field>
+          <div className="flex items-end pb-1.5">
+            <p className="text-2xs leading-relaxed text-faint">
+              通知内容形如「ProxCenter 新增 3 个 star（当前 128）」。发不出去也不会丢 —— 攒着下次一起发。
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 border-t border-line pt-3.5">
+          <Button size="sm" variant="soft" onClick={() => void testStarsNotify()} disabled={savingSection === 'stars'}>
+            <Send size={13} aria-hidden />
+            保存并测试通知
+          </Button>
+          {starsTest ? (
+            <span className={cls('flex items-center gap-1.5 text-2xs', starsTest.ok ? 'text-ok' : 'text-crit')}>
+              <Led tone={starsTest.ok ? 'ok' : 'crit'} />
+              {starsTest.text}
+            </span>
+          ) : (
+            <span className="text-2xs text-faint">换仓库保存后会立刻采一次，之后每 12 小时一次</span>
+          )}
+          <SaveAction className="ml-auto" dirty={starsDirty} busy={savingSection === 'stars'} onSave={() => void saveStars()} />
         </div>
       </Card>
 

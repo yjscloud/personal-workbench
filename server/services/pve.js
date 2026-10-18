@@ -43,6 +43,31 @@ function friendlyPveError(message) {
 /* ────────────────────────────────────────────────────────────────────────
  * 极简 HTTP 客户端（node:https，支持自签证书）
  * ──────────────────────────────────────────────────────────────────────── */
+
+/**
+ * 拼 Authorization 头，并先验一遍字符合法性。
+ *
+ * Node 对头里的非 ASCII / 控制字符只会抛一句
+ * `Invalid character in header content ["Authorization"]` —— 既没说是哪个字符，
+ * 也没说是哪个字段，看着像"密钥错了"，其实密钥可能完全正确。
+ * 实际最常见的两个来源：
+ *   1. 把服务端返回的**掩码**（••••••••）当成密钥发了过来；
+ *   2. 从截图/PDF 里粘贴，混进了全角字符或零宽空格。
+ * 这两种都能在这里指名道姓地说出来，比让错误一路冒到界面上强。
+ */
+function authHeader(cfg) {
+  const value = `PVEAPIToken=${cfg.tokenId}=${cfg.tokenSecret}`;
+  if (/^[\x20-\x7e]+$/.test(value)) return value;
+
+  const bad = [...value].find((ch) => !/[\x20-\x7e]/.test(ch)) || '';
+  const code = bad ? `U+${bad.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}` : '';
+  /* 这里在 Promise 的执行器里被调用，同步 throw 会直接变成 reject */
+  throw new Error(
+    `Token 里有不能放进 HTTP 头的字符「${bad}」（${code}）—— 密钥栏里是不是还留着掩码「••••••••」，` +
+      '或者粘贴时带进了全角字符/空格？',
+  );
+}
+
 function request(cfg, apiPath, { method = 'GET', timeout = 8000, body = null } = {}) {
   const mod = cfg.port === 443 ? https : https; // PVE 默认 https
   return new Promise((resolve, reject) => {
@@ -54,7 +79,7 @@ function request(cfg, apiPath, { method = 'GET', timeout = 8000, body = null } =
         method,
         rejectUnauthorized: cfg.verifyTls,
         headers: {
-          Authorization: `PVEAPIToken=${cfg.tokenId}=${cfg.tokenSecret}`,
+          Authorization: authHeader(cfg),
           Accept: 'application/json',
           ...(body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
         },
@@ -488,7 +513,10 @@ function normalizeSeries(rows) {
       iowait: num(r.iowait),
       loadavg: num(r.loadavg),
       memused: num(r.memused),
-      maxmem: num(r.maxmem),
+      /* 总量在 rrddata 里叫 memtotal，**不是** maxmem（后者是 /cluster/resources
+         里虚拟机的字段）。读错字段的表现很隐蔽：分母是 0，于是内存占用率恒为 0，
+         曲线平贴着底边，看着像"这台机器内存一点没用" —— 而不是像一处报错。 */
+      maxmem: num(r.maxmem ?? r.memtotal),
       rootused: num(r.rootused),
       roottotal: num(r.roottotal),
       netin: num(r.netin),

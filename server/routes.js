@@ -33,6 +33,7 @@ import { askAboutArticle } from './services/knowledge-ai.js';
 import { askAboutNews, cachedBody, unreadableHosts } from './services/reader.js';
 import { usageSnapshot } from './services/ai-usage.js';
 import { balanceReport, deepseekConfigured } from './services/deepseek.js';
+import { collectStars, DEFAULT_REPO, normalizeRepo, sendTestNotification, starsReport } from './services/github-stars.js';
 import { probeSiteColor } from './services/sitecolor.js';
 import { fetchSiteIcon } from './services/siteicon.js';
 import { suggestSource, fetchSuggest } from './services/suggest.js';
@@ -205,6 +206,15 @@ function maskSettings(settings) {
       ...settings.pve,
       tokenSecret: settings.pve?.tokenSecret ? MASK : '',
       hasSecret: Boolean(settings.pve?.tokenSecret),
+    },
+    /* star 卡片的数据源。webhook 地址**明文**回显：它是一长串随机串，
+       遮起来用户就没法核对"是不是我想加的那个群"，而且它本身也要能改能清空
+       （清空 = 停止通知）。签名密钥照 tokenSecret 的做法只回掩码 + 布尔 ——
+       那位是真正的写入凭据，而且要改它必须重新敲一遍。 */
+    stars: {
+      ...settings.stars,
+      feishuSecret: settings.stars?.feishuSecret ? MASK : '',
+      hasFeishuSecret: Boolean(settings.stars?.feishuSecret),
     },
     ha: {
       ...ha,
@@ -2026,6 +2036,30 @@ router.put(
     const nextSearch = incoming.search ? normalizeSearch(db().settings.search, incoming.search) : null;
     if (nextSearch && !nextSearch.ok) return fail(res, 400, nextSearch.error);
 
+    /* 监控页 star 卡片的数据源（仓库 + 飞书通知）。
+       仓库两种写法都收：owner/repo，或者直接粘整条 GitHub 地址 —— 从地址栏
+       复制是常态。校验放在 update 之前，理由同 backup：失败响应也会触发落库，
+       塞进 update 里就成了"报错但存进去了"。 */
+    let nextStars = null;
+    if (incoming.stars) {
+      const repo = normalizeRepo(incoming.stars.repo);
+      if (!repo) return fail(res, 400, '仓库要写成 owner/repo，或者直接粘 GitHub 地址');
+      const feishuUrl = String(incoming.stars.feishuUrl ?? '').trim().slice(0, 500);
+      if (feishuUrl && !/^https?:\/\//i.test(feishuUrl)) {
+        return fail(res, 400, '飞书 webhook 地址要以 http:// 或 https:// 开头（留空则不发通知）');
+      }
+      /* 签名密钥：空串或掩码都表示"没改过"，沿用库里的旧值。
+         想清空它没有入口 —— 它一旦不属于这个机器人，换掉 webhook 就是了 */
+      const sentSecret = incoming.stars.feishuSecret;
+      const keepSecret = sentSecret === undefined || sentSecret === '' || sentSecret === MASK;
+      nextStars = {
+        repo,
+        feishuUrl,
+        feishuSecret: keepSecret ? db().settings.stars?.feishuSecret || '' : String(sentSecret).slice(0, 200),
+      };
+    }
+    const prevRepo = normalizeRepo(db().settings.stars?.repo) || DEFAULT_REPO;
+
     /* 智能办公室那个"打开完整办公室"的链接。
        同样先校验再落库：地址会被塞进 href，不是 http(s) 的一律拒掉
        （javascript: 之类在这里没有正当用途）。空字符串是合法的 ——
@@ -2141,12 +2175,22 @@ router.put(
           delete s.ha.counterEntity;
         }
       }
+      if (nextStars) s.stars = nextStars;
       s.updatedAt = new Date().toISOString();
     });
     /* 计划改了要**立刻**生效：定时任务的注册搬到了 services/backup.js，
        这里直接按新设置重新注册一遍，不必重启服务。
        （同样的问题在 news 上还没解：那边的 cron 只在启动时读一次） */
     if (nextBackup) applyBackupSchedule();
+
+    /* 换了仓库就立刻采一次。不采的话，卡片会顶着一个"还没采集到"的空状态
+       一直等到下一个整点（最多 12 小时），用户会以为配错了。
+       旧仓库的历史由 services 侧按 repo 判定并作废（见 stateOf），不必在这里清。 */
+    if (nextStars && nextStars.repo !== prevRepo) {
+      collectStars()
+        .then(() => flush())
+        .catch((err) => console.warn('[stars] 换仓库后立即采集失败：', err.message));
+    }
     ok(res, maskSettings(db().settings));
   }),
 );
@@ -2441,6 +2485,36 @@ router.get(
   }),
 );
 
+/* ── GitHub star（监控页那张卡片）─────────────────────────────────────
+ * GET 返回的是**采集结果**，不会现去请求 GitHub：卡片 12 小时才变一次，
+ * 没必要每开一次页面就浪费一次未认证额度（60 次/小时，按出口 IP 算）。
+ * 想立刻看最新的，点卡片右上角的刷新 —— 那是唯一会真打 GitHub 的入口。
+ * ──────────────────────────────────────────────────────────────────── */
+router.get('/github/stars', (_req, res) => ok(res, starsReport()));
+
+router.post(
+  '/github/stars/refresh',
+  wrap(async (_req, res) => {
+    try {
+      await collectStars();
+    } catch {
+      /* 采集失败也要把状态给出去：卡片上要显示"这次为什么没采到"，
+         而不是弹一个只有状态码的报错。星数照旧是上一次的成功值 */
+    }
+    ok(res, starsReport());
+  }),
+);
+
+/* 发一条测试消息。失败就让 wrap 把它变成 500 —— 界面要的是那句具体原因
+   （「飞书返回 code=19021」），而不是一个布尔值 */
+router.post(
+  '/github/stars/test',
+  wrap(async (_req, res) => {
+    await sendTestNotification();
+    ok(res, { sent: true });
+  }),
+);
+
 router.post(
   '/pve/eco',
   wrap(async (req, res) => {
@@ -2457,9 +2531,20 @@ router.post(
 router.post(
   '/pve/config/test',
   wrap(async (req, res) => {
-    const cfg = pveConfig({ pve: { ...db().settings.pve, ...(req.body || {}) } });
+    /* 测试用的是"当前填写的值"，但密钥那一栏有两个特殊值不能当密钥用：
+       —— 空串：界面上写着"留空表示不修改"，意思是沿用库里那把；
+       —— 掩码：GET /settings 回给前端的就是它，前端整段回传时会原样带上来。
+       以前这里不管三七二十一直接拼进 Authorization，Node 只会回一句
+       Invalid character in header content，看起来像"密钥错了"，
+       实际上密钥是对的 —— 错的是把掩码当成了密钥。 */
+    const { hasSecret: _derived, ...body } = req.body || {};
+    const sent = typeof body.tokenSecret === 'string' ? body.tokenSecret.trim() : '';
+    const pve = { ...db().settings.pve, ...body };
+    pve.tokenSecret = !sent || sent === MASK ? db().settings.pve?.tokenSecret || '' : sent;
+
+    const cfg = pveConfig({ pve });
     if (!cfg.host || !cfg.tokenId || !cfg.tokenSecret) return fail(res, 400, '请先填写地址、Token ID 与密钥');
-    const nodes = await listNodes({ pve: { ...db().settings.pve, ...(req.body || {}) } });
+    const nodes = await listNodes({ pve });
     ok(res, { nodes, count: nodes.length });
   }),
 );

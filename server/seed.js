@@ -234,6 +234,11 @@ export function defaultData() {
       auth: { user: '', passwordHash: '', updatedAt: '' },
       theme: { mode: 'light', accent: 'azure' },
       pve: { host: '', port: 8006, tokenId: '', tokenSecret: '', node: '', verifyTls: false },
+      /* 监控页那张 GitHub star 卡片盯哪个仓库、涨了发到哪个飞书群。
+         仓库留空则用 yjscloud/ProxCenter；webhook 留空 = 只记数不发通知
+         （.env 里的 FEISHU_WEBHOOK_URL 作为兜底，老部署不必改）。
+         签名密钥是机器人开了「签名校验」才用的，同样可以留空。 */
+      stars: { repo: 'yjscloud/ProxCenter', feishuUrl: '', feishuSecret: '' },
       // Home Assistant：整机功耗与用电的实测来源（米家插座 → Xiaomi Home 集成）
       ha: {
         // 注意：这里没有 token —— 长期访问令牌只从环境变量 HA_TOKEN 读，不进库
@@ -345,5 +350,11 @@ export function defaultData() {
     /* DeepSeek 余额的按天快照（见 services/deepseek.js）。
        同样是空壳：谁第一次读到余额，谁往 days 里写第一笔。 */
     petBalance: { days: {} },
+
+    /* GitHub star 的采样状态（见 services/github-stars.js）。
+       stars 先给 null 而不是 0：卡片要区分"还没采过"和"真的是 0 个 star"，
+       给 0 的话首屏会理直气壮地显示一个错数。
+       pending 是攒着还没发出去的增量 —— 飞书不通时不丢通知，等下次合并发。 */
+    githubStars: { repo: 'yjscloud/ProxCenter', stars: null, history: [], pending: 0 },
   };
 }

@@ -575,6 +575,35 @@ export type GrowthReport = {
   usedRatio?: number;
 };
 
+/**
+ * 监控页那张 GitHub star 卡片（见 services/github-stars.js）。
+ *
+ * 字段恒定齐全：没采过时 `stars` 是 null，而不是 0 —— 卡片要能区分
+ * "还没采过"和"真的一个 star 都没有"。`history` 是 12 小时一个点的采样，
+ * 直接拿去画曲线。
+ */
+export type GithubStars = {
+  repo: string;
+  stars: number | null;
+  prevStars: number | null;
+  /** 最近一次采集的增量（上一个点到这一个点） */
+  delta: number;
+  /** 攒着还没发出去的增量：飞书不通时会累积，下次合并成一条发 */
+  pending: number;
+  forks: number;
+  issues: number;
+  description: string;
+  htmlUrl: string;
+  /** 上次成功采集的时间；采集失败时它不动，另由 error 说明原因 */
+  checkedAt: string | null;
+  attemptedAt: string | null;
+  history: { t: string; stars: number }[];
+  notify: { at: string; ok: boolean; delta: number; error: string | null } | null;
+  error: string | null;
+  /** 没配 FEISHU_WEBHOOK_URL 时只记数不发通知，卡片上要说明这一点 */
+  feishuConfigured: boolean;
+};
+
 /** 一个插座：只需选一个功率实体；整机功耗 = 所有启用插座功率之和 */
 export type HaSocket = {
   id: string;
@@ -686,6 +715,12 @@ export type Settings = {
   auth: { user: string; enabled: boolean; custom: boolean; envFallback: boolean };
   theme: { mode: 'dark' | 'light'; accent: 'azure' | 'copper' | 'signal' | 'violet' };
   pve: { host: string; port: number; tokenId: string; tokenSecret: string; node: string; verifyTls: boolean; hasSecret?: boolean };
+  /**
+   * 监控页 star 卡片的数据源。
+   * `feishuUrl` 明文（要能核对、能清空）；`feishuSecret` 只会回来一个掩码，
+   * 配过的话 `hasFeishuSecret` 为 true —— 留空保存即"不修改"。
+   */
+  stars: { repo: string; feishuUrl: string; feishuSecret: string; hasFeishuSecret?: boolean };
   ha: HaSettings;
   power: {
     idleW: number;
@@ -1744,6 +1779,14 @@ export const api = {
         };
       }>('/pve/eco', send('POST', { enabled })),
     testConfig: (body: Partial<Settings['pve']>) => req<{ nodes: any[]; count: number }>('/pve/config/test', send('POST', body)),
+  },
+
+  /* GitHub star：监控页卡片。读的是采集结果，refresh 才会真去打 GitHub */
+  github: {
+    stars: () => req<GithubStars>('/github/stars'),
+    refresh: () => req<GithubStars>('/github/stars/refresh', send('POST', {})),
+    /** 发一条测试消息。失败时抛出的就是服务端那句具体原因（code=19021 之类） */
+    testNotify: () => req<{ sent: boolean }>('/github/stars/test', send('POST', {})),
   },
 
   /* Home Assistant：米家智能插座实测功耗与用电 */

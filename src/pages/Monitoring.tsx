@@ -15,13 +15,13 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { Activity, CircuitBoard, Cpu, HardDrive, Info, Leaf, MemoryStick, Network, Server, Settings2, Thermometer, Zap } from 'lucide-react';
-import { api, type DiskHealth, type PowerSource } from '@/lib/api';
+import { Activity, CircuitBoard, Cpu, ExternalLink, HardDrive, Info, Leaf, MemoryStick, Network, RefreshCw, Server, Settings2, Star, Thermometer, Zap } from 'lucide-react';
+import { api, type DiskHealth, type GithubStars, type PowerSource } from '@/lib/api';
 import { useMonitor } from '@/lib/monitor';
 import { useChartColors, timeLabel, GRID_DASH } from '@/lib/useChartColors';
 import { fmtTokens, gatewaySourceLabel, useAiUsage, usedTokens } from '@/lib/ai-usage';
-import { cls, energyParts, fmtBytes, fmtDuration, fmtEnergy, fmtMoney, fmtRate } from '@/lib/format';
-import { Badge, Button, Card, CardHead, Empty, LiveDot, Meter, PageHead, Section, Segmented, Select, Skeleton, Spinner, toneByRatio } from '@/components/ui';
+import { cls, energyParts, fmtBytes, fmtDuration, fmtEnergy, fmtMoney, fmtRate, fmtRelative } from '@/lib/format';
+import { Badge, Button, Card, CardHead, Empty, LiveDot, Meter, PageHead, Section, Segmented, Select, Skeleton, SkeletonLines, Spinner, toneByRatio } from '@/components/ui';
 import { RatioStat, Stat, ToneLed } from '@/components/bits';
 
 const TIMEFRAMES = [
@@ -205,10 +205,14 @@ export default function Monitoring() {
         </div>
       </Section>
 
-      <Section title="使用趋势" hint="CPU 与内存的走势，以及磁盘读写吞吐">
-        <div className="grid gap-5 lg:grid-cols-2">
+      {/* Star 卡片和两张图同排：它是这一页唯一一个"外部世界"的数，
+          单独占一行会让它看起来比 CPU/IO 更重要。三列只在 lg 以上成立，
+          窄屏自然堆成三行。 */}
+      <Section title="资源走势" hint="CPU 与内存使用率、磁盘读写吞吐随时间的变化，以及 ProxCenter 的 star 变化">
+        <div className="grid gap-5 lg:grid-cols-3">
           <CpuMemChart />
           <IoChart />
+          <StarPanel />
         </div>
       </Section>
 
@@ -684,18 +688,52 @@ function useChartData() {
 
 function CpuMemChart() {
   const { data, colors, timeframe } = useChartData();
+  const latest = data[data.length - 1];
+
+  /* 两条线共用一个 0–100 的轴会失真：这台机器内存常驻 30% 出头，
+     CPU 常态只有 2%~3%，于是 CPU 成了一条贴着底边的直线 —— 不是没采到数，
+     是量程把它压平了。改成双轴：左边 CPU 按峰值取档（5/10/20/25/50/100），
+     右边内存固定 0–100，80/92 两条阈值线继续挂在内存轴上。
+     取档时留出两成余量（峰值只占量程的 80%），既不让曲线顶到框上，
+     也给顶部那两条阈值线腾出地方 —— 否则 CPU 一冲高就压住了阈值文字。 */
+  const cpuPeak = data.reduce((peak, d) => Math.max(peak, d.cpuPct), 0);
+  const cpuMax = [5, 10, 20, 25, 50, 100].find((step) => cpuPeak <= step * 0.8) ?? 100;
+  /* 轴刻度只留三档，半档可能是 2.5 这种小数 */
+  const tickPct = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+
   return (
     <Card>
-      <CardHead title="CPU 与内存" hint="使用率随时间变化（%）" />
+      <CardHead
+        title="CPU 与内存"
+        hint="左轴 CPU · 右轴内存（%）"
+        right={
+          latest ? (
+            /* 最新读数放在标题栏：图上一深一浅两条蓝线，先把"谁是谁"点名 */
+            <div className="flex items-center gap-3 text-2xs">
+              <span className="num flex items-center gap-1.5">
+                <span className="inline-block h-1.5 w-1.5" style={{ background: colors.cpu }} />
+                <span className="text-muted">CPU</span>
+                <span className="text-ink">{latest.cpuPct.toFixed(1)}%</span>
+              </span>
+              <span className="num flex items-center gap-1.5">
+                <span className="inline-block h-1.5 w-1.5" style={{ background: colors.mem }} />
+                <span className="text-muted">内存</span>
+                <span className="text-ink">{latest.memPct.toFixed(1)}%</span>
+              </span>
+            </div>
+          ) : null
+        }
+      />
       {data.length < 2 ? (
         <Empty title="暂无历史点" hint="等下一次采样后就会出现曲线。" />
       ) : (
         <ResponsiveContainer width="100%" height={210}>
-          <AreaChart data={data} margin={{ top: 6, right: 6, left: -24, bottom: 0 }}>
+          <AreaChart data={data} margin={{ top: 6, right: 0, left: 0, bottom: 0 }}>
             <defs>
-              {/* 颜色跟着指标域走：CPU 蓝、内存紫 —— 和上面那张环形读数卡是同一支色 */}
+              {/* 颜色跟着指标域走：CPU、内存同一支蓝的两个明度档 ——
+                  和上面那张环形读数卡是同一套色 */}
               <linearGradient id="gradCpu" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={colors.cpu} stopOpacity={0.34} />
+                <stop offset="0%" stopColor={colors.cpu} stopOpacity={0.24} />
                 <stop offset="100%" stopColor={colors.cpu} stopOpacity={0.02} />
               </linearGradient>
               <linearGradient id="gradMem" x1="0" y1="0" x2="0" y2="1">
@@ -704,14 +742,35 @@ function CpuMemChart() {
               </linearGradient>
             </defs>
             <CartesianGrid stroke={colors.line} strokeDasharray={GRID_DASH} strokeOpacity={0.55} vertical={false} />
-            {/* 阈值线：把"多少算高"画在图上，比只写在代码里有用 */}
-            <ReferenceLine y={80} stroke={colors.warn} strokeDasharray="4 4" strokeOpacity={0.5} label={{ value: '80', position: 'right', fill: colors.faint, fontSize: 9 }} />
-            <ReferenceLine y={92} stroke={colors.crit} strokeDasharray="4 4" strokeOpacity={0.5} label={{ value: '92', position: 'right', fill: colors.faint, fontSize: 9 }} />
+            {/* 阈值线：把"多少算高"画在图上，比只写在代码里有用。
+                挂在内存轴上 —— CPU 轴量程只有几格，80 根本不在画面里 */}
+            <ReferenceLine yAxisId="mem" y={80} stroke={colors.warn} strokeDasharray="4 4" strokeOpacity={0.5} label={{ value: '80%', position: 'insideTopRight', fill: colors.faint, fontSize: 9, dx: -4 }} />
+            <ReferenceLine yAxisId="mem" y={92} stroke={colors.crit} strokeDasharray="4 4" strokeOpacity={0.5} label={{ value: '92%', position: 'insideTopRight', fill: colors.faint, fontSize: 9, dx: -4 }} />
             <XAxis dataKey="time" tickFormatter={(t) => timeLabel(t, timeframe)} tick={{ fill: colors.faint, fontSize: 10 }} axisLine={false} tickLine={false} minTickGap={28} />
-            <YAxis domain={[0, 100]} tick={{ fill: colors.faint, fontSize: 10 }} axisLine={false} tickLine={false} width={44} />
+            <YAxis
+              yAxisId="cpu"
+              domain={[0, cpuMax]}
+              ticks={[0, cpuMax / 2, cpuMax]}
+              tickFormatter={tickPct}
+              tick={{ fill: colors.faint, fontSize: 9 }}
+              axisLine={false}
+              tickLine={false}
+              width={30}
+            />
+            <YAxis
+              yAxisId="mem"
+              orientation="right"
+              domain={[0, 100]}
+              ticks={[0, 50, 100]}
+              tick={{ fill: colors.faint, fontSize: 9 }}
+              axisLine={false}
+              tickLine={false}
+              width={32}
+            />
             <Tooltip cursor={{ stroke: colors.faint, strokeDasharray: '3 3' }} content={<ChartTip unit={(v: number) => `${v.toFixed(1)}%`} labelFmt={(t: number) => new Date(t * 1000).toLocaleString('zh-CN')} />} />
-            <Area type="monotone" dataKey="cpuPct" name="CPU" stroke={colors.cpu} strokeWidth={1.8} fill="url(#gradCpu)" />
-            <Area type="monotone" dataKey="memPct" name="内存" stroke={colors.mem} strokeWidth={1.8} fill="url(#gradMem)" />
+            {/* 内存先画、CPU 后画：深色那条压在上面，才不会被浅色填充盖住 */}
+            <Area yAxisId="mem" type="monotone" dataKey="memPct" name="内存" stroke={colors.mem} strokeWidth={1.8} fill="url(#gradMem)" />
+            <Area yAxisId="cpu" type="monotone" dataKey="cpuPct" name="CPU" stroke={colors.cpu} strokeWidth={1.8} fill="url(#gradCpu)" />
           </AreaChart>
         </ResponsiveContainer>
       )}
@@ -775,6 +834,212 @@ function IoChart() {
             <Line type="monotone" dataKey="iowait" name="iowait" stroke={colors.warn} strokeWidth={1.8} dot={false} />
           </LineChart>
         </ResponsiveContainer>
+      )}
+    </Card>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════════
+   ProxCenter 的 GitHub star
+
+   数据是服务端每 12 小时采一次的**采样结果**（services/github-stars.js），
+   前端不轮询：这个数一天只变两次，每 15 秒问一遍纯属浪费。
+   唯一会现去请求 GitHub 的动作是右上角那个刷新 —— 它对应一个 POST。
+
+   空窗口期（部署后还没到采集点）由服务端的启动补采兜住；万一补采也失败，
+   这里如实说"还没有采集到"，而不是画一个 0。
+   ══════════════════════════════════════════════════════════════════ */
+function StarPanel() {
+  const colors = useChartColors();
+  const [data, setData] = useState<GithubStars | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  /* 测试通知的结果就地显示，不弹 toast：这条卡片自己的状态已经够多了，
+     再冒一个浮层反而看不出是哪个动作的结果 */
+  const [test, setTest] = useState<{ text: string; ok: boolean } | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api.github
+      .stars()
+      .then((d) => {
+        if (alive) setData(d);
+      })
+      .catch((err: unknown) => {
+        if (alive) setError(err instanceof Error ? err.message : '读取失败');
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  async function refresh() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      /* POST 的返回值就是刷新后的完整状态 —— 即使采集失败也会带着上次的
+         星数与这次的错误，所以这里不需要分两个分支 */
+      setData(await api.github.refresh());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '采集失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function testNotify() {
+    setTest({ text: '发送中…', ok: true });
+    try {
+      await api.github.testNotify();
+      setTest({ text: '测试通知已发出，去飞书群里看一眼', ok: true });
+    } catch (err) {
+      setTest({ text: err instanceof Error ? err.message : '发送失败', ok: false });
+    }
+  }
+
+  const points = useMemo(
+    () => (data?.history ?? []).map((p) => ({ t: new Date(p.t).getTime(), stars: p.stars })),
+    [data],
+  );
+
+  const stars = data?.stars ?? null;
+  const delta = data?.delta ?? 0;
+
+  /* 一行状态说明。优先级按"用户最需要知道的"排：采集失败 > 通知失败 >
+     没配 webhook > 上次通知成功。都正常时不占地方 */
+  let notice: ReactNode = null;
+  if (error) notice = <p className="mt-1.5 text-2xs leading-relaxed text-crit">采集失败：{error}</p>;
+  else if (data?.error) notice = <p className="mt-1.5 text-2xs leading-relaxed text-crit">采集失败：{data.error}</p>;
+  else if (data?.notify && !data.notify.ok)
+    notice = (
+      <p className="mt-1.5 text-2xs leading-relaxed text-crit">
+        飞书通知失败：{data.notify.error}
+        {data.pending > 0 ? `（${data.pending} 个 star 的通知攒着，下次合并发）` : ''}
+      </p>
+    );
+  else if (data && !data.feishuConfigured)
+    notice = <p className="mt-1.5 text-2xs leading-relaxed text-faint">未配置 FEISHU_WEBHOOK_URL：只记数，不发通知</p>;
+  else if (data?.notify?.ok)
+    notice = (
+      <p className="mt-1.5 text-2xs leading-relaxed text-faint">
+        上次通知 +{data.notify.delta} · {fmtRelative(data.notify.at)}
+      </p>
+    );
+
+  return (
+    <Card>
+      <CardHead
+        title="GitHub Star"
+        hint={`${data?.repo ?? 'yjscloud/ProxCenter'} · 每 12 小时采集`}
+        right={
+          <Button size="sm" variant="ghost" onClick={() => void refresh()} disabled={busy} aria-label="立即采集 star 数">
+            <RefreshCw size={13} className={cls(busy && 'animate-spin')} />
+          </Button>
+        }
+      />
+
+      {!data && !error ? (
+        <SkeletonLines lines={3} />
+      ) : stars == null ? (
+        <Empty
+          icon={<Star size={20} />}
+          title="还没有采集到"
+          hint={error || data?.error || '服务每 12 小时采一次；点右上角的刷新可以立刻试一次。'}
+          action={
+            <Button size="sm" variant="soft" onClick={() => void refresh()} disabled={busy}>
+              立即采集
+            </Button>
+          }
+        />
+      ) : (
+        <>
+          <div className="flex items-end justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-baseline gap-2">
+                <span className="num text-3xl font-semibold leading-none">{stars}</span>
+                <span className="text-2xs text-faint">stars</span>
+              </div>
+              <p className="num mt-1.5 text-2xs text-muted">
+                {data?.forks ?? 0} forks · {data?.issues ?? 0} open issues
+              </p>
+            </div>
+            <span
+              className={cls(
+                'num shrink-0 rounded-full px-2 py-0.5 text-2xs',
+                delta > 0 ? 'bg-ok-soft text-ok' : 'bg-bg-2 text-faint',
+              )}
+              title={delta > 0 ? `比上一次采集多了 ${delta} 个` : '与上一次采集持平'}
+            >
+              {delta > 0 ? `+${delta}` : '持平'}
+            </span>
+          </div>
+
+          {points.length >= 2 ? (
+            <ResponsiveContainer width="100%" height={92}>
+              <AreaChart data={points} margin={{ top: 8, right: 0, left: 0, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="gradStar" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={colors.accent} stopOpacity={0.32} />
+                    <stop offset="100%" stopColor={colors.accent} stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                {/* 轴都藏起来：92px 高的迷你图放刻度只会剩一堆噪点。
+                    但 XAxis 本身要留着 —— 不留的话 Tooltip 拿不到 label */}
+                <XAxis dataKey="t" hide />
+                <Tooltip
+                  cursor={{ stroke: colors.faint, strokeDasharray: '3 3' }}
+                  content={
+                    <ChartTip
+                      unit={(v: number) => `${v} ★`}
+                      labelFmt={(t: number) => (Number.isFinite(t) ? new Date(t).toLocaleString('zh-CN') : '')}
+                    />
+                  }
+                />
+                <Area
+                  type="monotone"
+                  dataKey="stars"
+                  name="star"
+                  stroke={colors.accent}
+                  strokeWidth={1.8}
+                  fill="url(#gradStar)"
+                  /* 点少的时候把采样点画出来，否则两个点连成的一条直线看不出"这是一次采样" */
+                  dot={points.length < 8 ? { r: 2 } : false}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : (
+            <p className="mt-3 flex h-[92px] items-center justify-center rounded-field bg-bg-2/50 px-3 text-center text-2xs leading-relaxed text-faint">
+              再采几次就能画出趋势了（每 12 小时一个点）
+            </p>
+          )}
+
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-line pt-2.5 text-2xs text-faint">
+            <span>上次采集 {fmtRelative(data?.checkedAt)}</span>
+            <span className="inline-flex items-center gap-2">
+              {data?.feishuConfigured ? (
+                <button
+                  type="button"
+                  onClick={() => void testNotify()}
+                  className="text-muted transition-colors hover:text-accent"
+                >
+                  测试通知
+                </button>
+              ) : null}
+              <a
+                href={data?.htmlUrl ?? 'https://github.com/yjscloud/ProxCenter'}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 text-muted transition-colors hover:text-accent"
+              >
+                打开仓库
+                <ExternalLink size={10} />
+              </a>
+            </span>
+          </div>
+          {test ? <p className={cls('mt-1.5 text-2xs leading-relaxed', test.ok ? 'text-faint' : 'text-crit')}>{test.text}</p> : null}
+          {notice}
+        </>
       )}
     </Card>
   );

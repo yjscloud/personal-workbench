@@ -11,6 +11,7 @@ import { authEnabled, currentUser } from './services/auth.js';
 import { initStore, closeStore, db, dbInfo, dbStats, flush } from './store.js';
 import { DB_LABEL } from './db/config.js';
 import { refreshNews, newsStale } from './services/news.js';
+import { collectStars, ensureStarsFresh } from './services/github-stars.js';
 import { startSampler, stopSampler } from './services/sampler.js';
 import { purgeOldKnowledge, purgeOldMonitoringData, purgeOldNews } from './services/retention.js';
 import { applyBackupSchedule } from './services/backup.js';
@@ -126,6 +127,26 @@ function applyNewsSchedule() {
   console.log(`[news] 已启用自动更新，计划：${expr}`);
 }
 
+/* ── 定时任务：GitHub star，每 12 小时一次 ───────────────────────────
+   12 小时不是拍脑袋的：star 的增长是"天"的量级，采得再勤也只是把同一批
+   数字重复记进历史，画出来的曲线不会更准。定在 0 点与 12 点，和新闻抓取
+   （2 小时一轮）、清理（4:20）都错开。
+
+   为什么不放进设置页：这个数是给监控卡片用的固定节奏，不是"用户偏好"。
+   做成可配置项反而多一个能被改坏的地方。 */
+const STAR_CRON = '0 */12 * * *';
+let starJob = null;
+
+function applyStarSchedule() {
+  if (starJob) return;
+  starJob = cron.schedule(STAR_CRON, () => {
+    collectStars()
+      .then((s) => console.log(`[stars] 采集完成：${s.stars} 个 star（本次 +${s.delta}）`))
+      .catch((err) => console.error('[stars] 采集失败：', err.message));
+  });
+  console.log(`[stars] 已启用定时采集，计划：${STAR_CRON}`);
+}
+
 /* ── 定时任务：清理过期数据 ─────────────────────────────────────────
    逐日明细留 3 个自然月，月度电费归档留 12 个月，AI 热点留 7 天，
    见 services/retention.js。
@@ -205,6 +226,15 @@ async function bootstrap() {
 
     applyNewsSchedule();
     applyRetentionSchedule();
+    applyStarSchedule();
+
+    /* 停机期间错过的 star 采集，起来就补一次。不补的话卡片的空窗期不是
+       12 小时，而是"从上次跑到下一个整点" —— 部署当天可能一整天都是空的 */
+    ensureStarsFresh()
+      .then((s) => {
+        if (s) console.log(`[stars] 启动补采完成：${s.stars} 个 star（本次 +${s.delta || 0}）`);
+      })
+      .catch((err) => console.warn('[stars] 启动补采失败：', err.message));
     // 用电量由实测功率积分而来，必须常驻采样：只靠前端轮询，页面一关就断档
     startSampler();
 

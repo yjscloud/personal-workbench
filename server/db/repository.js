@@ -338,6 +338,14 @@ const SINGLETONS = [
     rows: (d) => [{ id: 1, payload: toJson(d.petBalance ?? null), updated_at: toDate(d.petBalance?.updatedAt) }],
   },
   {
+    /* GitHub star 的采样状态。updatedAt 由 github-stars.js 每次采集后刷新 ——
+       指纹里带上它，数字变了才会触发写入 */
+    name: 'github_stars',
+    table: 'github_stars',
+    columns: ['id', 'payload', 'updated_at'],
+    rows: (d) => [{ id: 1, payload: toJson(d.githubStars ?? null), updated_at: toDate(d.githubStars?.updatedAt) }],
+  },
+  {
     name: 'energy_state',
     table: 'energy_state',
     columns: ['id', 'last_ts', 'last_watts', 'total_kwh', 'total_cost', 'eco_saved_kwh'],
@@ -585,6 +593,9 @@ export async function loadAll(base) {
       search: { ...data.settings.search, ...(stored.search || {}) },
       pve: { ...data.settings.pve, ...(stored.pve || {}) },
       power: { ...data.settings.power, ...(stored.power || {}) },
+      /* 监控页 star 卡片的数据源。嵌套合并：以后给它加字段时，老库里的
+         整个 stars 对象不该把新字段吞掉 */
+      stars: { ...data.settings.stars, ...(stored.stars || {}) },
       ha,
       news: { ...data.settings.news, ...(stored.news || {}), aihot: { ...data.settings.news.aihot, ...(stored.news?.aihot || {}) } },
       // 同 store.js 的 normalize：backup.cos 是嵌套对象，必须逐层合并
@@ -632,6 +643,10 @@ export async function loadAll(base) {
   const [[petBalanceRow]] = await pool.query('SELECT `payload` FROM `pet_balance` WHERE `id` = 1');
   const petBalance = parseJson(petBalanceRow?.payload, null);
   if (petBalance && typeof petBalance === 'object') data.petBalance = petBalance;
+
+  const [[githubStarsRow]] = await pool.query('SELECT `payload` FROM `github_stars` WHERE `id` = 1');
+  const githubStars = parseJson(githubStarsRow?.payload, null);
+  if (githubStars && typeof githubStars === 'object') data.githubStars = githubStars;
 
   data.energy = await loadEnergy(data.energy);
   return data;
