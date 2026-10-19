@@ -30,6 +30,10 @@ export type Ticket = {
   archivedAt?: string | null;
   /** 非空表示在回收站（软删除，可恢复） */
   deletedAt?: string | null;
+  /** 来源：空 = 面板里建的，external = 从公开外链投递进来的 */
+  source?: '' | 'external';
+  /** 外链提交者的联系方式；任务完成时按它发邮件 */
+  contact?: string;
   createdAt: string;
   updatedAt?: string;
 };
@@ -71,6 +75,42 @@ export type ProjectSection = {
   name: string;
   sort: number;
   createdAt: string;
+};
+
+/**
+ * 外部提交链接：一条链接绑定一个项目，拿到链接的人不用登录就能投一条任务。
+ *
+ * token 就是凭据本身，前端用它拼出 `/s/<token>`。它只在管理端接口里出现，
+ * 公开接口只回 project / section / label。
+ */
+export type PublicLink = {
+  id: string;
+  token: string;
+  project: string;
+  /** 项目内的分类名，空表示不归类 */
+  section: string;
+  /** 链接备注名，会显示在公开页上 */
+  label: string;
+  enabled: boolean;
+  /** 有提交时是否推飞书（用的是设置页里那条 webhook） */
+  notify: boolean;
+  /** 总提交上限，null = 不限 */
+  maxUses: number | null;
+  uses: number;
+  dayCount: number;
+  expiresAt: string | null;
+  lastUsedAt: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
+/** 公开页能看到的全部信息 */
+export type PublicLinkMeta = {
+  project: string;
+  section: string;
+  label: string;
+  /** 非空表示这条链接到点关闭 */
+  closesAt: string | null;
 };
 
 export type Bookmark = {
@@ -721,6 +761,13 @@ export type Settings = {
    * 配过的话 `hasFeishuSecret` 为 true —— 留空保存即"不修改"。
    */
   stars: { repo: string; feishuUrl: string; feishuSecret: string; hasFeishuSecret?: boolean };
+  /**
+   * 邮件通知（SMTP）。只用于「外链提交的任务完成」这一件事。
+   * `pass` 回来的是掩码，`hasPass` 表示库里已经有密码，留空保存即不修改。
+   */
+  mail: { host: string; port: number; secure: boolean; user: string; pass: string; from: string; notifyTo: string; hasPass?: boolean };
+  /** 任务到期提醒：每天 09:00 检查一次，飞书发汇总、邮件发给留了邮箱的提交者 */
+  reminders: { enabled: boolean };
   ha: HaSettings;
   power: {
     idleW: number;
@@ -1454,6 +1501,56 @@ export const api = {
       req<{ section: ProjectSection; renamedTasks: boolean }>(`/sections/${id}`, send('PATCH', { name })),
     /** 删分类不删任务：段里的任务保留、只是失去归属 */
     remove: (id: string) => req<{ removed: number; clearedTasks: number }>(`/sections/${id}`, send('DELETE')),
+  },
+
+  /** 邮件通知：发一封测试邮件，确认 SMTP 通不通 */
+  mail: {
+    test: (to: string) => req<{ sent: boolean }>('/mail/test', send('POST', { to })),
+  },
+
+  /** 到期提醒：立即跑一次检查（当天已发过的不会重发） */
+  reminders: {
+    run: () => req<{ skipped: boolean; tickets: number; mails: number; feishu: boolean }>('/reminders/run', send('POST', {})),
+  },
+
+  /** 外部提交链接（管理端，需登录） */
+  publicLinks: {
+    list: () => req<{ links: PublicLink[] }>('/public-links'),
+    create: (body: {
+      project: string;
+      section?: string;
+      label?: string;
+      notify?: boolean;
+      maxUses?: number | null;
+      expiresAt?: string | null;
+    }) => req<PublicLink>('/public-links', send('POST', body)),
+    update: (id: string, patch: Partial<Pick<PublicLink, 'project' | 'section' | 'label' | 'enabled' | 'notify'>> & { maxUses?: number | null; expiresAt?: string | null }) =>
+      req<PublicLink>(`/public-links/${id}`, send('PATCH', patch)),
+    /** 换一条新 token，旧链接立刻失效 */
+    rotate: (id: string) => req<PublicLink>(`/public-links/${id}/rotate`, send('POST', {})),
+    remove: (id: string) => req<{ removed: number }>(`/public-links/${id}`, send('DELETE')),
+  },
+
+  /**
+   * 公开侧（不需要登录）。这两个是 /s/:token 页面唯一的接口依赖；
+   * 提交失败时服务端只回一句"链接无效或已关闭"，不区分停用 / 过期 / 满额。
+   */
+  publicSubmit: {
+    meta: (token: string) => req<PublicLinkMeta>(`/public/links/${encodeURIComponent(token)}`),
+    submit: (
+      token: string,
+      body: {
+        title: string;
+        note?: string;
+        submitter?: string;
+        contact: string;
+        /** YYYY-MM-DD，空表示不设截止 */
+        due?: string;
+        attachments?: { name: string; mime: string; content: string }[];
+        website?: string;
+        elapsedMs: number;
+      },
+    ) => req<{ received: boolean; duplicate: boolean }>(`/public/links/${encodeURIComponent(token)}/submit`, send('POST', body)),
   },
 
   bookmarks: {

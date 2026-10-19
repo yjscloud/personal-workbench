@@ -84,7 +84,7 @@ const ENTITIES = [
     set: (d, list) => {
       d.tickets = list;
     },
-    columns: ['id', 'title', 'priority', 'status', 'project', 'section', 'owner', 'due', 'note', 'tags', 'checklist', 'archived_at', 'deleted_at', 'created_at', 'updated_at', 'sort_order'],
+    columns: ['id', 'title', 'priority', 'status', 'project', 'section', 'owner', 'due', 'note', 'source', 'contact', 'tags', 'checklist', 'archived_at', 'deleted_at', 'created_at', 'updated_at', 'sort_order'],
     toRow: (t, i) => ({
       id: str(t.id, 48),
       title: str(t.title, 200),
@@ -95,6 +95,8 @@ const ENTITIES = [
       owner: str(t.owner, 80),
       due: str(t.due, 40),
       note: text(t.note),
+      source: str(t.source, 16),
+      contact: str(t.contact, 160),
       tags: toJson(Array.isArray(t.tags) ? t.tags : []),
       checklist: toJson(Array.isArray(t.checklist) ? t.checklist : []),
       archived_at: toDate(t.archivedAt),
@@ -113,6 +115,8 @@ const ENTITIES = [
       owner: r.owner,
       due: r.due,
       note: r.note,
+      source: r.source ?? '',
+      contact: r.contact ?? '',
       tags: parseJson(r.tags, []),
       checklist: parseJson(r.checklist, []),
       archivedAt: toIso(r.archived_at),
@@ -596,6 +600,9 @@ export async function loadAll(base) {
       /* 监控页 star 卡片的数据源。嵌套合并：以后给它加字段时，老库里的
          整个 stars 对象不该把新字段吞掉 */
       stars: { ...data.settings.stars, ...(stored.stars || {}) },
+      /* 邮件通知的 SMTP 配置。同样整对象合并：以后加字段时老库不会被吞掉 */
+      mail: { ...data.settings.mail, ...(stored.mail || {}) },
+      reminders: { ...data.settings.reminders, ...(stored.reminders || {}) },
       ha,
       news: { ...data.settings.news, ...(stored.news || {}), aihot: { ...data.settings.news.aihot, ...(stored.news?.aihot || {}) } },
       // 同 store.js 的 normalize：backup.cos 是嵌套对象，必须逐层合并

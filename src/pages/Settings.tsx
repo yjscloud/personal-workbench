@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { CheckCircle2, CloudUpload, Database, Download, HardDriveDownload, History, ImageIcon, KeyRound, Leaf, Palette, Plug, Plus, RefreshCcw, Save, Search, Send, Sun, Moon, Trash2, Upload, User, Zap } from 'lucide-react';
+import { BellRing, CheckCircle2, CloudUpload, Database, Download, HardDriveDownload, History, ImageIcon, KeyRound, Leaf, Mail, Palette, Plug, Plus, RefreshCcw, Save, Search, Send, Sun, Moon, Trash2, Upload, User, Zap } from 'lucide-react';
 import {
   api,
   type HaEntityOption,
@@ -1171,6 +1171,12 @@ export default function Settings() {
         </div>
       </Card>
 
+      {/* 邮件通知：外链任务被标记完成时给提交者回信 */}
+      <MailCard />
+
+      {/* 到期提醒：每天扫一遍未完成任务 */}
+      <RemindersCard />
+
       {/* Home Assistant：米家插座实测 */}
       <Card>
         <CardHead level={2}
@@ -2117,5 +2123,203 @@ function LoginBgPreview({ bg }: { bg: LoginBackground }) {
         预览 · 登录页看到的底图
       </span>
     </div>
+  );
+}
+
+/* ── 邮件通知 ─────────────────────────────────────────────────────────
+   目前只服务于「外链提交的任务被标记完成」这一条路径，所以字段只留发信必需的几项。
+   密码沿用密钥那一套：后端只回掩码，留空保存 = 不改，避免把授权码回显到页面上。 */
+function MailCard() {
+  const { settings, saveSettings, notify } = useStore();
+  /* 设置还没加载完时给一份空配置，卡片照常渲染，不会因为 null 直接炸掉 */
+  const mail: SettingsShape['mail'] = settings?.mail ?? {
+    host: '',
+    port: 465,
+    secure: true,
+    user: '',
+    pass: '',
+    from: '',
+    notifyTo: '',
+  };
+
+  const [host, setHost] = useState(mail.host);
+  const [port, setPort] = useState(String(mail.port));
+  const [secure, setSecure] = useState(mail.secure);
+  const [user, setUser] = useState(mail.user);
+  const [pass, setPass] = useState('');
+  const [from, setFrom] = useState(mail.from);
+  const [notifyTo, setNotifyTo] = useState(mail.notifyTo);
+  const [busy, setBusy] = useState(false);
+
+  const [testTo, setTestTo] = useState('');
+  const [testing, setTesting] = useState(false);
+
+  const configured = Boolean(mail.host && mail.from);
+
+  async function save() {
+    setBusy(true);
+    try {
+      const next = await saveSettings({
+        mail: {
+          host: host.trim(),
+          port: Number(port) || 465,
+          secure,
+          user: user.trim(),
+          pass,
+          from: from.trim(),
+          notifyTo: notifyTo.trim(),
+        },
+      });
+      /* 服务端回的是掩码，这里顺手把输入框清空：下次打开就是"留空表示不修改" */
+      if (next) setPass('');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function test() {
+    if (!testTo.trim()) {
+      notify('先填一个收件地址', 'warn');
+      return;
+    }
+    setTesting(true);
+    try {
+      await api.mail.test(testTo.trim());
+      notify('测试邮件已发出，去收件箱看看（也可能在垃圾箱）');
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '发送失败', 'crit');
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHead
+        level={2}
+        title="邮件通知"
+        hint="外链提交的任务被标记为「已完成」时，给提交者发一封邮件；只对联系方式填了邮箱的生效"
+        right={<Badge tone={configured ? 'ok' : 'neutral'} dot>{configured ? '已配置' : '未配置'}</Badge>}
+      />
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="SMTP 服务器" hint="例如 smtp.qq.com / smtp.163.com">
+          <Input value={host} onChange={(e) => setHost(e.target.value)} placeholder="smtp.example.com" />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="端口">
+            <Input
+              value={port}
+              onChange={(e) => setPort(e.target.value.replace(/[^\d]/g, '').slice(0, 5))}
+              inputMode="numeric"
+              placeholder="465"
+            />
+          </Field>
+          <Field label="SSL/TLS" hint="465 端口通常开启">
+            <div className="flex h-10 items-center">
+              <Toggle checked={secure} onChange={setSecure} label="使用 SSL/TLS" />
+            </div>
+          </Field>
+        </div>
+        <Field label="账号" hint="一般就是邮箱地址">
+          <Input value={user} onChange={(e) => setUser(e.target.value)} placeholder="you@example.com" autoComplete="off" />
+        </Field>
+        <Field label="密码 / 授权码" hint={mail.hasPass ? '已保存；留空表示不修改' : 'QQ / 163 要用授权码，不是登录密码'}>
+          <Input
+            type="password"
+            value={pass}
+            onChange={(e) => setPass(e.target.value)}
+            placeholder={mail.hasPass ? '已保存' : ''}
+            autoComplete="new-password"
+          />
+        </Field>
+        <Field label="发件地址" hint="收件人看到的发件人，通常与账号相同">
+          <Input value={from} onChange={(e) => setFrom(e.target.value)} placeholder="noreply@example.com" />
+        </Field>
+        <Field label="通知收件人" hint="外部任务提交时发到这里；留空 = 发给上面的发件地址">
+          <Input
+            value={notifyTo}
+            onChange={(e) => setNotifyTo(e.target.value)}
+            placeholder="留空则发给自己"
+            autoComplete="off"
+          />
+        </Field>
+        <Field label="测试收件地址" hint="保存后点「发测试邮件」验证连通性">
+          <Input value={testTo} onChange={(e) => setTestTo(e.target.value)} placeholder="you@example.com" />
+        </Field>
+      </div>
+
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <Button variant="primary" onClick={() => void save()} disabled={busy}>
+          {busy ? <Spinner /> : <Save size={14} aria-hidden />}
+          保存
+        </Button>
+        <Button variant="soft" onClick={() => void test()} disabled={testing || !configured}>
+          {testing ? <Spinner /> : <Mail size={14} aria-hidden />}
+          发测试邮件
+        </Button>
+        {!configured ? <span className="text-2xs text-faint">先填服务器和发件地址并保存，才能发测试信</span> : null}
+      </div>
+    </Card>
+  );
+}
+
+/* ── 任务到期提醒 ─────────────────────────────────────────────────────
+   每天 09:00 由服务端检查一次：T-1「明天到期」、T0「今天到期」、
+   T+1 / T+3 / T+7「已逾期」。飞书发汇总，邮件只发给留了邮箱的提交者。
+   这个开关只影响"以后还发不发"，不影响已发记录 —— 关了再开不会补发当天。 */
+function RemindersCard() {
+  const { settings, saveSettings, notify } = useStore();
+  const enabled = settings?.reminders?.enabled !== false;
+  const [busy, setBusy] = useState(false);
+  const [running, setRunning] = useState(false);
+
+  async function toggle(next: boolean) {
+    setBusy(true);
+    try {
+      await saveSettings({ reminders: { enabled: next } });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runNow() {
+    setRunning(true);
+    try {
+      const r = await api.reminders.run();
+      if (!r.tickets) {
+        notify('今天没有需要提醒的任务（或今天已经提醒过了）');
+      } else {
+        notify(`检查完成：${r.tickets} 条任务，邮件 ${r.mails} 封${r.feishu ? '，飞书已发' : ''}`);
+      }
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '检查失败', 'crit');
+    } finally {
+      setRunning(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHead
+        level={2}
+        title="任务到期提醒"
+        hint="每天 09:00 检查未完成任务：提前一天、到期当天、逾期第 1/3/7 天各提醒一次"
+        right={<Toggle checked={enabled} onChange={(next) => void toggle(next)} disabled={busy} label="启用到期提醒" />}
+      />
+
+      <p className="text-2xs leading-relaxed text-faint">
+        飞书发一条汇总（所有到期任务合在一条里，不刷屏）；邮件只发给留下了邮箱的提交者，用的是上面那套 SMTP 配置。
+        提醒按「任务 + 类型 + 日期」去重，同一天不会重复发送。
+      </p>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <Button variant="soft" onClick={() => void runNow()} disabled={running}>
+          {running ? <Spinner /> : <BellRing size={14} aria-hidden />}
+          立即检查一次
+        </Button>
+        <span className="text-2xs text-faint">当天已提醒过的任务不会重发，可以放心点</span>
+      </div>
+    </Card>
   );
 }

@@ -1,5 +1,5 @@
-import { createHmac } from 'node:crypto';
 import { db, flush, update } from '../store.js';
+import { notifyFeishu, feishuConfigured } from './feishu.js';
 
 /* ── GitHub star 卡片 ─────────────────────────────────────────────────
    监控页上唯一一个"外部世界的数"：某个仓库有多少 star、最近涨得怎么样。
@@ -60,13 +60,12 @@ export function normalizeRepo(input) {
 function configOf() {
   const s = db()?.settings?.stars || {};
   const repo = normalizeRepo(s.repo) || DEFAULT_REPO;
-  const feishuUrl = String(s.feishuUrl || '').trim() || String(process.env.FEISHU_WEBHOOK_URL || '').trim();
-  const feishuSecret = String(s.feishuSecret || '').trim() || String(process.env.FEISHU_WEBHOOK_SECRET || '').trim();
-  return { repo, feishuUrl, feishuSecret };
+  return { repo };
 }
 
-/** 卡片上要说明"没配 webhook 所以只记数"，而不是让人以为通知发过了 */
-export const feishuConfigured = () => Boolean(configOf().feishuUrl);
+/* 卡片上要说明"没配 webhook 所以只记数"，而不是让人以为通知发过了。
+   webhook 的读取与发送统一在 services/feishu.js —— 外部任务提交复用同一条出口 */
+export { feishuConfigured };
 
 /**
  * 当前仓库的采样状态。
@@ -131,41 +130,6 @@ async function fetchRepo(repo) {
 /* ── 飞书 ──────────────────────────────────────────────────────────── */
 
 /**
- * 往飞书自定义机器人发一条文本。
- *
- * 两种机器人形态都支持：只给 URL（无签名校验），或 URL + secret。
- * 如果机器人开了「签名校验」而这里没带 timestamp/sign，飞书会回 19021，
- * 那句话对用户毫无信息量 —— 所以宁可多十行把签名算上。
- */
-async function notifyFeishu(text, cfg) {
-  if (!cfg.feishuUrl) throw new Error('还没有配置飞书 webhook 地址');
-
-  const body = { msg_type: 'text', content: { text } };
-
-  if (cfg.feishuSecret) {
-    const timestamp = String(Math.floor(Date.now() / 1000));
-    /* 飞书的算法：key = `${timestamp}\n${secret}`，内容为空，HMAC-SHA256 后 base64 */
-    body.timestamp = timestamp;
-    body.sign = createHmac('sha256', `${timestamp}\n${cfg.feishuSecret}`).update('').digest('base64');
-  }
-
-  const res = await fetch(cfg.feishuUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  }).catch((err) => {
-    throw new Error(`连不上飞书 webhook：${err?.cause?.code || err?.message || err}`);
-  });
-
-  const json = await res.json().catch(() => null);
-  const code = json?.code ?? json?.StatusCode;
-  if (!res.ok || (code != null && code !== 0)) {
-    throw new Error(`飞书返回 HTTP ${res.status}${code != null ? ` code=${code}` : ''}${json?.msg ? `（${json.msg}）` : ''}`);
-  }
-}
-
-/**
  * 发一条测试消息。
  *
  * 存在的理由：webhook 地址填错、机器人被移出群、开了签名校验却没给 secret ——
@@ -173,8 +137,7 @@ async function notifyFeishu(text, cfg) {
  * 一个按钮就能当场确认这条通道通不通。
  */
 export async function sendTestNotification() {
-  const cfg = configOf();
-  await notifyFeishu('【个人工作台】飞书通知已连通。\nstar 有新增时会发到这个群。', cfg);
+  await notifyFeishu('【个人工作台】飞书通知已连通。\nstar 有新增时会发到这个群。');
 }
 
 /* ── 采集 ──────────────────────────────────────────────────────────── */
@@ -232,7 +195,7 @@ export async function collectStars() {
   if (pending > 0) {
     const text = `${cfg.repo} 新增 ${pending} 个 star（当前 ${repo.stars}）\nhttps://github.com/${cfg.repo}`;
     try {
-      await notifyFeishu(text, cfg);
+      await notifyFeishu(text);
       update((d) => {
         d.githubStars = { ...d.githubStars, pending: 0, notify: { at: new Date().toISOString(), ok: true, delta: pending, error: null } };
       });
@@ -286,6 +249,6 @@ export function starsReport() {
     history: Array.isArray(s.history) ? s.history.slice(-HISTORY_MAX) : [],
     notify: s.notify && typeof s.notify === 'object' ? s.notify : null,
     error: s.error || null,
-    feishuConfigured: Boolean(cfg.feishuUrl),
+    feishuConfigured: feishuConfigured(),
   };
 }

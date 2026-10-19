@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS `tickets` (
   `owner`       VARCHAR(80)   NOT NULL DEFAULT '' COMMENT '负责人',
   `due`         VARCHAR(40)   NOT NULL DEFAULT '' COMMENT '截止时间',
   `note`        TEXT          NULL COMMENT '备注：纯文本，可内嵌 ![名字](att:ID) 图片引用',
+  -- 来源。空串 = 面板里手动建的；external = 从公开外链投递进来的。
+  -- 外链是面向公网的写入口，任务卡上要能一眼认出哪些不是自己建的。
+  `source`      VARCHAR(16)   NOT NULL DEFAULT '' COMMENT '来源：空=面板，external=外链',
+  -- 提交者的联系方式。放在列上而不是只写进备注：任务完成时要按它发邮件。
+  `contact`     VARCHAR(160)  NOT NULL DEFAULT '' COMMENT '外链提交者的联系方式',
   `tags`        JSON          NULL COMMENT '标签数组',
   `checklist`   JSON          NULL COMMENT '子任务数组 [{id,text,done}]',
   `archived_at` DATETIME(3)   NULL COMMENT '归档时间（UTC），非空即已归档',
@@ -45,6 +50,31 @@ CREATE TABLE IF NOT EXISTS `tickets` (
   KEY `idx_tickets_sort` (`sort_order`),
   KEY `idx_tickets_deleted` (`deleted_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='任务';
+
+-- 外部任务提交链接：一条链接只对应一个项目，是**公网上的写入口**。
+-- 刻意不放进 store 的内存镜像：它不在首屏数据里，改动是"低频写 + 高频读一行"，
+-- 而且 token 属于凭据，没必要随 /bootstrap 整包发给前端。
+-- token 明文存：管理员要能随时复制链接；真正的防护是「可停用、可过期、可轮换」，
+-- 外加提交侧的限速与字段白名单（见 services/public-links.js）。
+CREATE TABLE IF NOT EXISTS `public_links` (
+  `id`           VARCHAR(48)  NOT NULL,
+  `token`        VARCHAR(64)  NOT NULL COMMENT '外链凭据（base64url，32 字节）',
+  `project`      VARCHAR(80)  NOT NULL COMMENT '投递到哪个项目（任务侧按名字关联）',
+  `section`      VARCHAR(120) NOT NULL DEFAULT '' COMMENT '项目分类名，空表示不归类',
+  `label`        VARCHAR(80)  NOT NULL DEFAULT '' COMMENT '链接备注名，显示在公开页上',
+  `enabled`      TINYINT      NOT NULL DEFAULT 1 COMMENT '停用后立即失效',
+  `notify`       TINYINT      NOT NULL DEFAULT 1 COMMENT '提交后是否推飞书',
+  `max_uses`     INT          NULL COMMENT '总提交上限，NULL = 不限',
+  `uses`         INT          NOT NULL DEFAULT 0 COMMENT '累计提交数',
+  `day_key`      CHAR(10)     NOT NULL DEFAULT '' COMMENT 'UTC 日期 yyyy-mm-dd',
+  `day_count`    INT          NOT NULL DEFAULT 0 COMMENT '当日提交数，防刷用',
+  `expires_at`   DATETIME(3)  NULL COMMENT '过期时间（UTC），NULL = 不过期',
+  `last_used_at` DATETIME(3)  NULL,
+  `created_at`   DATETIME(3)  NULL,
+  `updated_at`   DATETIME(3)  NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_public_link_token` (`token`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='外部任务提交链接';
 
 -- 任务的评论 / 动态流。
 --
@@ -105,6 +135,20 @@ CREATE TABLE IF NOT EXISTS `ticket_attachments` (
   UNIQUE KEY `uk_attachment_id` (`id`),
   KEY `idx_attachment_ticket` (`ticket_id`, `seq`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='任务附件';
+
+-- 到期提醒的发送记录。
+-- 唯一键（ticket_id, kind, sent_on）是去重的关键：服务重启、手动补跑、
+-- 同一天跑两次，都不会把同一条提醒发两遍。
+CREATE TABLE IF NOT EXISTS `ticket_reminders` (
+  `seq`        BIGINT      NOT NULL AUTO_INCREMENT COMMENT '单调递增序号',
+  `ticket_id`  VARCHAR(48) NOT NULL COMMENT '任务 ID',
+  `kind`       VARCHAR(20) NOT NULL COMMENT 'due_soon / due_today / overdue',
+  `sent_on`    DATE        NOT NULL COMMENT '发送日期（本地日期）',
+  `created_at` DATETIME(3) NOT NULL COMMENT '记录时间（UTC）',
+  PRIMARY KEY (`seq`),
+  UNIQUE KEY `uk_reminder` (`ticket_id`, `kind`, `sent_on`),
+  KEY `idx_reminder_day` (`sent_on`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='任务到期提醒记录';
 
 CREATE TABLE IF NOT EXISTS `bookmark_groups` (
   `id`         VARCHAR(48) NOT NULL COMMENT '分组 ID',

@@ -41,6 +41,11 @@ const ADDITIVE_COLUMNS = [
      而"这一列是我后加的"这件事只有这里记得住。
      这正是本次修的缺口：它原本两边都没有，于是全新初始化的库一播种就失败。 */
   ['tickets', 'section', "VARCHAR(120) NOT NULL DEFAULT '' COMMENT '项目分类名' AFTER `project`"],
+  /* 任务来源。老库补上这一列后所有行都是空串，也就是「都是面板里建的」—— 正好成立 */
+  ['tickets', 'source', "VARCHAR(16) NOT NULL DEFAULT '' COMMENT '来源：空=面板，external=外链' AFTER `note`"],
+  /* 外链提交者的联系方式。放在列上而不是只埋在备注正文里：
+     任务完成时要按它发邮件，从一段自由文本里再把人捞出来太脆 */
+  ['tickets', 'contact', "VARCHAR(160) NOT NULL DEFAULT '' COMMENT '外链提交者的联系方式' AFTER `source`"],
   /* 知识库正文从 steps 数组改成 Markdown：老库要补这两列，
      已有的 steps 由 store.js 启动时做一次搬迁，见 services/knowledge.js */
   ['knowledge_items', 'body', "MEDIUMTEXT NULL COMMENT 'Markdown 正文' AFTER `steps`"],

@@ -239,6 +239,12 @@ export function defaultData() {
          （.env 里的 FEISHU_WEBHOOK_URL 作为兜底，老部署不必改）。
          签名密钥是机器人开了「签名校验」才用的，同样可以留空。 */
       stars: { repo: 'yjscloud/ProxCenter', feishuUrl: '', feishuSecret: '' },
+      /* 邮件通知：外链提交的任务被标记完成时，给提交者发一封信。
+         留空 = 不发；.env 里的 SMTP_* 作为兜底（老部署不必改设置）。 */
+      mail: { host: '', port: 465, secure: true, user: '', pass: '', from: '', notifyTo: '' },
+      /* 到期提醒总开关。默认开：提醒本来就是"设了截止日期就该有人管"，
+         真嫌吵的人自己去关。 */
+      reminders: { enabled: true },
       // Home Assistant：整机功耗与用电的实测来源（米家插座 → Xiaomi Home 集成）
       ha: {
         // 注意：这里没有 token —— 长期访问令牌只从环境变量 HA_TOKEN 读，不进库

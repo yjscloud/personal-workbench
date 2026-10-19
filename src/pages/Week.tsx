@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronRight,
   GripVertical,
+  Link2,
   ListChecks,
   MessageSquare,
   MoreVertical,
@@ -33,8 +34,9 @@ import {
   type TicketStatus,
 } from '@/lib/api';
 import { cls, daysUntil, fmtBytes, fmtDate, fmtRelative } from '@/lib/format';
-import { Button, Empty, Field, Input, Meter, Segmented, Select, Skeleton, Spinner, Textarea } from '@/components/ui';
+import { Button, Empty, Field, Input, Meter, Modal, Segmented, Select, Skeleton, Spinner, Textarea } from '@/components/ui';
 import { ProjectBoard } from '@/components/ProjectBoard';
+import { PublicLinksPanel } from '@/components/PublicLinksPanel';
 import {
   ADVANCE_LABEL,
   REVERT_LABEL,
@@ -304,6 +306,8 @@ export default function Week() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   /** 彻底删除前的确认。不可恢复的操作不能一点就走 */
   const [purgeOpen, setPurgeOpen] = useState(false);
+  /* 外部提交链接的管理弹窗。它属于「任务」这一段配置，放任务计划页比放设置页好找 */
+  const [linksOpen, setLinksOpen] = useState(false);
   const [undo, setUndo] = useState<{ id: string; prev: TicketStatus; title: string } | null>(null);
 
   const [mon, sun] = weekRange();
@@ -576,6 +580,7 @@ export default function Week() {
           filtersActive={filtersActive}
           onClearFilters={clearFilters}
           onCreate={() => setCreating('todo')}
+          onLinks={() => setLinksOpen(true)}
           bucket={bucket}
           onBucket={setBucket}
         />
@@ -699,6 +704,11 @@ export default function Week() {
         }}
         onLifecycle={lifecycle}
       />
+
+      {/* 外部提交链接：属于「任务」这一段配置，所以放在本页工具条里 */}
+      <Modal open={linksOpen} onClose={() => setLinksOpen(false)} title="外部提交链接" width="max-w-2xl">
+        <PublicLinksPanel />
+      </Modal>
 
       {/* 彻底删除的确认。文案把「不可恢复」和波及范围（动态 / 附件）写清楚，
           比只丢一句「确定删除吗」有用得多 —— 这是整条流程里唯一撤不回来的动作 */}
@@ -1011,6 +1021,7 @@ function Toolbar({
   filtersActive,
   onClearFilters,
   onCreate,
+  onLinks,
   bucket,
   onBucket,
 }: {
@@ -1037,6 +1048,7 @@ function Toolbar({
   filtersActive: boolean;
   onClearFilters: () => void;
   onCreate: () => void;
+  onLinks: () => void;
   bucket: Bucket;
   onBucket: (b: Bucket) => void;
 }) {
@@ -1082,6 +1094,10 @@ function Toolbar({
               { value: 'all', label: '全部' },
             ]}
           />
+          <Button size="sm" variant="soft" onClick={onLinks}>
+            <Link2 size={13} />
+            外链
+          </Button>
           <Button size="sm" variant="primary" onClick={onCreate}>
             <Plus size={13} />
             新建任务
@@ -2167,6 +2183,13 @@ function TaskCard({
 
       <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-2xs text-faint">
         <span className="truncate max-w-[8rem]">{ticket.project?.trim() || '未归类'}</span>
+        {/* 外链投进来的任务：不拦、不特殊处理，但得让人知道它不是自己建的 */}
+        {ticket.source === 'external' ? (
+          <span className="inline-flex items-center gap-0.5" title="从外部提交链接投递进来">
+            <Link2 size={11} aria-hidden />
+            外部
+          </span>
+        ) : null}
         {checklist.length ? (
           <span className={cls('num inline-flex items-center gap-0.5', checklistDone === checklist.length ? 'text-ok' : '')}>
             <ListChecks size={11} />

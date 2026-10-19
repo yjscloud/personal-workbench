@@ -7,11 +7,13 @@ import cors from 'cors';
 import cron from 'node-cron';
 
 import { router } from './routes.js';
+import { publicRouter } from './routes-public.js';
 import { authEnabled, currentUser } from './services/auth.js';
 import { initStore, closeStore, db, dbInfo, dbStats, flush } from './store.js';
 import { DB_LABEL } from './db/config.js';
 import { refreshNews, newsStale } from './services/news.js';
 import { collectStars, ensureStarsFresh } from './services/github-stars.js';
+import { runDueReminders } from './services/reminders.js';
 import { startSampler, stopSampler } from './services/sampler.js';
 import { purgeOldKnowledge, purgeOldMonitoringData, purgeOldNews } from './services/retention.js';
 import { applyBackupSchedule } from './services/backup.js';
@@ -27,6 +29,42 @@ app.disable('x-powered-by');
    这样 req.ip 拿到的是真实客户端 IP（登录失败限速按它计），
    X-Forwarded-Proto 也才会被采纳（决定 cookie 要不要加 Secure）。 */
 app.set('trust proxy', 'loopback');
+
+/* ── 公开外链：唯一一个不登录的写入口 ────────────────────────────────
+   挂在全局 express.json / cors / 登录守卫之前，理由是三件事都由它自己定：
+   1. 请求体上限 32KB（面板用的是 4MB，对外链太宽松了）；
+   2. 不加 cors()：跨站页面拿不到响应头，等于默认只允许同源调用；
+   3. 不依赖会话，也不该被会话逻辑拦住。
+   响应头一并收窄：这条 URL 本身就是凭据，不能进 Referer、不能被搜索引擎收录。 */
+app.use(
+  '/api/public',
+  (_req, res, next) => {
+    res.set('Referrer-Policy', 'no-referrer');
+    res.set('X-Robots-Tag', 'noindex, nofollow');
+    res.set('Cache-Control', 'no-store');
+    next();
+  },
+  /* 8MB：外链允许带最多 3 个附件、单个 1.5MB，base64 后约 6MB。
+     比全局的 4MB 宽，但只宽在这一个前缀上，且仍受路由里的数量 / 类型校验。 */
+  express.json({ limit: '8mb' }),
+  publicRouter,
+  /* 请求体超限 / JSON 语法错误：这两个错必须停在公开路由里，
+     不能让它们落到全局错误处理器变成一句 500（原文还是英文的） */
+  (err, _req, res, _next) => {
+    if (err?.type === 'entity.too.large') {
+      return res.status(413).json({ ok: false, error: '附件太大了，请压缩或减少数量后重试' });
+    }
+    res.status(400).json({ ok: false, error: '请求格式不正确' });
+  },
+);
+/* 公开提交页同样不收录、不把 token 泄露给任何外链资源 */
+app.use('/s', (_req, res, next) => {
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('X-Robots-Tag', 'noindex, nofollow');
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+
 app.use(cors());
 app.use(express.json({ limit: '4mb' }));
 
@@ -159,6 +197,22 @@ function applyStarSchedule() {
 const RETENTION_CRON = '20 4 * * *';
 let retentionJob = null;
 
+/* ── 定时任务：任务到期提醒 ─────────────────────────────────────────
+   每天 09:00 扫一遍未完成任务：T-1「明天到期」、T0「今天到期」、
+   T+1/T+3/T+7「已逾期」。飞书发一条汇总，邮件发给留了邮箱的提交者。
+   开关在设置页（reminders.enabled），任务本身照常排班 —— 关掉再打开时
+   不会把当天已经发过的补一遍（去重靠 ticket_reminders 的唯一键）。 */
+const REMINDER_CRON = '0 9 * * *';
+let reminderJob = null;
+
+function applyReminderSchedule() {
+  if (reminderJob) return;
+  reminderJob = cron.schedule(REMINDER_CRON, () => {
+    runDueReminders().catch((err) => console.error('[reminders] 检查失败：', err.message));
+  });
+  console.log(`[reminders] 已启用到期提醒，计划：${REMINDER_CRON}`);
+}
+
 function applyRetentionSchedule() {
   if (retentionJob) return;
   retentionJob = cron.schedule(RETENTION_CRON, () => {
@@ -227,6 +281,7 @@ async function bootstrap() {
     applyNewsSchedule();
     applyRetentionSchedule();
     applyStarSchedule();
+    applyReminderSchedule();
 
     /* 停机期间错过的 star 采集，起来就补一次。不补的话卡片的空窗期不是
        12 小时，而是"从上次跑到下一个整点" —— 部署当天可能一整天都是空的 */

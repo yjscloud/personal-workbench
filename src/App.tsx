@@ -30,6 +30,9 @@ const KnowledgeEditor = lazy(() => import('./pages/Knowledge').then((m) => ({ de
    不进首屏，也不跟知识库那几页一起失效 */
 const KnowledgeGraph = lazy(() => import('./pages/KnowledgeGraph'));
 const Settings = lazy(() => import('./pages/Settings'));
+/* 公开提交页：不需要登录，也必须**不套** AppProvider ——
+   那个 provider 一挂载就去拉 /bootstrap，在公开页上只会换来一串 401。 */
+const PublicSubmit = lazy(() => import('./pages/PublicSubmit'));
 
 /**
  * 登录关卡。
@@ -54,36 +57,47 @@ function AuthGate({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+/** 面板本体：登录关卡 + 业务数据 + 各个页面 */
+function PanelApp() {
+  return (
+    <AuthProvider>
+      <AuthGate>
+        <AppProvider>
+          <MonitorProvider>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route index element={<Dashboard />} />
+                <Route path="week" element={<Week />} />
+                <Route path="monitoring" element={<Monitoring />} />
+                <Route path="toolbox" element={<Toolbox />} />
+                <Route path="news" element={<News />} />
+                <Route path="knowledge" element={<Knowledge />} />
+                <Route path="office" element={<Office />} />
+                {/* 顺序无关紧要：react-router 会把静态段 /new 排在 :id 之前，
+                    所以它不会被当成一个 id 叫 "new" 的条目 */}
+                <Route path="knowledge/new" element={<KnowledgeEditor />} />
+                <Route path="knowledge/graph" element={<KnowledgeGraph />} />
+                <Route path="knowledge/:id" element={<KnowledgeDoc />} />
+                <Route path="knowledge/:id/edit" element={<KnowledgeEditor />} />
+                <Route path="settings" element={<Settings />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Route>
+            </Routes>
+          </MonitorProvider>
+        </AppProvider>
+      </AuthGate>
+    </AuthProvider>
+  );
+}
+
 export default function App() {
   return (
     <BrowserRouter>
-      <AuthProvider>
-        <AuthGate>
-          <AppProvider>
-            <MonitorProvider>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route index element={<Dashboard />} />
-                  <Route path="week" element={<Week />} />
-                  <Route path="monitoring" element={<Monitoring />} />
-                  <Route path="toolbox" element={<Toolbox />} />
-                  <Route path="news" element={<News />} />
-                  <Route path="knowledge" element={<Knowledge />} />
-                  <Route path="office" element={<Office />} />
-                  {/* 顺序无关紧要：react-router 会把静态段 /new 排在 :id 之前，
-                      所以它不会被当成一个 id 叫 "new" 的条目 */}
-                  <Route path="knowledge/new" element={<KnowledgeEditor />} />
-                  <Route path="knowledge/graph" element={<KnowledgeGraph />} />
-                  <Route path="knowledge/:id" element={<KnowledgeDoc />} />
-                  <Route path="knowledge/:id/edit" element={<KnowledgeEditor />} />
-                  <Route path="settings" element={<Settings />} />
-                  <Route path="*" element={<Navigate to="/" replace />} />
-                </Route>
-              </Routes>
-            </MonitorProvider>
-          </AppProvider>
-        </AuthGate>
-      </AuthProvider>
+      <Routes>
+        {/* 公开外链：在登录关卡之外，拿不到任何面板数据 */}
+        <Route path="/s/:token" element={<PublicSubmit />} />
+        <Route path="/*" element={<PanelApp />} />
+      </Routes>
     </BrowserRouter>
   );
 }

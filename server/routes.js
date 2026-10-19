@@ -34,6 +34,8 @@ import { askAboutNews, cachedBody, unreadableHosts } from './services/reader.js'
 import { usageSnapshot } from './services/ai-usage.js';
 import { balanceReport, deepseekConfigured } from './services/deepseek.js';
 import { collectStars, DEFAULT_REPO, normalizeRepo, sendTestNotification, starsReport } from './services/github-stars.js';
+import { notifyTicketDone, sendTestMail } from './services/mail.js';
+import { runDueReminders } from './services/reminders.js';
 import { probeSiteColor } from './services/sitecolor.js';
 import { fetchSiteIcon } from './services/siteicon.js';
 import { suggestSource, fetchSuggest } from './services/suggest.js';
@@ -71,6 +73,15 @@ import {
   countAttachments,
 } from './db/attachments.js';
 import { listProjects, getProject, addProject, patchProject, removeProject, countProjects } from './db/projects.js';
+import { createTicket, normalizeTags, normalizeChecklist, PRIORITIES, TICKET_STATUS } from './services/tickets.js';
+import {
+  listLinks,
+  addLink,
+  patchLink,
+  rotateLink,
+  removeLink,
+  getLink,
+} from './db/public-links.js';
 import {
   listSections,
   listAllSections,
@@ -216,6 +227,13 @@ function maskSettings(settings) {
       feishuSecret: settings.stars?.feishuSecret ? MASK : '',
       hasFeishuSecret: Boolean(settings.stars?.feishuSecret),
     },
+    /* SMTP 密码同理：只回掩码 + 布尔，改它必须重新敲一遍 */
+    mail: {
+      ...settings.mail,
+      pass: settings.mail?.pass ? MASK : '',
+      hasPass: Boolean(settings.mail?.pass),
+    },
+    reminders: { enabled: settings.reminders?.enabled !== false },
     ha: {
       ...ha,
       url: cfg.url,
@@ -548,36 +566,8 @@ router.post(
 );
 
 /* ── 任务 ──────────────────────────────────────────────────── */
-const TICKET_STATUS = ['todo', 'doing', 'review', 'done'];
-const PRIORITIES = ['P0', 'P1', 'P2', 'P3'];
-
-/** 标签规范化：去重、限长、限数量，别让脏数据进库 */
-function normalizeTags(input) {
-  if (!Array.isArray(input)) return undefined;
-  const seen = new Set();
-  const out = [];
-  for (const raw of input) {
-    const tag = String(raw ?? '').trim().slice(0, 24);
-    if (!tag || seen.has(tag)) continue;
-    seen.add(tag);
-    out.push(tag);
-    if (out.length >= 10) break;
-  }
-  return out;
-}
-
-/** 子任务规范化：丢掉空文本、补 ID、限条数 */
-function normalizeChecklist(input) {
-  if (!Array.isArray(input)) return undefined;
-  return input
-    .slice(0, 50)
-    .map((item, i) => ({
-      id: String(item?.id || `ck_${i + 1}`).slice(0, 48),
-      text: String(item?.text ?? '').trim().slice(0, 200),
-      done: Boolean(item?.done),
-    }))
-    .filter((item) => item.text);
-}
+/* 新建任务的规则（含标签 / 子任务规范化）放在 services/tickets.js：
+   公开外链也走那一段，两边不能各写一份。 */
 
 /**
  * 把一份 patch 应用到单个任务上。批量与单条共用同一套规则，避免两边慢慢漂移。
@@ -611,40 +601,8 @@ router.get('/tickets', (_req, res) => ok(res, db().tickets));
 router.post(
   '/tickets',
   wrap(async (req, res) => {
-    const {
-      title,
-      priority = 'P2',
-      status = 'todo',
-      project = '',
-      section = '',
-      owner = '',
-      due = '',
-      note = '',
-    } = req.body || {};
-    if (!title || !String(title).trim()) return fail(res, 400, '任务标题不能为空');
-    const maxSeq = db().tickets.reduce((m, t) => {
-      const n = Number(String(t.id).replace(/\D/g, ''));
-      return Number.isFinite(n) ? Math.max(m, n) : m;
-    }, 1000);
-    const ticket = {
-      id: `WO-${maxSeq + 1}`,
-      title: String(title).trim().slice(0, 200),
-      priority: PRIORITIES.includes(priority) ? priority : 'P2',
-      status: TICKET_STATUS.includes(status) ? status : 'todo',
-      project: String(project).slice(0, 80),
-      // section 必须一起初始化：缺了这个字段，新建的任务在项目视图里会归不了组
-      section: String(section).slice(0, 120),
-      owner: String(owner).slice(0, 80),
-      due: String(due).slice(0, 40),
-      // 与 PATCH 的口径保持一致：备注要装图片引用，1000 字符会被静默截断
-      note: String(note).slice(0, 20000),
-      tags: normalizeTags(req.body?.tags) || [],
-      checklist: normalizeChecklist(req.body?.checklist) || [],
-      archivedAt: null,
-      deletedAt: null,
-      createdAt: new Date().toISOString(),
-    };
-    update((d) => d.tickets.unshift(ticket));
+    if (!req.body?.title || !String(req.body.title).trim()) return fail(res, 400, '任务标题不能为空');
+    const ticket = createTicket(req.body);
     ok(res, ticket);
   }),
 );
@@ -662,14 +620,20 @@ router.patch(
     if (!patch || typeof patch !== 'object' || !Object.keys(patch).length) return fail(res, 400, '没有要修改的内容');
 
     const updated = [];
+    /* 这一批里刚刚变成「已完成」的。只有状态**变化**的那一次才发邮件：
+       反复保存一条已完成的任务不该反复打扰提交者。 */
+    const justDone = [];
     update((d) => {
       for (const t of d.tickets) {
         if (!ids.includes(t.id)) continue;
+        const wasDone = t.status === 'done';
         applyTicketPatch(t, patch);
         updated.push(t);
+        if (!wasDone && t.status === 'done') justDone.push(t);
       }
     });
     if (!updated.length) return fail(res, 404, '没有找到选中的任务');
+    for (const t of justDone) void notifyTicketDone(t);
     ok(res, { updated: updated.length, tickets: updated });
   }),
 );
@@ -713,13 +677,18 @@ router.patch(
   '/tickets/:id',
   wrap(async (req, res) => {
     let updated = null;
+    let wasDone = false;
     update((d) => {
       const t = d.tickets.find((x) => x.id === req.params.id);
       if (!t) return;
+      wasDone = t.status === 'done';
       applyTicketPatch(t, req.body || {});
       updated = t;
     });
     if (!updated) return fail(res, 404, '任务不存在');
+    /* 外链提交的任务完成时给提交者发邮件。通知是尽力而为，不 await，
+       发不出去也不能让「标记完成」这个动作失败 */
+    if (!wasDone && updated.status === 'done') void notifyTicketDone(updated);
     ok(res, updated);
   }),
 );
@@ -991,6 +960,98 @@ router.delete(
       });
     }
     ok(res, { removed: 1, clearedTasks: cleared });
+  }),
+);
+
+/* ── 外部提交链接 ─────────────────────────────────────────────────── */
+/* 管理端：这里全是登录后的接口。公开侧只有 routes-public.js 的那两个端点，
+   两边共用 db/public-links.js，但权限完全不同。 */
+
+async function requireProject(name) {
+  const clean = String(name || '').trim().slice(0, 80);
+  if (!clean) return { error: '先选一个项目' };
+  const projects = await listProjects();
+  if (!projects.some((p) => p.name === clean)) return { error: `项目「${clean}」不存在` };
+  return { name: clean };
+}
+
+/** 过期时间只收 ISO 或空。非法值不静默丢弃 —— 那会变成"以为设了、其实没设" */
+function normalizeExpiry(value) {
+  if (value === null || value === undefined || value === '') return { value: null };
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return { error: '过期时间格式不对' };
+  return { value: d.toISOString() };
+}
+
+router.get(
+  '/public-links',
+  wrap(async (_req, res) => ok(res, { links: await listLinks() })),
+);
+
+router.post(
+  '/public-links',
+  wrap(async (req, res) => {
+    const target = await requireProject(req.body?.project);
+    if (target.error) return fail(res, 400, target.error);
+
+    const expiry = normalizeExpiry(req.body?.expiresAt);
+    if (expiry.error) return fail(res, 400, expiry.error);
+
+    const link = await addLink({
+      project: target.name,
+      section: String(req.body?.section || '').trim().slice(0, 120),
+      label: String(req.body?.label || '').trim().slice(0, 80),
+      notify: req.body?.notify !== false,
+      maxUses: req.body?.maxUses,
+      expiresAt: expiry.value,
+    });
+    ok(res, link);
+  }),
+);
+
+router.patch(
+  '/public-links/:id',
+  wrap(async (req, res) => {
+    const before = await getLink(req.params.id);
+    if (!before) return fail(res, 404, '链接不存在');
+
+    const patch = {};
+    if (req.body?.project !== undefined) {
+      const target = await requireProject(req.body.project);
+      if (target.error) return fail(res, 400, target.error);
+      patch.project = target.name;
+    }
+    if (req.body?.section !== undefined) patch.section = String(req.body.section).trim().slice(0, 120);
+    if (req.body?.label !== undefined) patch.label = String(req.body.label).trim().slice(0, 80);
+    if (req.body?.enabled !== undefined) patch.enabled = Boolean(req.body.enabled);
+    if (req.body?.notify !== undefined) patch.notify = Boolean(req.body.notify);
+    if (req.body?.maxUses !== undefined) patch.maxUses = req.body.maxUses;
+    if (req.body?.expiresAt !== undefined) {
+      const expiry = normalizeExpiry(req.body.expiresAt);
+      if (expiry.error) return fail(res, 400, expiry.error);
+      patch.expiresAt = expiry.value;
+    }
+
+    ok(res, await patchLink(before.id, patch));
+  }),
+);
+
+/** 换一条 token：旧链接立刻失效。链接被转到不该去的地方时用这个，比删了重建省事 */
+router.post(
+  '/public-links/:id/rotate',
+  wrap(async (req, res) => {
+    const link = await rotateLink(req.params.id);
+    if (!link) return fail(res, 404, '链接不存在');
+    ok(res, link);
+  }),
+);
+
+router.delete(
+  '/public-links/:id',
+  wrap(async (req, res) => {
+    const removed = await removeLink(req.params.id);
+    if (!removed) return fail(res, 404, '链接不存在');
+    ok(res, { removed });
   }),
 );
 
@@ -2058,6 +2119,35 @@ router.put(
         feishuSecret: keepSecret ? db().settings.stars?.feishuSecret || '' : String(sentSecret).slice(0, 200),
       };
     }
+    /* 邮件通知（SMTP）。同样先校验再落库：端口、发件地址错了，
+       表现是"任务完成了但对方没收到"，比直接报错难查得多。 */
+    let nextMail = null;
+    if (incoming.mail) {
+      const raw = incoming.mail;
+      const host = String(raw.host ?? '').trim().slice(0, 200);
+      const port = Number(raw.port || 465);
+      if (!Number.isFinite(port) || port < 1 || port > 65535) {
+        return fail(res, 400, 'SMTP 端口要在 1–65535 之间');
+      }
+      const from = String(raw.from ?? '').trim().slice(0, 200);
+      if (host && !from) return fail(res, 400, '填了 SMTP 服务器就要填发件地址');
+      if (host && !/@/.test(from)) return fail(res, 400, '发件地址要写成 someone@example.com');
+      /* 通知收件人留空就发给发件地址自己；填了就必须是个邮箱 */
+      const notifyTo = String(raw.notifyTo ?? '').trim().slice(0, 200);
+      if (notifyTo && !/@/.test(notifyTo)) return fail(res, 400, '通知收件人要写成 someone@example.com');
+      /* 密码留空或掩码 = 没改过，沿用库里的旧值（与 pve tokenSecret 同一口径） */
+      const sentPass = raw.pass;
+      const keepPass = sentPass === undefined || sentPass === '' || sentPass === MASK;
+      nextMail = {
+        host,
+        port,
+        secure: typeof raw.secure === 'boolean' ? raw.secure : port === 465,
+        user: String(raw.user ?? '').trim().slice(0, 200),
+        pass: keepPass ? db().settings.mail?.pass || '' : String(sentPass).slice(0, 200),
+        from,
+        notifyTo,
+      };
+    }
     const prevRepo = normalizeRepo(db().settings.stars?.repo) || DEFAULT_REPO;
 
     /* 智能办公室那个"打开完整办公室"的链接。
@@ -2176,6 +2266,8 @@ router.put(
         }
       }
       if (nextStars) s.stars = nextStars;
+      if (nextMail) s.mail = nextMail;
+      if (incoming.reminders) s.reminders = { enabled: incoming.reminders.enabled !== false };
       s.updatedAt = new Date().toISOString();
     });
     /* 计划改了要**立刻**生效：定时任务的注册搬到了 services/backup.js，
@@ -2512,6 +2604,27 @@ router.post(
   wrap(async (_req, res) => {
     await sendTestNotification();
     ok(res, { sent: true });
+  }),
+);
+
+/* 发一封测试邮件到指定地址。失败让 wrap 抛出具体原因 ——
+   界面上要的是「连不上 smtp.example.com:465」而不是一个布尔值 */
+router.post(
+  '/mail/test',
+  wrap(async (req, res) => {
+    const to = String(req.body?.to ?? '').trim();
+    if (!to) return fail(res, 400, '先填一个收件地址');
+    await sendTestMail(to);
+    ok(res, { sent: true });
+  }),
+);
+
+/* 手动跑一次到期检查。force 只管"跳过总开关"，当天已发过的仍然不会重发 ——
+   所以这个按钮可以放心点，不会把飞书群和邮箱刷一遍。 */
+router.post(
+  '/reminders/run',
+  wrap(async (_req, res) => {
+    ok(res, await runDueReminders({ force: true }));
   }),
 );
 
