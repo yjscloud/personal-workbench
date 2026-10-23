@@ -12,9 +12,12 @@ import {
   isEmpty,
   resetSignatures,
   primeSignatures,
+  rewriteSettings,
+  settingsNeedEncryption,
   tableStats,
   sync as syncToDb,
 } from './db/repository.js';
+import { decryptSettings, encryptSettings, keyOrigin } from './services/secrets.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -83,6 +86,10 @@ function normalize(input) {
      放在 normalize 里是因为「旧 db.json 导入」和「备份恢复」两条路都经过它 ——
      恢复完不一定重启，不在这儿转就永远漏一条。 */
   normalizeKnowledge(data);
+  /* 导入的备份与旧 db.json 里，凭据可能是密文（导出时就是加密的）。
+     统一换回明文再进内存：解不开时退化成空值并告警，好过让 pve / mail
+     拿着 "enc:v1:..." 去发请求 —— 那种失败看起来像"对方挂了"，最难查。 */
+  data.settings = decryptSettings(data.settings).settings;
   return data;
 }
 
@@ -117,6 +124,17 @@ export async function initStore() {
     resetSignatures();
     primeSignatures(cache);
     result = { seeded: false, source: 'mysql' };
+  }
+
+  /* ── 旧库凭据的一次性加密（AES-256-GCM，见 services/secrets.js）───────
+     升级前 app_settings.payload 里是明文凭据：只要拿到数据库读权限就能
+     一次性拿走 PVE root Token / COS 密钥 / SMTP 授权码。读完内存镜像后
+     回写一行，把明文换成密文。之后每次落库都走同一个加密出口，不需要
+     再跑第二遍；已经是密文时这一步连一条 SQL 都不发。 */
+  console.log(`[secrets] 凭据加密密钥：${keyOrigin()}`);
+  if (settingsNeedEncryption()) {
+    await rewriteSettings(cache);
+    console.log('[db] 设置中的第三方凭据已加密落库');
   }
 
   /* RSS 时代那串 feeds 配置已经没有任何代码读它了（2026-10 换成 AIHOT 单源，
@@ -262,12 +280,17 @@ export async function resetToSeed() {
 }
 
 export function exportAll() {
+  const data = db();
   return {
     exportedAt: new Date().toISOString(),
     app: 'personal-workbench',
     version: 1,
     storage: dbInfo(),
-    data: db(),
+    /* 导出的是文件，一旦被谁捡到就是全部凭据。所以这里不给明文：
+       同一套密文写进去，恢复时由 decryptSettings 解开。
+       代价是换一台机器恢复要带着密钥（SETTINGS_KEY 或 .settings-key），
+       解不开只会让那几项变成空的，配置本身照样回来。 */
+    data: { ...data, settings: encryptSettings(data.settings) },
   };
 }
 

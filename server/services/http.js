@@ -1,6 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
+import net from 'node:net';
 import zlib from 'node:zlib';
+import { resolvePublicTarget } from './ssrf.js';
 
 /* ── 一个够用的出站 GET ────────────────────────────────────────────────
    本项目要访问的外部地址分两类，需求不同，所以这里不引 fetch：
@@ -46,85 +48,122 @@ function decodeBody(buf, encoding) {
 
 /**
  * 取一个 URL 的前 limit 字节。超过上限直接掐断连接，不把整张图拖回来。
+ *
+ * guard=true 是给"地址由用户填、抓的是服务器所在网络"的场景用的
+ * （见 services/ssrf.js）：只允许公网 http/https，每一跳重定向都重新校验，
+ * 并且**连解析出来的 IP**，而不是再让系统解析一次域名。
+ * 站点取色 / 取图标打的是用户自己的内网面板，不能开这个开关。
+ *
  * @returns {Promise<{body: Buffer, url: string, type: string, status: number}>}
  */
-export function fetchBytes(
+export async function fetchBytes(
   url,
-  { limit, timeout = DEFAULT_TIMEOUT_MS, redirects = DEFAULT_REDIRECTS, accept = '*/*', insecure = false } = {},
+  { limit, timeout = DEFAULT_TIMEOUT_MS, redirects = DEFAULT_REDIRECTS, accept = '*/*', insecure = false, guard = false } = {},
 ) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error('地址无法解析');
+  }
+  if (!/^https?:$/.test(parsed.protocol)) throw new Error(`不支持的协议 ${parsed.protocol}`);
+
+  /* 解析 + 校验在建立连接之前完成。失败时抛 SsrfError（code=SSRF_BLOCKED），
+     路由层据此返回一句"这个地址不允许抓取"，而不是把内网细节带出去。 */
+  const pinned = guard ? await resolvePublicTarget(parsed) : null;
+
   return new Promise((resolve, reject) => {
-    let parsed;
-    try {
-      parsed = new URL(url);
-    } catch {
-      return reject(new Error('地址无法解析'));
-    }
-    if (!/^https?:$/.test(parsed.protocol)) return reject(new Error(`不支持的协议 ${parsed.protocol}`));
-
     const mod = parsed.protocol === 'https:' ? https : http;
-    const req = mod.request(
-      parsed,
-      {
-        method: 'GET',
-        headers: { 'User-Agent': BROWSER_UA, Accept: accept, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
-        rejectUnauthorized: !insecure,
-        maxHeaderSize: MAX_HEADER_BYTES,
-        timeout,
-      },
-      (res) => {
-        const status = res.statusCode || 0;
+    const headers = {
+      'User-Agent': BROWSER_UA,
+      Accept: accept,
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    };
+    const options = {
+      method: 'GET',
+      headers,
+      rejectUnauthorized: !insecure,
+      maxHeaderSize: MAX_HEADER_BYTES,
+      timeout,
+    };
 
-        if (status >= 300 && status < 400 && res.headers.location && redirects > 0) {
-          res.resume();
-          let next;
-          try {
-            next = new URL(res.headers.location, parsed).href;
-          } catch {
-            return reject(new Error('重定向地址无法解析'));
-          }
-          return fetchBytes(next, { limit, timeout, redirects: redirects - 1, accept, insecure }).then(resolve, reject);
-        }
-        if (status < 200 || status >= 300) {
-          res.resume();
-          // 4xx/5xx 通常带一页说明，但调用方只需要状态码和一句人话
-          return reject(new Error(describeStatus(status)));
-        }
+    if (pinned) {
+      /* 连 IP、Host 头写域名：校验过的那一个地址就是唯一可能被连的地址 */
+      headers.Host = parsed.host;
+      options.host = pinned.address;
+      options.port = Number(parsed.port) || (parsed.protocol === 'https:' ? 443 : 80);
+      options.path = `${parsed.pathname}${parsed.search}`;
+      /* SNI 与证书校验仍然按域名来；目标本身就是 IP 时不能写 servername，
+         否则 TLS 会拿 IP 去校验证书并报 altname 不匹配 */
+      if (parsed.protocol === 'https:' && !net.isIP(parsed.hostname.replace(/^\[|\]$/g, ''))) {
+        options.servername = parsed.hostname;
+      }
+    }
 
-        const chunks = [];
-        let size = 0;
-        let settled = false;
-        const finish = () => {
-          if (settled) return;
+    const onResponse = (res) => {
+      const status = res.statusCode || 0;
+
+      if (status >= 300 && status < 400 && res.headers.location && redirects > 0) {
+        res.resume();
+        let next;
+        try {
+          next = new URL(res.headers.location, parsed).href;
+        } catch {
+          return reject(new Error('重定向地址无法解析'));
+        }
+        /* 每一跳都重新过 guard —— 首跳公网、第二跳 127.0.0.1 是最常见的绕过 */
+        return fetchBytes(next, { limit, timeout, redirects: redirects - 1, accept, insecure, guard }).then(resolve, reject);
+      }
+      if (status < 200 || status >= 300) {
+        res.resume();
+        // 4xx/5xx 通常带一页说明，但调用方只需要状态码和一句人话
+        return reject(new Error(describeStatus(status)));
+      }
+
+      const chunks = [];
+      let size = 0;
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve({
+          body: decodeBody(Buffer.concat(chunks), res.headers['content-encoding']),
+          url: parsed.href,
+          type: res.headers['content-type'] || '',
+          status,
+        });
+      };
+
+      res.on('data', (c) => {
+        chunks.push(c);
+        size += c.length;
+        if (size >= limit) {
+          res.destroy();
+          finish();
+        }
+      });
+      res.on('end', finish);
+      // 被 destroy 的响应不会触发 end，在上面 finish 兜住；这里只收拾错误
+      res.on('error', (err) => {
+        if (!settled) {
           settled = true;
-          resolve({
-            body: decodeBody(Buffer.concat(chunks), res.headers['content-encoding']),
-            url: parsed.href,
-            type: res.headers['content-type'] || '',
-            status,
-          });
-        };
+          reject(err);
+        }
+      });
+    };
 
-        res.on('data', (c) => {
-          chunks.push(c);
-          size += c.length;
-          if (size >= limit) {
-            res.destroy();
-            finish();
-          }
-        });
-        res.on('end', finish);
-        // 被 destroy 的响应不会触发 end，在上面 finish 兜住；这里只收拾错误
-        res.on('error', (err) => {
-          if (!settled) {
-            settled = true;
-            reject(err);
-          }
-        });
-      },
-    );
+    /* 传 URL 与传 options 是两种调用形态：pinned 时所有字段都在 options 里，
+       不能再把 options 当 URL 传进去（会被当成 url 参数解析）。 */
+    const req = pinned ? mod.request(options, onResponse) : mod.request(parsed, options, onResponse);
 
     req.on('timeout', () => req.destroy(new Error(`请求超时（${Math.round(timeout / 1000)} 秒）`)));
-    req.on('error', reject);
+    req.on('error', (err) => {
+      /* guard 模式下底层错误里带着 IP:端口（ECONNREFUSED 127.0.0.1:6379），
+         原样回显就等于送了一个端口扫描器。统一成一句人话。 */
+      if (!guard) return reject(err);
+      const timeoutHit = /超时/.test(err.message || '');
+      reject(new Error(timeoutHit ? '抓取失败：对方响应超时' : '抓取失败：这个地址没有响应（可能不可达，或不是网页服务）'));
+    });
     req.end();
   });
 }

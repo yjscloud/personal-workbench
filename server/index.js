@@ -22,6 +22,13 @@ import { refreshBackground } from './services/background.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const PORT = Number(process.env.PORT || 8787);
+/* 监听地址。默认只听回环：对外由 nginx 的 443 反代进来。
+ *
+ * 以前这里是 app.listen(PORT) —— 等于 0.0.0.0，于是局域网里任何人都能绕过
+ * HTTPS 直接访问完整 API（登录接口也在里面），明文口令与 Cookie 可被嗅探。
+ * 容器部署若需要映射端口，显式设 HOST=0.0.0.0 并只映射到宿主回环：
+ *   docker run -p 127.0.0.1:8787:8787 -e HOST=0.0.0.0 ... */
+const HOST = process.env.HOST || '127.0.0.1';
 
 const app = express();
 app.disable('x-powered-by');
@@ -256,10 +263,10 @@ async function bootstrap() {
   const info = dbInfo();
   const data = db();
 
-  const server = app.listen(PORT, async () => {
+  const server = app.listen(PORT, HOST, async () => {
     console.log('');
     console.log('  个人工作台 · 服务已启动');
-    console.log(`  API      http://127.0.0.1:${PORT}/api`);
+    console.log(`  API      http://${HOST === '0.0.0.0' ? '127.0.0.1' : HOST}:${PORT}/api${HOST === '0.0.0.0' ? '（监听所有网卡）' : ''}`);
     console.log(`  数据库    MySQL · ${DB_LABEL}`);
     if (seeded) {
       console.log(`  初始化    已写入 ${source === 'legacy-json' ? '旧 db.json 迁移数据' : '示例数据'}`);

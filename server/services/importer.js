@@ -268,6 +268,13 @@ export async function importFromUrl(rawUrl, options = {}) {
   const input = String(rawUrl || '').trim();
   if (!input) throw new Error('请填一个网址');
 
+  /* 带了明确的 scheme 但不是 http(s)（file://、gopher://、data:…）直接拒。
+     不能先补 https:// 再交给 URL 解析 —— 那会把 file:///etc/passwd 拼成
+     https://file:///etc/passwd，报出来的是一句莫名其妙的"域名找不到"。 */
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(input) && !/^https?:\/\//i.test(input)) {
+    throw new Error('只支持 http / https 地址');
+  }
+
   let target;
   try {
     target = new URL(/^https?:\/\//i.test(input) ? input : `https://${input}`);
@@ -285,6 +292,9 @@ export async function importFromUrl(rawUrl, options = {}) {
     accept: 'text/html,application/xhtml+xml,*/*',
     // 打的是公网，证书该校验就校验（和站点取色那边的取舍正相反）
     insecure: false,
+    /* URL 是用户填的，而请求是服务器替他去发的：不设防就等于把 127.0.0.1、
+       内网段和云元数据地址都变成可读页面。逐跳校验见 services/ssrf.js。 */
+    guard: true,
   });
 
   const type = page.type || '';

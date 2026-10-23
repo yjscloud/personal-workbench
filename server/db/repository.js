@@ -1,5 +1,6 @@
 import { pool } from './connection.js';
 import { BODY_MAX, normalizeType } from '../services/knowledge.js';
+import { decryptSettings, encryptSettings } from '../services/secrets.js';
 
 /* ── 值转换 ────────────────────────────────────────────────────────── */
 
@@ -298,7 +299,18 @@ const SINGLETONS = [
     name: 'settings',
     table: 'app_settings',
     columns: ['id', 'payload', 'updated_at'],
-    rows: (d) => [{ id: 1, payload: toJson(d.settings ?? {}), updated_at: toDate(d.settings?.updatedAt) ?? new Date(0) }],
+    /* 落库前把凭据换成密文（见 services/secrets.js）。内存镜像里始终是明文，
+       只有这一处出口写密文 —— 于是"谁能读到库"和"谁能用这些凭据"被分开了。
+       接口返回的掩码是另一回事：那只挡页面，不挡数据库。 */
+    rows: (d) => [
+      {
+        id: 1,
+        payload: toJson(encryptSettings(d.settings ?? {})),
+        updated_at: toDate(d.settings?.updatedAt) ?? new Date(0),
+      },
+    ],
+    /* 密文带随机 IV，用它算指纹会导致"每次都变"，见 settingsSignature 的注释 */
+    signature: (d) => settingsSignature(d.settings),
   },
   {
     name: 'news_state',
@@ -470,6 +482,14 @@ async function replaceTable(conn, table, columns, rows, keyCols) {
 /* 上一次成功落库时的数据指纹：内容没变的表直接跳过，避免每次写请求全表重写 */
 const savedSignature = new Map();
 
+/* 读到过没加密的旧凭据。启动时据此回写一次，把明文换成密文。
+   用模块级变量而不是改 loadAll 的返回形状 —— 那个返回值在别处被直接使用 */
+let settingsPlaintext = false;
+
+export function settingsNeedEncryption() {
+  return settingsPlaintext;
+}
+
 export function resetSignatures() {
   savedSignature.clear();
 }
@@ -479,16 +499,27 @@ export function primeSignatures(data) {
   for (const step of buildPlan(data)) savedSignature.set(step.name, step.signature);
 }
 
+/**
+ * settings 的指纹取明文，不能取落库行。
+ *
+ * 行里是密文，而 GCM 每次加密都换 IV —— 拿行算指纹的话，同一份配置每算一次
+ * 都是"变了"，于是任何一个写请求都会把 app_settings 重写一遍，而且
+ * primeSignatures 永远对不上。指纹只在内存里比对，不落库，用明文没有泄露面。
+ */
+const settingsSignature = (settings) => JSON.stringify(settings ?? {});
+
 function buildPlan(data) {
   const steps = [];
-  const add = (name, table, columns, rows, key) => {
-    const signature = JSON.stringify(rows);
+  const add = (name, table, columns, rows, key, custom) => {
+    const signature = custom ?? JSON.stringify(rows);
     if (savedSignature.get(name) === signature) return;
     steps.push({ name, signature, table, columns, rows, key });
   };
 
   for (const def of ENTITIES) add(def.name, def.table, def.columns, (def.get(data) || []).map(def.toRow), def.key);
-  for (const def of SINGLETONS) add(def.name, def.table, def.columns, def.rows(data), def.key);
+  for (const def of SINGLETONS) {
+    add(def.name, def.table, def.columns, def.rows(data), def.key, def.signature?.(data));
+  }
   return steps;
 }
 
@@ -519,6 +550,36 @@ export async function sync(data) {
   // 提交成功后才更新指纹，失败时下次会重试同一批数据
   for (const step of steps) savedSignature.set(step.name, step.signature);
   return steps.length;
+}
+
+/**
+ * 只重写 app_settings 这一行。
+ *
+ * 用在启动迁移上：旧库里的凭据是明文，读完就该就地换成密文。走 sync() 会把
+ * 所有表的指纹清掉重写，而这次迁移只跟一行有关 —— 外链提交、任务这些表
+ * 没有任何变化，跟着重写一遍既慢又给了"迁移写坏了别的表"的机会。
+ */
+export async function rewriteSettings(data) {
+  const def = SINGLETONS.find((item) => item.name === 'settings');
+  const rows = def.rows(data);
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    await replaceTable(conn, def.table, def.columns, rows, def.key);
+    await conn.commit();
+  } catch (err) {
+    try {
+      await conn.rollback();
+    } catch {
+      /* 回滚失败时保留原始错误 */
+    }
+    throw err;
+  } finally {
+    conn.release();
+  }
+  settingsPlaintext = false;
+  savedSignature.set(def.name, settingsSignature(data.settings));
+  return true;
 }
 
 /* ── 读取 ──────────────────────────────────────────────────────────── */
@@ -580,7 +641,12 @@ export async function loadAll(base) {
 
   const [[settingsRow]] = await pool.query('SELECT `payload` FROM `app_settings` WHERE `id` = 1');
   if (settingsRow) {
-    const stored = parseJson(settingsRow.payload, {});
+    /* 库里存的是密文，先换回明文再参与合并：否则 pve / mail 拿到的会是
+       enc:v1:... 这串东西，表现是"配置明明在、就是连不上"。
+       plaintext 表示这批数据里还有没加密的旧值，启动后要回写一次。 */
+    const opened = decryptSettings(parseJson(settingsRow.payload, {}));
+    const stored = opened.settings;
+    if (opened.plaintext) settingsPlaintext = true;
     // 早期版本把 HA 令牌存进过库，读到就地丢弃，免得它被原样写回去继续扩散
     const ha = { ...data.settings.ha, ...(stored.ha || {}) };
     delete ha.token;

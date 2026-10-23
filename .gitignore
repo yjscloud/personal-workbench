@@ -10,6 +10,10 @@ server/data/*.tmp
 # 登录会话密钥：启动时自动生成，属于凭据，不能入库
 server/data/.auth-secret
 
+# 设置里第三方凭据的加密密钥：启动时自动生成（或用 SETTINGS_KEY 注入），
+# 它和数据库分离才是防护本身，绝不能跟着代码走
+server/data/.settings-key
+
 # 上传的背景图（个人照片），要入库的话把这一行删掉
 server/data/background/
 
@@ -21,3 +25,6 @@ trash.yaml
 # 立绘的生成源料：候选图、每档原图、核对用的拼图。39MB 级，且都能按提示词重出，
 # 所以不入库。要重画立绘时用的角色描述见 src/components/PetWhale.tsx 顶部
 .pet-src/
+
+# PVE 私有 CA（部署环境自带的证书，不是本项目的东西）
+server/data/pve-ca.pem

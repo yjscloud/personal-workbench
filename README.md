@@ -39,10 +39,27 @@ A self-hosted, single-user console for homelab operators — tasks, Proxmox VE m
 ### 1. 建库建账号
 
 ```bash
+openssl rand -hex 24          # 生成数据库口令
+# 把 server/db/bootstrap.sql 里的 __DB_PASSWORD__ 换成它，再执行：
 mysql -uroot -p < server/db/bootstrap.sql
 ```
 
-会创建 `personal_workbench` 库与 `workbench` 账号。
+会创建 `personal_workbench` 库与只允许本机登录的 `workbench` 账号（最小权限：增删改查 + 建表补列，不含 DROP）。同一个口令要写进 `.env` 的 `DB_PASSWORD`。
+
+**3306 不要对外**。应用和数据库在同一台机器上，数据库没有理由出现在局域网扫描结果里：
+
+```ini
+# /etc/my.cnf.d/99-bind-local.cnf
+[mysqld]
+bind-address=127.0.0.1
+```
+
+```bash
+systemctl restart mariadb
+ss -lntp | grep 3306      # 应该只有 127.0.0.1:3306
+```
+
+Docker 部署时同理：不要用 `-p 3306:3306`，用 compose 内部网络，或映射成 `-p 127.0.0.1:3306:3306`。
 
 ### 2. 安装依赖并配置
 
@@ -127,6 +144,31 @@ scripts/build-restart.sh
 > }
 > ```
 
+### 5. 对外只走 HTTPS
+
+应用默认 `HOST=127.0.0.1`：**8787 不是对外端口**，只给本机 nginx 反代用。直接
+暴露 8787 等于把登录接口和全部 API 放在明文 HTTP 上，同网段抓包就能拿走口令与
+会话 Cookie —— 域名那边配了 HTTPS 也拦不住有人按 IP 直连。
+
+nginx 侧对应要做两件事：
+
+```nginx
+# 1) 80 全部跳 HTTPS（保留路径与查询串）
+server {
+    listen      80 default_server;
+    server_name _;
+    return 301 https://demo.example.com$request_uri;
+}
+
+# 2) 443 加 HSTS，让浏览器记住"这个站只走 HTTPS"
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+```
+
+内网若只有 IP、没有证书，宁可只走带证书的域名，也不要为了方便在 IP 上保留明文
+入口：那等于给局域网里的每一台设备（包括被入侵的 IoT）留了一条可嗅探的登录通道。
+容器部署时不要 `-p 8787:8787`，要映射也只映射到宿主回环：
+`-p 127.0.0.1:8787:8787`。
+
 ## 环境变量
 
 完整清单和注释见 [`.env.example`](.env.example)。常用的几组：
@@ -134,9 +176,11 @@ scripts/build-restart.sh
 | 变量 | 说明 |
 | --- | --- |
 | `DB_HOST` `DB_PORT` `DB_USER` `DB_PASSWORD` `DB_NAME` | MySQL 连接（**必填**） |
-| `PORT` | 服务端口，默认 `8787` |
+| `PORT` `HOST` | 服务端口（默认 `8787`）与监听地址（默认 `127.0.0.1`，只给本机反代用） |
 | `AUTH_USER` `AUTH_PASSWORD` | 面板登录账号；`AUTH_PASSWORD` 留空即关闭登录 |
+| `HEALTH_TOKEN` | 可选。带 `X-Health-Token` 才返回 `/api/health` 的详细诊断（默认只回状态与 uptime） |
 | `PVE_HOST` `PVE_TOKEN_ID` `PVE_TOKEN_SECRET` | Proxmox VE 连接，留空走演示模式 |
+| `PVE_CA_FILE` | 可选。PVE 私有 CA 的路径（默认 `server/data/pve-ca.pem`），有它才能开着证书校验连自签的 PVE |
 | `HA_URL` `HA_TOKEN` | Home Assistant，读取智能插座的真实功耗（可选，见[依赖说明](#依赖说明home-assistant可选)） |
 | `AI_BASE_URL` `AI_API_KEY` `AI_MODEL` | 任意 OpenAI 兼容端点（官方 API / Ollama / vLLM 均可） |
 | `HERMES_BASE_URL` | 局域网 Hermes Agent Office 网关（可选） |

@@ -1,7 +1,35 @@
 import https from 'node:https';
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { collectSmart, clearSmartCache } from './smart.js';
 import { collectNet, clearNetCache } from './net.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/** PVE 集群自带的私有 CA。默认放数据目录，可用 PVE_CA_FILE 指向别处 */
+const DEFAULT_CA_FILE = path.join(__dirname, '..', 'data', 'pve-ca.pem');
+
+/**
+ * 读 PVE 的私有 CA。
+ *
+ * PVE 默认用 pve-root-ca 签发 pveproxy 的证书，这张 CA 不在 Node 自带的
+ * 根证书里，也不在系统信任库里（Node 读的是自己打包的 Mozilla 根，不读
+ * /etc/ssl）。结果是"证书校验失败"与"证书其实是对的"同时成立 ——
+ * 打开「信任自签证书」能绕过，但那是把校验整个关掉。
+ *
+ * 正确做法是把这张 CA 交给 TLS：链能验通、主机名照验，中间人依然不可行。
+ * 取法（在 PVE 宿主机上）：/etc/pve/pve-root-ca.pem
+ */
+function trustedCa() {
+  const file = (process.env.PVE_CA_FILE || '').trim() || DEFAULT_CA_FILE;
+  try {
+    const pem = fs.readFileSync(file, 'utf8');
+    return /BEGIN CERTIFICATE/.test(pem) ? pem : null;
+  } catch {
+    return null;
+  }
+}
 
 /* ────────────────────────────────────────────────────────────────────────
  * PVE 配置解析：优先使用「设置」页里保存的配置，其次读 .env
@@ -70,6 +98,9 @@ function authHeader(cfg) {
 
 function request(cfg, apiPath, { method = 'GET', timeout = 8000, body = null } = {}) {
   const mod = cfg.port === 443 ? https : https; // PVE 默认 https
+  /* 开了校验时把 PVE 私有 CA 一并交给 TLS；没有这个文件就按 Node 默认根证书走
+     （公网签发的证书照常能过），不会因为缺文件而静默关闭校验 */
+  const ca = cfg.verifyTls ? trustedCa() : null;
   return new Promise((resolve, reject) => {
     const req = mod.request(
       {
@@ -78,6 +109,7 @@ function request(cfg, apiPath, { method = 'GET', timeout = 8000, body = null } =
         path: `/api2/json${apiPath}`,
         method,
         rejectUnauthorized: cfg.verifyTls,
+        ...(ca ? { ca } : {}),
         headers: {
           Authorization: authHeader(cfg),
           Accept: 'application/json',

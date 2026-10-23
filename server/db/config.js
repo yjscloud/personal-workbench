@@ -10,8 +10,10 @@ export const DB = {
   host: process.env.DB_HOST || '127.0.0.1',
   port: int(process.env.DB_PORT, 3306),
   user: process.env.DB_USER || 'workbench',
-  // 允许显式配成空口令：只有 undefined 才回退到默认值
-  password: process.env.DB_PASSWORD === undefined ? 'workbench' : process.env.DB_PASSWORD,
+  /* 不再有默认口令。以前这里回退成 'workbench'，于是"忘了配 .env"的表现
+     不是启动失败，而是一个用户名即口令的账号安静地跑在 3306 上。
+     允许显式配空串（本机 socket 免密场景），但绝不替用户编一个。 */
+  password: process.env.DB_PASSWORD ?? '',
   database: process.env.DB_NAME || 'personal_workbench',
   poolSize: int(process.env.DB_POOL_SIZE, 10),
   connectTimeout: int(process.env.DB_CONNECT_TIMEOUT, 10000),

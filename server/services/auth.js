@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { db } from '../store.js';
+import { db, flush, update } from '../store.js';
 
 /* ── 登录会话 ────────────────────────────────────────────────────────
    账号密码放在 .env 里（AUTH_USER / AUTH_PASSWORD），不落库：
@@ -23,9 +23,7 @@ import { db } from '../store.js';
 const COOKIE = 'wb_session';
 const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** 失败几次、锁多久。按 IP 计，成功一次就清零 */
-const MAX_FAILURES = 8;
-const BLOCK_MS = 5 * 60 * 1000;
+/* 失败阈值与锁定时长定义在下面的「限速」一节：那里 IP 与账号两个维度一起记 */
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SECRET_FILE = path.resolve(__dirname, '..', 'data', '.auth-secret');
@@ -147,9 +145,41 @@ function tokenKey() {
 
 const sign = (data) => crypto.createHmac('sha256', tokenKey()).update(data).digest();
 
+/**
+ * 会话代号。登出一次 +1，此前签发的所有 token 立即失效。
+ *
+ * 无状态签名令牌的代价就是"服务端说不了它作废"：不记任何东西的话，
+ * 退出登录只是让客户端把 Cookie 丢掉，拿到过这张 Cookie 的人还能用到
+ * exp 为止。这里用一个自增计数把"吊销"变成一次写库 —— 不必建会话表，
+ * 也不必每个请求查一次库（这个值随 settings 一起在内存里）。
+ *
+ * 代价是**一次登出会让所有设备都下线**。这是单人面板，这个取舍是可接受的：
+ * 与其为了"只登出这一台"而引入会话表、清理和过期回收，不如先保证
+ * "我点了退出，别人手里的旧 Cookie 立刻不能用了"。
+ */
+function sessionEpoch() {
+  try {
+    return Number(db().settings?.auth?.sessionEpoch) || 0;
+  } catch {
+    // 数据层还没初始化（启动期）：当作 0，与空库一致
+    return 0;
+  }
+}
+
+/** 作废所有已签发的会话（登出 / 改口令后调用） */
+export async function revokeAllSessions() {
+  const next = sessionEpoch() + 1;
+  update((d) => {
+    d.settings.auth = { ...(d.settings.auth || {}), sessionEpoch: next, updatedAt: new Date().toISOString() };
+    d.settings.updatedAt = new Date().toISOString();
+  });
+  await flush();
+  return next;
+}
+
 /** 用户名 → 签名 token */
 export function issueToken(user) {
-  const payload = b64(JSON.stringify({ u: user, exp: Date.now() + TTL_MS }));
+  const payload = b64(JSON.stringify({ u: user, exp: Date.now() + TTL_MS, v: sessionEpoch() }));
   return `${payload}.${b64(sign(payload))}`;
 }
 
@@ -171,6 +201,9 @@ export function readToken(token) {
   try {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     if (!data?.u || !data?.exp || data.exp < Date.now()) return null;
+    /* 登出 / 改口令会把代号 +1：旧 token 签名仍然是对的，但版本对不上，
+       于是立即失效。没有 v 的老 token 按 0 处理，升级当刻不会把人踢下线 */
+    if ((Number(data.v) || 0) !== sessionEpoch()) return null;
     return data.u;
   } catch {
     return null;
@@ -184,33 +217,104 @@ function sameSecret(a, b) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
-/* ── 限速 ──────────────────────────────────────────────────────────── */
+/* ── 限速 ────────────────────────────────────────────────────────────
+ * 这张面板只有一个账号，在线爆破的成本本来就低，所以限制必须是真的：
+ *   · 同一 IP 一分钟最多 20 次（令牌桶的简化版：滑动窗口）；
+ *   · 失败 5 次起逐步加延迟，10 次锁 15 分钟；
+ *   · 计数按 IP **和** 用户名各记一份 —— 只按 IP 记的话，换一台机器
+ *     继续试同一个账号就绕过去了；只按账号记的话，换用户名又绕过去了。
+ * 失败响应统一是 401 + 同一句话，且都先算过一次 scrypt，避免用耗时区分
+ * "用户名对不对""密码错在第几位"。
+ */
+
+const MAX_FAILURES = 10;
+const BLOCK_MS = 15 * 60 * 1000;
+/** 第几次失败开始加延迟，以及每多一次加多少（上限 2 秒） */
+const DELAY_FROM = 5;
+const DELAY_STEP_MS = 250;
+const DELAY_MAX_MS = 2000;
+/** 单 IP 一分钟的登录尝试上限 */
+const WINDOW_MS = 60 * 1000;
+const WINDOW_MAX = 20;
 
 const failures = new Map();
+const recent = new Map();
 
-export function blockedFor(ip) {
-  const rec = failures.get(ip);
-  if (!rec) return 0;
-  const left = rec.until - Date.now();
-  if (left <= 0) {
-    failures.delete(ip);
-    return 0;
+const userKey = (ip, user) => `${ip}|${String(user || '').toLowerCase()}`;
+
+/**
+ * 取计数记录，顺手清掉"锁定已经到期"的。
+ * 注意只能清 until>0 且已过期的：until 为 0 表示这还在攒失败次数，
+ * 当成过期删掉的话，每次登录前查一遍锁定状态就把计数清零了 ——
+ * 限速会安静地失效，测试时表现就是"连错 15 次也没反应"。
+ */
+function liveRecord(key) {
+  const rec = failures.get(key);
+  if (!rec) return null;
+  if (rec.until > 0 && rec.until <= Date.now()) {
+    failures.delete(key);
+    return null;
   }
-  return Math.ceil(left / 1000);
+  return rec;
 }
 
-export function noteFailure(ip) {
-  const rec = failures.get(ip) || { count: 0, until: 0 };
+function leftOf(rec) {
+  if (!rec || !rec.until) return 0;
+  const left = rec.until - Date.now();
+  return left > 0 ? Math.ceil(left / 1000) : 0;
+}
+
+/** 还要等多少秒：IP 与「IP+账号」两个维度取大的那个 */
+export function blockedFor(ip, user) {
+  return Math.max(leftOf(liveRecord(userKey(ip, user))), leftOf(liveRecord(ip)));
+}
+
+function bump(key) {
+  const rec = failures.get(key) || { count: 0, until: 0 };
   rec.count += 1;
   if (rec.count >= MAX_FAILURES) {
     rec.until = Date.now() + BLOCK_MS;
     rec.count = 0;
-    console.warn(`[auth] ${ip} 连续登录失败 ${MAX_FAILURES} 次，已锁定 ${BLOCK_MS / 60000} 分钟`);
   }
-  failures.set(ip, rec);
+  failures.set(key, rec);
+  return rec.count;
 }
 
-export const clearFailures = (ip) => failures.delete(ip);
+export function noteFailure(ip, user) {
+  const byKey = bump(userKey(ip, user));
+  const byIp = bump(ip);
+  if (byKey === 0 || byIp === 0) {
+    console.warn(`[auth] ${ip} 连续登录失败 ${MAX_FAILURES} 次，已锁定 ${BLOCK_MS / 60000} 分钟`);
+  }
+  /* 被大量伪造来源打过之后别让这张表一直涨。单人面板，清掉最省事 */
+  if (failures.size > 5000) failures.clear();
+}
+
+/** 失败后的固定加延迟。返回毫秒；没到阈值就是 0 */
+export function loginDelayMs(ip, user) {
+  const count = Math.max(failures.get(userKey(ip, user))?.count || 0, failures.get(ip)?.count || 0);
+  if (count < DELAY_FROM) return 0;
+  return Math.min(DELAY_MAX_MS, (count - DELAY_FROM + 1) * DELAY_STEP_MS);
+}
+
+/** 滑动窗口限流。返回 false 表示这一分钟已经超了 */
+export function withinLoginRate(ip) {
+  const now = Date.now();
+  if (recent.size > 5000) recent.clear();
+  const list = (recent.get(ip) || []).filter((t) => now - t < WINDOW_MS);
+  if (list.length >= WINDOW_MAX) {
+    recent.set(ip, list);
+    return false;
+  }
+  list.push(now);
+  recent.set(ip, list);
+  return true;
+}
+
+export const clearFailures = (ip, user) => {
+  failures.delete(ip);
+  failures.delete(userKey(ip, user));
+};
 
 /** 账号密码对不对 */
 function verify(c, username, password) {
@@ -222,13 +326,13 @@ function verify(c, username, password) {
 
 /** 校验账号密码：对了返回用户名，错了返回 null（失败会计数） */
 export function checkCredentials(ip, username, password) {
-  if (blockedFor(ip)) return 'blocked';
+  if (blockedFor(ip, username)) return 'blocked';
   const c = credentials();
   if (verify(c, username, password)) {
-    clearFailures(ip);
+    clearFailures(ip, username);
     return c.user;
   }
-  noteFailure(ip);
+  noteFailure(ip, username);
   return null;
 }
 

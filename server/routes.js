@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
@@ -58,9 +58,12 @@ import {
   expiredCookie,
   hashPassword,
   issueToken,
+  loginDelayMs,
+  revokeAllSessions,
   sessionCookie,
   verifyCurrent,
   verifyHash,
+  withinLoginRate,
 } from './services/auth.js';
 import { ask, askStream } from './services/assistant.js';
 import { listMessages, addMessage, clearMessages, countMessages } from './db/messages.js';
@@ -275,9 +278,43 @@ function maskSettings(settings) {
 }
 
 /* ── 基础 ─────────────────────────────────────────────────────────── */
+
+/** 回环地址（本机脚本、直接 curl 127.0.0.1 的那条路） */
+function isLoopbackIp(ip) {
+  const v = String(ip || '').replace(/^::ffff:/, '');
+  return v === '::1' || v === '127.0.0.1' || v.startsWith('127.');
+}
+
+/** 内部探活令牌：容器 / 远程监控需要详细诊断时用，常规部署不必配 */
+function healthTokenOk(req) {
+  const expected = String(process.env.HEALTH_TOKEN || '').trim();
+  if (!expected) return false;
+  const given = String(req.headers['x-health-token'] || '').trim();
+  if (!given) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/**
+ * 健康检查。
+ *
+ * 对外只回「活着 + 跑了多久」：以前这里把库名、账号、连接标签、
+ * 遗留文件绝对路径、每张表行数和各子系统"配没配"一起吐出去，等于给
+ * 扫描器一份免认证的资产画像（库名与账号可直接拿去定向爆破）。
+ * uptime 保留，因为 scripts/build-restart.sh 靠它判断"重启是不是真生效"。
+ *
+ * 详细诊断只给两类调用者：本机回环（部署后的自查脚本），或带了
+ * HEALTH_TOKEN 的监控端。
+ */
 router.get(
   '/health',
-  wrap(async (_req, res) => {
+  wrap(async (req, res) => {
+    const uptime = Math.round(process.uptime());
+    if (!isLoopbackIp(req.ip) && !healthTokenOk(req)) {
+      return ok(res, { status: 'up', uptime });
+    }
+
     // 顺带探一次库：让健康检查真实反映"能不能落盘"，而不只是进程活着
     const probe = await dbStats().then(
       async (tables) => {
@@ -295,7 +332,7 @@ router.get(
     );
     ok(res, {
       status: 'up',
-      uptime: Math.round(process.uptime()),
+      uptime,
       db: { ...dbInfo(), reachable: probe.ok, error: probe.ok ? null : probe.error, tables: probe.tables },
       pveConfigured: isConfigured(db().settings),
       haConfigured: isHaConfigured(db().settings),
@@ -366,24 +403,52 @@ router.post(
     if (!enabled) return fail(res, 400, '没有开启登录：请在服务器的 .env 里设置 AUTH_PASSWORD');
 
     const ip = req.ip || 'unknown';
-    const wait = blockedFor(ip);
-    if (wait) return fail(res, 429, `尝试过于频繁，请 ${wait} 秒后再试`);
-
     const { username = '', password = '' } = req.body || {};
-    const user = checkCredentials(ip, String(username).trim(), String(password));
-    if (user === 'blocked') return fail(res, 429, '尝试过于频繁，请稍后再试');
+    const name = String(username).trim();
+
+    /* 先看锁定，再看频率。两者都带 Retry-After：客户端知道该等多久，
+       而不是盲目重试。 */
+    const wait = blockedFor(ip, name);
+    if (wait) {
+      res.setHeader('Retry-After', String(wait));
+      return fail(res, 429, `尝试过于频繁，请 ${Math.ceil(wait / 60)} 分钟后再试`);
+    }
+    if (!withinLoginRate(ip)) {
+      res.setHeader('Retry-After', '60');
+      return fail(res, 429, '登录尝试过于频繁，请一分钟后再试');
+    }
+
+    const user = checkCredentials(ip, name, String(password));
+    if (user === 'blocked') {
+      const left = blockedFor(ip, name) || 1;
+      res.setHeader('Retry-After', String(left));
+      return fail(res, 429, `尝试过于频繁，请 ${Math.ceil(left / 60)} 分钟后再试`);
+    }
     // 只回一句"账号或密码不正确"：分开提示等于告诉对方用户名猜对了
-    if (!user) return fail(res, 401, '账号或密码不正确');
+    if (!user) {
+      /* 失败次数越多，回得越慢。上限 2 秒，够让脚本的吞吐掉一个数量级，
+         又不至于让真人觉得"点了一下没反应" */
+      const delay = loginDelayMs(ip, name);
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      return fail(res, 401, '账号或密码不正确');
+    }
 
     res.setHeader('Set-Cookie', sessionCookie(issueToken(user), isSecure(req)));
     ok(res, { user });
   }),
 );
 
-router.post('/auth/logout', (req, res) => {
-  res.setHeader('Set-Cookie', expiredCookie(isSecure(req)));
-  ok(res, { ok: true });
-});
+router.post(
+  '/auth/logout',
+  wrap(async (req, res) => {
+    /* 无状态 token 本来"退不掉"，这里把会话代号 +1，让此前签发的所有
+       token 立即失效（见 services/auth.js 的 revokeAllSessions）。
+       本机这张 Cookie 照样由浏览器丢弃。 */
+    if (authConfig().enabled) await revokeAllSessions();
+    res.setHeader('Set-Cookie', expiredCookie(isSecure(req)));
+    ok(res, { ok: true });
+  }),
+);
 
 /**
  * 改密码。要在这里做而不是让用户去改 .env：
@@ -418,10 +483,19 @@ router.post(
       return fail(res, 500, '口令写入前校验失败，请重试');
     }
 
+    /* 代号 +1 是第二道保险：签名密钥本身掺了口令指纹，改完旧 token 已经验不过了；
+       把它显式写进代号，是为了将来换存储 / 换签名方式时这条语义仍然成立 */
+    const epoch = Number(db().settings.auth?.sessionEpoch) || 0;
     update((d) => {
-      d.settings.auth = { user: cfg.user, passwordHash: hash, updatedAt: new Date().toISOString() };
+      d.settings.auth = {
+        user: cfg.user,
+        passwordHash: hash,
+        sessionEpoch: epoch + 1,
+        updatedAt: new Date().toISOString(),
+      };
       d.settings.updatedAt = new Date().toISOString();
     });
+    await flush();
     // 密码变更留一条日志：出问题时这是唯一能回溯"什么时候改过"的地方
     console.log(`[auth] 面板口令已更新（账号 ${cfg.user}，哈希 ${hash.slice(0, 13)}…），其它设备上的会话已失效`);
     res.setHeader('Set-Cookie', sessionCookie(issueToken(cfg.user), isSecure(req)));
@@ -1654,9 +1728,11 @@ router.post(
     try {
       ok(res, await importFromUrl(url));
     } catch (err) {
-      /* 失败原因原样带出去：连不上、被反爬、还是页面里没正文，
-         这三种的处置完全不同，糊成一句"导入失败"就没法排查了。 */
-      fail(res, 502, err.message);
+      /* 失败原因带出去：连不上、被反爬、还是页面里没正文，处置完全不同。
+         但**底层异常文本不能带**（ECONNREFUSED 127.0.0.1:6379 就是一份
+         端口扫描结果）—— http.js 的 guard 模式已经把这类错误换成固定文案，
+         这里只管把"被策略拒绝"标成 400。 */
+      fail(res, err?.code === 'SSRF_BLOCKED' ? 400 : 502, err.message);
     }
   }),
 );
@@ -2675,8 +2751,16 @@ router.post(
   '/ha/test',
   wrap(async (req, res) => {
     const body = req.body || {};
-    // 令牌由环境变量提供，请求体里带什么都不作数；其余字段允许就地覆盖，方便"只改个地址再测一次"
-    const { token: _ignored, ...rest } = body;
+    /* 令牌由环境变量提供，请求体里带什么都不作数。
+       地址也**不**接受覆盖：这个接口会带着 HA_TOKEN 去请求目标，允许改地址
+       等于给了"把令牌发到任意主机 + 探测内网端口"的两用工具（SSRF）。
+       页面要测新地址，先保存再测。 */
+    const { token: _ignored, url: sentUrl, ...rest } = body;
+    const savedUrl = String(db().settings.ha?.url || '').trim().replace(/\/+$/, '');
+    const wanted = sentUrl === undefined ? savedUrl : String(sentUrl).trim().replace(/\/+$/, '');
+    if (wanted !== savedUrl) {
+      return fail(res, 400, '地址改动还没保存。服务端只连接已保存的地址，先保存再测试');
+    }
     const merged = { ha: { ...(db().settings.ha || {}), ...rest } };
     const cfg = haConfig(merged);
     if (!cfg.token) return fail(res, 400, '服务端没有配置环境变量 HA_TOKEN，请在 .env 里补上并重启服务');
