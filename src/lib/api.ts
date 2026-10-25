@@ -1040,8 +1040,118 @@ export type OfficeSeatChip = {
   tip?: string;
 };
 
-/** 页签名。与上游控制台一致 */
-export type OfficeSeatTabKey = 'config' | 'skills' | 'evo' | 'memory' | 'chat';
+/* ── 边界守望（尾流 · Edge Sentry）─────────────────────────────────────
+ * 尾流最近多出来的那层：前置边界（frp 暴露出去的 SSH / RDP / 面板）被扫描与
+ * 爆破的实时记录。数据由上游采集器落库后算好，这里只按它的结论画，不自己评分。
+ */
+
+export type OfficeGuardSeverity = 'CRITICAL' | 'HIGH' | 'MED' | 'LOW';
+
+/** 采集健康度：哪个源瞎了一眼看得出来，而不是整体一个「正常」 */
+export type OfficeGuardHealth = {
+  src: string;
+  label: string;
+  level: 'ok' | 'stale' | 'retry' | 'down' | 'off';
+  levelLabel: string;
+  /** null = 该源未启用（比如 ProxCenter Web 日志还没采过） */
+  ok: boolean | null;
+  fails: number;
+  lastOk: string | null;
+  error: string;
+};
+
+/** 一条「待你授权」的封禁申请。批准后上游才会在 frps 上真的 ipset add */
+export type OfficeGuardPending = {
+  id: number | string;
+  ip: string;
+  /** 一次性授权码（6 小时有效），批准 / 拒绝都要带它 */
+  ticket: string;
+  reason: string;
+  requestedAt: string;
+  expiresAt: string;
+  requestedBy: string;
+};
+
+export type OfficeGuardBlock = {
+  id: number | string;
+  ip: string;
+  reason: string;
+  status: string;
+  statusLabel: string;
+  requestedAt: string;
+  expiresAt: string;
+  approvedBy: string;
+};
+
+export type OfficeGuardIp = {
+  ip: string;
+  hits: number;
+  score: number;
+  severity: OfficeGuardSeverity;
+  severityLabel: string;
+  /** 双源确认：frps 与 haproxy 都看到过这个来源 */
+  dual: boolean;
+  sources: string[];
+  maxBytes: number;
+  /** 疑似已进入 shell（haproxy 字节数越过判定线） */
+  shell: boolean;
+  last: string;
+  services: { name: string; kind: string; target: string; hits: number }[];
+  anomalies: { name: string; ratio: number }[];
+  slow: { days: number; total: number } | null;
+};
+
+export type OfficeTabGuard = {
+  kind: 'guard';
+  source: string;
+  generatedAt: string;
+  /** 上游这轮采集是否成功；false 时 error 里是原因 */
+  ok: boolean;
+  error: string;
+  windowMin: number;
+  summary24h: { total: number; sources: number; services: number };
+  hourly: { h: string; n: number }[];
+  topProxy: { name: string; n: number }[];
+  current: { level: OfficeGuardSeverity; levelLabel: string; sources: number; total: number };
+  baseline: { enabled: boolean; services: number; hours: number; minBuckets: number };
+  health: OfficeGuardHealth[];
+  degraded: string[];
+  blind: string[];
+  topIps: OfficeGuardIp[];
+  subnets: { cidr: string; ipCount: number; hits: number; severity: OfficeGuardSeverity; severityLabel: string; members: string[] }[];
+  /** 暴露面档案：失联 / 未登记的新入口比扫描次数更值得看 */
+  assets: { name: string; kind: string; target: string; hits: number; active: boolean; registered: boolean; external: boolean }[];
+  /** SSH 字典是主机级的（sshd 只看到 haproxy 的地址，认不出单个来源在试什么） */
+  dict: { host: string; users: number; total: number; capped: boolean; targeted: { user: string; n: number }[] }[];
+  dictOverlap: { a: string; b: string; shared: number; cover: number } | null;
+  /** 宿主机上真的登录成功过 —— 判「有没有被打穿」最硬的证据 */
+  authOk: { user: string; fromIp: string; n: number; weak: boolean; isNew: boolean }[];
+  pending: OfficeGuardPending[];
+  blocks: OfficeGuardBlock[];
+  thresholds: { hitsMed: number; hitsHigh: number; hitsCrit: number; subnetIps: number; bytesFail: number; bytesShell: number };
+};
+
+/** 单个来源 IP 的画像（点「画像」按需深挖；首次要采 SSH 用户名，慢一点） */
+export type OfficeGuardProfile = {
+  ip: string;
+  hours: number;
+  hits: number;
+  first: string;
+  last: string;
+  services: { name: string; kind: string; target: string; hits: number }[];
+  timeline: { ts: string; name: string; src: string; bytes: number; durMs: number }[];
+  dict: { host: string; users: number; total: number; capped: boolean; top: { user: string; n: number }[] }[];
+  blocks: { id: number | string; ip: string; reason: string; status: string; requestedAt: string; expiresAt: string }[];
+  subnet: string | null;
+  subnetPeers: string[];
+  lifetime: { total: number } | null;
+};
+
+/** 工位卡片上的边界守望摘要（尾流） */
+export type OfficeGuardBrief = { pending: number; high: number; ok: boolean };
+
+/** 页签名。与上游控制台一致（边界守望只给尾流） */
+export type OfficeSeatTabKey = 'config' | 'skills' | 'evo' | 'guard' | 'memory' | 'chat';
 
 export type OfficeSeatDetail = {
   profile: OfficeEmployee;
@@ -1075,7 +1185,7 @@ export type OfficeTabMemory = {
   note?: string;
 };
 
-export type OfficeSeatTab = OfficeTabDoc | OfficeTabSkills | OfficeTabEvo | OfficeTabMemory;
+export type OfficeSeatTab = OfficeTabDoc | OfficeTabSkills | OfficeTabEvo | OfficeTabMemory | OfficeTabGuard;
 
 /** 拾贝的一条历史抓取记录（按它当时的卡片样子回放） */
 export type OfficeHarvestItem = {
@@ -1781,6 +1891,25 @@ export const api = {
      * 所以是 POST，且只有「即时交互」页签里那个发送按钮会调它。
      */
     harvest: (text: string) => req<OfficeHarvestRun>('/office/harvest', send('POST', { text })),
+
+    /* ── 尾流 · 边界守望 ── */
+    /**
+     * 工位卡片上那一行摘要：待授权几条、边界告警几项。
+     * 与页签里那份完整快照分开 —— 卡片上只放得下两个数。
+     */
+    guardBrief: () => req<OfficeGuardBrief>('/office/security/brief'),
+    /**
+     * 单个来源 IP 的画像。它是**按需现采**的：首次会去两台主机读 SSH 用户名，
+     * 上游说要十几秒，所以调用方要给转圈、不要重复点。
+     */
+    securityProfile: (ip: string) =>
+      req<OfficeGuardProfile>(`/office/security/profile?ip=${encodeURIComponent(ip)}`),
+    /**
+     * 批准 / 拒绝一条封禁申请。**approve=true 会真的在 frps 上执行封禁**，
+     * 所以界面上必须先二次确认；code 是上游给的一次性授权码。
+     */
+    securityDecide: (code: string, approve: boolean) =>
+      req<{ ok?: boolean; output?: string }>('/office/security/decide', send('POST', { code, approve })),
   },
 
   search: {

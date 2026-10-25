@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { Activity, AlertTriangle, CalendarClock, MessagesSquare, Star } from 'lucide-react';
-import { type OfficeBoard, type OfficeEmployee, type OfficeRoster, type OfficeSession, type OfficeUsage } from '@/lib/api';
+import { type OfficeBoard, type OfficeEmployee, type OfficeGuardBrief, type OfficeRoster, type OfficeSession, type OfficeUsage } from '@/lib/api';
 import { cls, fmtDuration, fmtRelative } from '@/lib/format';
 import { gatewaySourceLabel } from '@/lib/ai-usage';
 import { Badge, Card, CardHead, Empty, Led, Meter, Skeleton, useCountUp } from '@/components/ui';
@@ -153,7 +153,16 @@ function OfficeScene({ occupied, online, children }: { occupied: boolean; online
  * 而在按钮里再套一个按钮是无效的 HTML。点击区是整张卡 —— 手指不用去瞄
  * 信息区那行小字；那行「详情」只是把这件事说明白。
  */
-export function EmployeeDesk({ employee, onOpen }: { employee: OfficeEmployee; onOpen: () => void }) {
+export function EmployeeDesk({
+  employee,
+  onOpen,
+  guard,
+}: {
+  employee: OfficeEmployee;
+  onOpen: () => void;
+  /** 边界守望摘要（只有尾流有）：待授权 / 边界告警各几个数 */
+  guard?: OfficeGuardBrief | null;
+}) {
   return (
     <button
       type="button"
@@ -194,6 +203,18 @@ export function EmployeeDesk({ employee, onOpen }: { employee: OfficeEmployee; o
           <span className="truncate text-2xs text-faint">{employee.en}</span>
         </span>
         <span className="mt-1 line-clamp-2 text-2xs leading-relaxed text-muted">{employee.role}</span>
+        {/* 边界守望的一行摘要（只有尾流有）：有待授权时它比"在线"更需要被看见 ——
+            那几条要人去点批准。所以它排在职责下面，且用警示色。 */}
+        {guard && (guard.pending > 0 || guard.high > 0) ? (
+          <span className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            {guard.pending > 0 ? (
+              <Badge tone="warn" dot>
+                待授权 {guard.pending} 条封禁
+              </Badge>
+            ) : null}
+            {guard.high > 0 ? <Badge tone="crit" dot>边界告警 {guard.high} 项</Badge> : null}
+          </span>
+        ) : null}
         {/* 这一行只剩「详情」：工位号（A-01）已经撤掉 —— 卡片是"人"，工位是
             屋里的事，工位相关的信息在详情弹窗里，不该占着卡片底部那一行 */}
         <span className="mt-auto flex items-center justify-end gap-2 pt-2.5 text-2xs">

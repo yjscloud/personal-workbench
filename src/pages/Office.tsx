@@ -16,6 +16,7 @@ import {
   api,
   type OfficeBoard,
   type OfficeEmployee,
+  type OfficeGuardBrief,
   type OfficeRoster,
   type OfficeSession,
   type OfficeUsage,
@@ -156,6 +157,8 @@ export default function Office() {
   const [board, setBoard] = useState<OfficeBoard | null>(null);
   const [usage, setUsage] = useState<OfficeUsage | null>(null);
   const [sessions, setSessions] = useState<OfficeSession[] | null>(null);
+  /** 尾流的边界守望摘要（工位卡片上那两个数）。读不到就当没有，不报错 */
+  const [guard, setGuard] = useState<OfficeGuardBrief | null>(null);
   /** 工位这一路的错误：它读不到就是页面级的事（地址错 / 机器关机） */
   const [error, setError] = useState('');
   /* 右栏三块各自记自己的错：一块坏了不该把另外两块一起变成错误块 */
@@ -213,11 +216,13 @@ export default function Office() {
   async function refresh(manual = false) {
     if (manual) setBusy(true);
     /* allSettled 而不是 all：四路互相独立，一路失败不该让另外三路的结果丢掉 */
-    const [rosterRes, boardRes, usageRes, sessionsRes] = await Promise.allSettled([
+    const [rosterRes, boardRes, usageRes, sessionsRes, guardRes] = await Promise.allSettled([
       api.office.roster(),
       api.office.board(),
       api.office.usage(),
       api.office.sessions(20),
+      /* 边界守望摘要：只给工位卡片上那两个数，读不到就当没有（不单独报错） */
+      api.office.guardBrief(),
     ]);
 
     if (rosterRes.status === 'fulfilled') {
@@ -229,6 +234,7 @@ export default function Office() {
     if (boardRes.status === 'fulfilled') setBoard(boardRes.value);
     if (usageRes.status === 'fulfilled') setUsage(usageRes.value);
     if (sessionsRes.status === 'fulfilled') setSessions(sessionsRes.value.data);
+    if (guardRes.status === 'fulfilled') setGuard(guardRes.value);
     setBoardError(reason(boardRes, '读取待办工作表失败'));
     setUsageError(reason(usageRes, '读取用量失败'));
     setSessionsError(reason(sessionsRes, '读取对话明细失败'));
@@ -413,7 +419,8 @@ export default function Office() {
         <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 2xl:grid-cols-3">
           {items.map((e) => (
             <li key={e.id}>
-              <EmployeeDesk employee={e} onOpen={() => setDetailWith(e)} />
+              {/* 边界守望摘要只给尾流（上游也只有它有这一层） */}
+              <EmployeeDesk employee={e} onOpen={() => setDetailWith(e)} guard={e.id === 'weiliu' ? guard : null} />
             </li>
           ))}
           {Array.from({ length: emptySeats }, (_, i) => (

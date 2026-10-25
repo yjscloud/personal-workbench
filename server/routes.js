@@ -22,6 +22,9 @@ import {
   seatTab,
   harvestHistory,
   harvestRun,
+  officeGuardBrief,
+  securityProfile,
+  securityDecide,
 } from './services/office.js';
 import { readGovernor, GOVERNORS } from './services/cpu.js';
 import { backgroundStatus, saveBackground, clearBackground } from './services/background.js';
@@ -2943,6 +2946,50 @@ router.post(
   wrap(async (req, res) => {
     if (!needsHermes(res)) return;
     ok(res, await harvestRun(req.body?.text));
+  }),
+);
+
+/* ── 边界守望（尾流）─────────────────────────────────────────────────
+ * 快照本身走 /office/seat/weiliu/tab/guard（与其它页签同一套缓存与错误处理）；
+ * 这里只补"按需深挖"和"授权"两条需要单独触发的动作。
+ */
+
+/**
+ * 工位卡片上那一行摘要（待授权 / 边界告警各几个数）。
+ * 与页签里那份完整快照分开：这里只要两个数。
+ */
+router.get(
+  '/office/security/brief',
+  wrap(async (_req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await officeGuardBrief());
+  }),
+);
+
+/**
+ * 单个来源 IP 的画像。它会**真的去采集**（首次顺带从两台主机读 SSH 用户名），
+ * 所以超时给到 45 秒。只读：不碰任何封禁状态。
+ */
+router.get(
+  '/office/security/profile',
+  wrap(async (req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await securityProfile(req.query.ip));
+  }),
+);
+
+/**
+ * 批准 / 拒绝一条封禁申请。
+ *
+ * 批准会**真的在 frps 上执行 ipset add**（授权码一次性、6 小时有效），所以：
+ *   · 挂在 POST 上，参数只有授权码 —— "封哪个 IP"由上游申请单决定，不由前端传；
+ *   · approve 只认显式的 true，缺省 / 其它值一律按拒绝走，不猜意图。
+ */
+router.post(
+  '/office/security/decide',
+  wrap(async (req, res) => {
+    if (!needsHermes(res)) return;
+    ok(res, await securityDecide(req.body?.code, req.body?.approve === true));
   }),
 );
 

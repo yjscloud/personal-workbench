@@ -15,6 +15,9 @@ import { authedRequest, hermesApi, hasHermesCredentials, openHermesStream, herme
  *   POST /hermes/api/sessions/:id/chat/stream 对话（SSE，边想边推）
  *   GET  /local/board                         全局待办工作表（任务 / 最近执行 / 异常）
  *   GET  /local/usage                         今日与近 7 日 token 用量、预算
+ *   GET  /local/security                      边界守望：攻击快照 / 24h 汇总 / 待授权封禁
+ *   GET  /local/security/profile?ip=          单个来源 IP 的画像（连接 / 字节 / 用户名 / 封禁史）
+ *   POST /local/security/approve|reject       {code} 批准或拒绝一条封禁申请
  *   GET  /assets/*.png                        员工立绘（连图片也在登录墙后面）
  *
  * ── 两个刻意的取舍 ──────────────────────────────────────────────────────
@@ -52,7 +55,7 @@ export const EMPLOYEES = [
     id: 'weiliu',
     name: '尾流',
     en: 'Wake',
-    role: '运维值守 · 巡检、告警根因分析（真实 cron 任务驱动）',
+    role: '运维值守 · 巡检、告警根因分析、边界攻击守望（真实 cron 任务驱动）',
     seat: 'B-03',
     avatar: 'wake.png',
     chat: null,
@@ -273,11 +276,11 @@ export async function chatHistory({ limit = 30 } = {}) {
  *    与「即时交互」，这里沿用同一套判断。
  * ──────────────────────────────────────────────────────────────────── */
 
-/** 每个岗位有哪些页签（沿用上游：进化档案只给本体；MCP/值守不能对话） */
+/** 每个岗位有哪些页签（沿用上游：进化档案只给本体；边界守望只给值守；MCP/值守不能对话） */
 const SEAT_TABS = {
   hermes: ['config', 'skills', 'evo', 'memory', 'chat'],
   'mcp-filesystem': ['config', 'skills', 'memory'],
-  weiliu: ['config', 'skills', 'memory'],
+  weiliu: ['config', 'skills', 'guard', 'memory'],
   shabei: ['config', 'skills', 'memory', 'chat'],
 };
 
@@ -432,6 +435,9 @@ const fetchTab = {
   weiliu: {
     config: () => hermesApi('/local/watch', { timeout: 12000 }),
     skills: () => hermesApi('/local/watch', { timeout: 12000 }),
+    /* 边界守望与值守任务不是同一份数据：它来自采集器落库的攻击记录（/local/security），
+       窗口快照 + 24 小时汇总 + 封禁申请单，读一次要现采两端日志，给足超时 */
+    guard: () => officeSecurity(),
     memory: () => hermesApi('/local/watch', { timeout: 12000 }),
   },
   shabei: {
@@ -550,13 +556,48 @@ function configDoc(seatId, d, usage) {
       `- 1 分钟负载 ≥ ${th.load ?? '—'}`,
       `- 固态硬盘剩余寿命 ≤ ${th.wear_remain ?? '—'}%（PVE 的 wearout 为剩余寿命，新盘接近 100）`,
       `- inode 使用率 ≥ ${th.inode ?? '—'}%`,
-      `- 冷却: 告警 ${th.cooldown_alert_s ?? '—'}s · 健康 ${th.cooldown_health_s ?? '—'}s`,
+      `- 抑制：阈值类 ${Math.round((th.cooldown_alert_s || 3600) / 3600)} 小时、硬盘健康类 ${Math.round(
+        (th.cooldown_health_s || 43200) / 3600,
+      )} 小时（同一条告警只报一次）`,
       '',
-      '## 实时快照（最近一次探测）',
+      '## 硬盘健康监控',
+      '- NVMe/SSD 剩余寿命（PVE SMART，取值 = 100 − Percentage Used，越低越危险）',
+      '- SMART 健康状态：非 PASSED 即告警',
+      '- inode 使用率、根分区只读挂载、内核 I/O 错误',
       '',
-      '```text',
-      String(snap).trim() || '—',
-      '```',
+      '## 探针',
+      `- 脚本: \`${d.probe?.script || 'infra_watch.py'}\``,
+      '- watchdog 模式：只在异常时输出，**空输出即静默**',
+      '- state 模式：输出稳定快照（无时间戳），供 cron 做字节级变化检测',
+      '- 只读：探针与值守任务均不执行任何写操作',
+      '',
+      '## 边界守望（Edge Sentry）',
+      '- 场景：frp 把内网 SSH / RDP / PVE / NAS / 面板暴露到公网，持续被扫描与爆破',
+      '- 三层数据源，越往下越可信：',
+      '  1. **frps journal** — 入口全景（谁连了哪个代理、频率）。只读，未改动 frps 配置',
+      '  2. **PVE haproxy tcplog** — 真实源 IP + 连接时长 + **字节数** + 后端（SSH 专用）',
+      '  3. **personal-workbench-8 / ProxCenter-17 的 secure 日志** — 用户名与认证失败次数（`qm guest exec` 按需读）',
+      '- 对外提供服务的就这两台：工作台（个人 VM）与管理面板 ProxCenter-17，各自都接了 frpc，',
+      '  代理命名风格不同（`pve3-*` 与 `agri`/`prokvm`/`workbuddy-api`/`tunnel-1`），均已纳入映射',
+      '- 为什么需要 L2：frps 只记 TCP 建连，一次连接算一条；爆破工具在一个连接里连试多个用户名，',
+      '  且「认证失败」与「真的登进去」在 frps 侧完全同形。haproxy 的字节数能区分：',
+      '  实测认证失败恒定 1657~1813 字节，超过 4000 字节即疑似进入 shell，直接判严重',
+      '- 采集：每 5 分钟增量拉取双源 journald，落 SQLite（`/var/lib/agent-office/security/attacks.db`），保留 7 天',
+      '- 按需深挖：`frp_guard.py users`（爆破用户名，两台主机）、`frp_guard.py web`（ProxCenter Web 侧路径/UA/状态码）',
+      '- 判定：单 IP 频率 / 服务广度 / 敏感目标 / 同 /24 段协同，四维评分；双源计数取最大值避免重复计数',
+      '- 唤醒：快照只保留 4 个粗档位，**只有跨档才唤醒白饭**；日常扫描只入库、不发消息、0 token',
+      '- 封禁：白饭只能生成申请单，你批准后才在 frps 上 `ipset add`；授权码一次性、6 小时有效',
+      '- 解封：TTL 由探针自己维护（ipset 未开 timeout），**只解自己加的条目**，不动既有封禁',
+      '- 白名单：`~/.hermes/scripts/frp_guard_allow.txt`，内网段自动放行',
+      '',
+      '## 最近一次状态快照（真实采集）',
+      ...(String(snap || '').trim()
+        ? String(snap)
+            .trim()
+            .split('\n')
+            .filter(Boolean)
+            .map((line) => `- ${line}`)
+        : ['- （无）']),
     ]);
   }
 
@@ -594,6 +635,12 @@ export async function seatTab(seatId, tab) {
   const load = fetchTab[seatId]?.[tab];
   if (!load) throw new Error('这个页签还没有接');
 
+  /* 边界守望：整份快照 + 待授权单一起给。它自带待授权/封禁这类要操作的结构，
+     所以与配置文档、技能列表那种"读完就画"的页签分开走 */
+  if (tab === 'guard') {
+    return { kind: 'guard', ...normalizeSecurity(await load()) };
+  }
+
   if (tab === 'config') {
     const usage = await officeUsage();
     const doc = configDoc(seatId, await load(), usage);
@@ -607,7 +654,7 @@ export async function seatTab(seatId, tab) {
           : seatId === 'mcp-filesystem'
             ? '`~/.hermes/config.yaml` 的 `mcp_servers` 段 + 实时 stdio 握手'
             : seatId === 'weiliu'
-              ? 'Hermes cron `/api/jobs` + `~/.hermes/cron/executions.db` + 探针 `infra_watch.py`'
+              ? 'Hermes cron `/api/jobs` + `~/.hermes/cron/executions.db` + 探针 `infra_watch.py` + 边界守望采集库（`/local/security`）'
               : '`/local/harvester/*` 本地采集服务的真实文件',
       markdown: doc,
     };
@@ -772,6 +819,282 @@ export async function seatTab(seatId, tab) {
  */
 export const harvestHistory = (limit = 200) =>
   hermesApi(`/local/harvester/history?limit=${Number(limit) || 200}`, { timeout: 15000 });
+
+/* ── 边界守望（尾流 · Edge Sentry）────────────────────────────────────
+ * 上游把"被扫描"这件事拆成三层：frps 入口日志（谁连了哪个代理）、PVE haproxy
+ * 的连接特征（真实源 IP / 时长 / 字节数）、两台对外主机的 secure 日志（用户名）。
+ * 采集器每 5 分钟增量抓一次落 SQLite，这里读的是它算好的快照与申请单。
+ *
+ * **判定逻辑一条都不搬**：阈值、四维评分、跨档唤醒、白名单都是上游的事。
+ * 这里只把给人看的那部分归并（severity 转中文、代理名对上、字段换 camelCase）——
+ * 搬一套自己的规则过来，两边迟早会对同一个 IP 给出两个不同的结论。
+ *
+ * 封禁是**真的会在 frps 上执行 ipset add** 的动作，所以：
+ *   · 读、写分成两条导出，只有点"批准"才走 securityDecide；
+ *   · 授权码只接受单段短字符串（不接受路径、空白、换行），
+ *     不给它变成"拼接任意路径去打那台内网机器"的机会；
+ *   · 批准的超时给得比拒绝长：它要 ssh 过去执行并回读结果。
+ */
+export const officeSecurity = () => hermesApi('/local/security', { timeout: 20000 });
+
+/**
+ * 工位卡片上那一行摘要：待授权几条、边界告警几项。
+ *
+ * 单独一条轻量接口：卡片要回答的是"有没有事等着我"，不是整份守望快照
+ * （那份有十几 KB，而卡片上只放得下两个数）。读不出来就当没有，不拖黑整页。
+ */
+export async function officeGuardBrief() {
+  const d = await officeSecurity();
+  const sn = d?.snapshot || {};
+  const high =
+    (sn.ips || []).filter((r) => r.severity === 'HIGH' || r.severity === 'CRITICAL').length +
+    (sn.subnets || []).filter((s) => s.severity === 'HIGH' || s.severity === 'CRITICAL').length;
+  return { pending: (d?.pending || []).length, high, ok: Boolean(d?.snapshot_ok) };
+}
+
+/**
+ * 单个来源 IP 的画像。首次会顺带从两台主机采 SSH 用户名（`qm guest exec`），
+ * 上游自己都说"可能要十几秒"，所以超时按它给的最坏情况留。
+ */
+export async function securityProfile(ip) {
+  const target = String(ip || '').trim();
+  /* 只放行 IP 字面量：这个值是拼进查询串再打到内网的 */
+  if (!/^[0-9a-fA-F:.]{3,45}$/.test(target)) throw new Error('IP 不合法');
+  const d = await hermesApi(`/local/security/profile?ip=${encodeURIComponent(target)}`, { timeout: 45000 });
+  return {
+    ip: String(d?.ip || target),
+    hours: Number(d?.hours) || 24,
+    hits: Number(d?.hits) || 0,
+    first: String(d?.first || ''),
+    last: String(d?.last || ''),
+    services: (d?.services || []).map((s) => ({
+      name: String(s.name || s.proxy || '未知服务'),
+      kind: String(s.kind || ''),
+      target: String(s.target || ''),
+      hits: Number(s.hits) || 0,
+    })),
+    /* 逐条连接：haproxy 那侧带字节数，超过 bytes_shell 就是"疑似进了 shell" */
+    timeline: (d?.timeline || []).map((t) => ({
+      ts: String(t.ts || '').slice(0, 19),
+      name: String(t.name || ''),
+      src: String(t.src || ''),
+      bytes: Number(t.bytes) || 0,
+      durMs: Number(t.dur_ms) || 0,
+    })),
+    dict: (d?.dict || []).map((x) => ({
+      host: String(x.host || ''),
+      users: Number(x.users) || 0,
+      total: Number(x.total) || 0,
+      capped: Boolean(x.capped),
+      top: (x.top || []).slice(0, 4).map((u) => ({ user: String(u.user || ''), n: Number(u.n) || 0 })),
+    })),
+    blocks: (d?.blocks || []).map((b) => ({
+      id: b.id,
+      ip: String(b.ip || ''),
+      reason: String(b.reason || ''),
+      status: String(b.status || ''),
+      requestedAt: String(b.requested_at || ''),
+      expiresAt: String(b.expires_at || ''),
+    })),
+    subnet: d?.subnet ? String(d.subnet) : null,
+    subnetPeers: (d?.subnet_peers || []).map(String),
+    lifetime: d?.lifetime ? { total: Number(d.lifetime.total) || 0 } : null,
+  };
+}
+
+/**
+ * 批准 / 拒绝一条封禁申请。approve=true 会**真的封禁**（frps 上 ipset add）。
+ * 授权码是上游生成的一次性票据（6 小时有效），这里只做形状校验，不解释内容。
+ */
+export function securityDecide(code, approve) {
+  const ticket = String(code || '').trim();
+  if (!ticket) throw new Error('缺少授权码');
+  if (ticket.length > 64 || /[\s/\\]/.test(ticket)) throw new Error('授权码格式不对');
+  return hermesApi(`/local/security/${approve ? 'approve' : 'reject'}`, {
+    method: 'POST',
+    body: { code: ticket },
+    timeout: approve ? 30000 : 15000,
+  });
+}
+
+const SEV_LABEL = { CRITICAL: '严重', HIGH: '高危', MED: '关注', LOW: '低' };
+const BLOCK_LABEL = {
+  executed: '已封禁',
+  expired: '已到期解封',
+  rejected: '已拒绝',
+  failed: '执行失败',
+  revoked: '已撤销',
+  dry_run: '演练未执行',
+  expired_ticket: '授权超时',
+  pending: '待授权',
+};
+const SRC_LABEL = { frps: 'frps 入口', haproxy: 'haproxy 特征', 'pve-auth': 'PVE 宿主日志', users: 'SSH 用户名', web: 'Web 日志' };
+const LEVEL_LABEL = { ok: '正常', stale: '停滞', retry: '重试中', down: '异常', off: '未启用' };
+
+/** 快照里 `proxy` → 中文服务名的映射：ips[].services 也会补一份，两处都要吃 */
+function proxyNames(sn) {
+  const map = { ...(sn?.proxy_names || {}) };
+  for (const r of sn?.ips || []) {
+    for (const s of r.services || []) if (s.proxy && s.name) map[s.proxy] = s.name;
+  }
+  return map;
+}
+
+/**
+ * 把 /local/security 归一化成前端能直接画的形状（字段名、中文标签、空值兜底都在这里）。
+ * 前端不重复判断"这个 level 该显示什么" —— 那就是又一个会和上游分叉的口径。
+ */
+function normalizeSecurity(d) {
+  const sn = d?.snapshot || {};
+  const th = d?.thresholds || {};
+  const nameOf = proxyNames(sn);
+
+  const topIps = (sn.ips || []).map((r) => ({
+    ip: String(r.ip || ''),
+    hits: Number(r.hits) || 0,
+    score: Number(r.score) || 0,
+    severity: SEV_LABEL[r.severity] ? r.severity : 'LOW',
+    severityLabel: SEV_LABEL[r.severity] || String(r.severity || '低'),
+    /* 双源确认：同一个 IP 在 frps 与 haproxy 两边都出现过，比单源可信 */
+    dual: (r.sources || []).length > 1,
+    sources: (r.sources || []).map(String),
+    maxBytes: Number(r.max_bytes) || 0,
+    /* 认证失败恒定 1657~1813 字节；超过 4000 即疑似进了 shell —— 这条判据是上游定的 */
+    shell: Boolean(r.shell),
+    last: String(r.last || '').slice(0, 19),
+    services: (r.services || []).map((s) => ({
+      name: s.name || nameOf[s.proxy] || s.proxy || '未知服务',
+      kind: s.kind || '',
+      target: s.target || '',
+      hits: Number(s.hits) || 0,
+    })),
+    anomalies: (r.anomaly || []).map((a) => ({ name: a.name || '', ratio: Number(a.ratio) || 0 })),
+    slow: r.slow ? { days: Number(r.slow.days) || 0, total: Number(r.slow.total) || 0 } : null,
+  }));
+
+  /* 最坏档位只看 IP：同段协同在 subnets 里单独标（上游也是这么算的） */
+  const level = topIps.some((r) => r.severity === 'CRITICAL')
+    ? 'CRITICAL'
+    : topIps.some((r) => r.severity === 'HIGH')
+      ? 'HIGH'
+      : topIps.length
+        ? 'MED'
+        : 'LOW';
+
+  /* dict_overlap 可能是对象（旧）也可能是数组（新），两种都吃 */
+  const overlapRaw = Array.isArray(sn.dict_overlap) ? sn.dict_overlap[0] : sn.dict_overlap;
+
+  return {
+    source:
+      '上游 `/local/security`：frps 入口日志 + PVE haproxy 连接特征 + 两台对外主机的 secure 日志（全部只读，未改任何 frps / haproxy 配置）',
+    generatedAt: String(d?.generated_at || ''),
+    ok: Boolean(d?.snapshot_ok),
+    error: String(d?.snapshot_error || ''),
+    windowMin: Number(sn.window_min) || Number(th.window_min) || 10,
+
+    /* 24 小时 */
+    summary24h: {
+      total: Number(d?.summary24h?.total) || 0,
+      sources: Number(d?.summary24h?.sources) || 0,
+      services: Number(d?.summary24h?.services) || 0,
+    },
+    hourly: (d?.hourly || []).map((x) => ({ h: String(x.h || ''), n: Number(x.n) || 0 })),
+    topProxy: (d?.topProxy || []).map((x) => ({ name: x.name || nameOf[x.proxy] || x.proxy || '未知服务', n: Number(x.n) || 0 })),
+
+    /* 当前窗口 */
+    current: { level, levelLabel: SEV_LABEL[level], sources: Number(sn.sources) || 0, total: Number(sn.total) || 0 },
+    baseline: {
+      enabled: Boolean(sn.baseline?.enabled),
+      services: Number(sn.baseline?.services) || 0,
+      hours: Number(sn.baseline?.hours) || 0,
+      minBuckets: Number(sn.baseline?.min_buckets) || 8,
+    },
+    health: (sn.health?.sources || []).map((x) => ({
+      src: String(x.src || ''),
+      label: SRC_LABEL[x.src] || String(x.src || ''),
+      level: LEVEL_LABEL[x.level] ? x.level : 'off',
+      levelLabel: LEVEL_LABEL[x.level] || '未启用',
+      ok: x.ok === null ? null : Boolean(x.ok),
+      fails: Number(x.fails) || 0,
+      lastOk: x.last_ok || null,
+      error: String(x.error || ''),
+    })),
+    degraded: sn.health?.degraded || [],
+    blind: sn.health?.blind || [],
+
+    topIps,
+    subnets: (sn.subnets || []).map((s) => ({
+      cidr: String(s.cidr || ''),
+      ipCount: Number(s.ip_count) || 0,
+      hits: Number(s.hits) || 0,
+      severity: SEV_LABEL[s.severity] ? s.severity : 'LOW',
+      severityLabel: SEV_LABEL[s.severity] || String(s.severity || '低'),
+      members: (s.members || []).map(String),
+    })),
+
+    /* 暴露面：新入口 / 失联入口比扫描次数更值得看 */
+    assets: (sn.assets || []).map((a) => ({
+      name: a.name || nameOf[a.proxy] || a.proxy || '未知入口',
+      kind: a.kind || '',
+      target: a.target || '',
+      hits: Number(a.hits) || 0,
+      active: Boolean(a.active),
+      registered: a.registered !== false,
+      external: a.external !== false,
+    })),
+
+    /* SSH 字典是**主机级**的（sshd 侧只看到 haproxy 的地址，认不出单个来源在试什么） */
+    dict: (sn.dict || []).map((x) => ({
+      host: String(x.host || ''),
+      users: Number(x.users) || 0,
+      total: Number(x.total) || 0,
+      capped: Boolean(x.capped),
+      targeted: (x.targeted || []).map((u) => ({ user: String(u.user || ''), n: Number(u.n) || 0 })),
+    })),
+    dictOverlap: overlapRaw
+      ? { a: String(overlapRaw.a || ''), b: String(overlapRaw.b || ''), shared: Number(overlapRaw.shared) || 0, cover: Number(overlapRaw.cover) || 0 }
+      : null,
+
+    /* 宿主机上真的登录成功过：判"有没有被打穿"最硬的证据 */
+    authOk: (sn.auth_ok || []).map((a) => ({
+      user: String(a.user || ''),
+      fromIp: String(a.from_ip || ''),
+      n: Number(a.n) || 0,
+      weak: Boolean(a.weak),
+      isNew: Boolean(a.new),
+    })),
+
+    pending: (d?.pending || []).map((p) => ({
+      id: p.id,
+      ip: String(p.ip || ''),
+      ticket: String(p.ticket || ''),
+      reason: String(p.reason || ''),
+      requestedAt: String(p.requested_at || ''),
+      expiresAt: String(p.expires_at || ''),
+      requestedBy: String(p.requested_by || 'agent'),
+    })),
+    blocks: (d?.blocks || []).map((b) => ({
+      id: b.id,
+      ip: String(b.ip || ''),
+      reason: String(b.reason || ''),
+      status: String(b.status || ''),
+      statusLabel: BLOCK_LABEL[b.status] || String(b.status || ''),
+      requestedAt: String(b.requested_at || ''),
+      expiresAt: String(b.expires_at || ''),
+      approvedBy: String(b.approved_by || ''),
+    })),
+
+    /* 只留界面上会写的几个阈值：整份 thresholds 里还有冷却、日上限这类内部参数 */
+    thresholds: {
+      hitsMed: Number(th.hits_med) || 8,
+      hitsHigh: Number(th.hits_high) || 20,
+      hitsCrit: Number(th.hits_crit) || 60,
+      subnetIps: Number(th.subnet_ips) || 5,
+      bytesFail: Number(th.bytes_fail) || 2500,
+      bytesShell: Number(th.bytes_shell) || 4000,
+    },
+  };
+}
 
 /**
  * 给拾贝下一条指令：先让网关上的模型把自然语言转成抓取计划，再交给本机采集器执行。

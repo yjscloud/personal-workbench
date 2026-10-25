@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import {
+  Activity,
   AlertTriangle,
   Armchair,
   Boxes,
@@ -8,9 +9,12 @@ import {
   Copy,
   FileText,
   FolderArchive,
+  KeyRound,
   MessagesSquare,
   RefreshCw,
   Send,
+  Shield,
+  ShieldAlert,
   Sparkles,
   Sprout,
   Square,
@@ -22,6 +26,11 @@ import {
   api,
   type OfficeChatEvent,
   type OfficeEmployee,
+  type OfficeGuardHealth,
+  type OfficeGuardIp,
+  type OfficeGuardPending,
+  type OfficeGuardProfile,
+  type OfficeGuardSeverity,
   type OfficeHarvestItem,
   type OfficeHarvestRun,
   type OfficeMessage,
@@ -61,6 +70,7 @@ const TAB_META: Record<OfficeSeatTabKey, { label: string; icon: typeof FileText;
   config: { label: '配置文档', icon: FileText, color: 'text-slate-400' },
   skills: { label: '技能列表', icon: Boxes, color: 'text-violet-500' },
   evo: { label: '进化档案', icon: Sprout, color: 'text-sky-500' },
+  guard: { label: '边界守望', icon: Shield, color: 'text-emerald-500' },
   memory: { label: '工作记录 & 记忆库', icon: FolderArchive, color: 'text-amber-500' },
   chat: { label: '即时交互', icon: MessagesSquare, color: 'text-rose-400' },
 };
@@ -490,6 +500,439 @@ function MemoryPane({ seat }: { seat: string }) {
           </section>
           {mem.note ? <p className="text-2xs leading-relaxed text-faint lg:col-span-2">{mem.note}</p> : null}
         </div>
+      ) : null}
+    </div>
+  );
+}
+
+/* ── 边界守望（尾流 · Edge Sentry）─────────────────────────────────────
+ * 前置边界（frp 暴露出去的 SSH / RDP / 面板）被扫描与爆破的真实记录。
+ *
+ * 三件事决定了这一页的画法：
+ * 1. **只显示上游的结论**。频率、服务广度、同段协同、字节数判定线全在采集器里，
+ *    这里不再算一遍 —— 两套规则迟早会对同一个 IP 给出不同的档位。
+ * 2. **采集源的健康度要单独摆出来**。整体一个"正常"会掩盖某一源瞎了
+ *    （比如 frps 那台 ssh 超时），而"哪个源瞎了"恰恰决定了这份结论可不可信。
+ * 3. **封禁是危险动作**。批准会在 frps 上真的执行 ipset add，所以按钮前面
+ *    必须有一次明确的确认，且授权码要原样展示（人能核对它和申请单是不是同一条）。
+ * ──────────────────────────────────────────────────────────────────── */
+
+const SEV_TONE: Record<OfficeGuardSeverity, 'crit' | 'warn' | 'accent' | 'neutral'> = {
+  CRITICAL: 'crit',
+  HIGH: 'warn',
+  MED: 'accent',
+  LOW: 'neutral',
+};
+
+const num = (n: number | null | undefined) => (Number(n) || 0).toLocaleString('zh-CN');
+
+const healthCls = (level: OfficeGuardHealth['level']) =>
+  level === 'ok' ? 'text-ok' : level === 'down' ? 'text-crit' : level === 'off' ? 'text-faint' : 'text-warn';
+
+function GuardBlock({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
+  return (
+    <section className="rounded-field border border-line bg-panel px-3 py-2.5">
+      <h4 className="mb-2 flex flex-wrap items-baseline gap-x-1.5 text-xs font-semibold text-ink">
+        {title}
+        {hint ? <span className="text-2xs font-normal text-faint">{hint}</span> : null}
+      </h4>
+      {children}
+    </section>
+  );
+}
+
+type ProfileState = { ip: string; loading: boolean; error: string; data: OfficeGuardProfile | null };
+
+/** 单 IP 画像：连接 / 流量 / 用户名 / 封禁史四层证据合一（上游同款口径） */
+function GuardProfileCard({ state, onClose }: { state: ProfileState; onClose: () => void }) {
+  const d = state.data;
+  const shell = (d?.timeline || []).some((t) => t.bytes >= 4000);
+  return (
+    <section className="rounded-field border border-accent/40 bg-accent-soft/40 px-3 py-2.5">
+      <div className="flex items-start gap-2">
+        <div className="min-w-0 flex-1">
+          <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+            <span className="font-semibold text-ink">攻击画像 · {state.ip}</span>
+            {d ? (
+              <>
+                <span className="text-2xs text-muted">
+                  近 {d.hours} 小时 <b className="num text-ink">{num(d.hits)}</b> 次
+                </span>
+                {shell ? <Badge tone="crit">⚠️ 有交互流量</Badge> : null}
+              </>
+            ) : null}
+            {state.loading ? (
+              <span className="flex items-center gap-1.5 text-2xs text-faint">
+                <Spinner /> 正在读画像（首次要采 SSH 用户名，可能要十几秒）…
+              </span>
+            ) : null}
+          </p>
+          {state.error ? <p className="mt-1.5 text-2xs text-warn">画像读取失败：{state.error}</p> : null}
+        </div>
+        <Button variant="ghost" size="icon" onClick={onClose} aria-label="关闭画像">
+          <X size={14} />
+        </Button>
+      </div>
+
+      {d ? (
+        <div className="mt-2 space-y-2">
+          <p className="text-2xs leading-relaxed text-muted">
+            目标：{d.services.length ? d.services.map((s) => `${s.name}×${s.hits}`).join('、') : '—'}
+          </p>
+          {d.dict.length ? (
+            <p className="text-2xs leading-relaxed text-muted">
+              SSH 字典（主机级）：
+              {d.dict
+                .slice(0, 2)
+                .map((x) => `${x.host} ${x.users} 个用户名 / ${num(x.total)} 次${x.top.length ? `（${x.top.map((u) => u.user).join('、')}）` : ''}`)
+                .join('；')}
+            </p>
+          ) : null}
+          {d.subnet && d.subnetPeers.length ? (
+            <p className="text-2xs leading-relaxed text-muted">
+              同段：{d.subnet} 内另有 {d.subnetPeers.length} 个活跃来源
+            </p>
+          ) : null}
+          <p className="text-2xs leading-relaxed text-muted">
+            历史：累计 {num(d.lifetime?.total ?? d.hits)} 次
+            {d.blocks.length ? ` · 封禁记录 ${d.blocks.length} 条` : ''}
+            {d.first ? ` · 首次 ${d.first}` : ''}
+          </p>
+          <ol className="max-h-[180px] space-y-0.5 overflow-y-auto overscroll-contain rounded-field bg-panel/70 px-2 py-1.5">
+            {d.timeline.slice(-24).map((t, i) => (
+              <li key={`${t.ts}-${i}`} className="flex items-baseline gap-2 text-2xs leading-relaxed">
+                <span className="num shrink-0 text-faint">{t.ts.slice(11, 19)}</span>
+                <span className="min-w-0 flex-1 truncate text-muted">
+                  {t.name}
+                  {t.src === 'haproxy' ? <span className="ml-1 text-accent">haproxy</span> : null}
+                </span>
+                <span className={cls('num shrink-0', t.bytes >= 4000 ? 'font-medium text-crit' : 'text-faint')}>
+                  {t.bytes ? `${num(t.bytes)}B` : '—'}
+                </span>
+              </li>
+            ))}
+            {!d.timeline.length ? <li className="text-2xs text-faint">（窗口内无事件）</li> : null}
+          </ol>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function GuardStat({ label, value, tone }: { label: string; value: string; tone?: 'crit' | 'warn' }) {
+  return (
+    <div className="rounded-field bg-bg-2 px-2.5 py-2">
+      <p
+        className={cls(
+          'num text-base font-semibold',
+          tone === 'crit' ? 'text-crit' : tone === 'warn' ? 'text-warn' : 'text-ink',
+        )}
+      >
+        {value}
+      </p>
+      <p className="mt-0.5 text-2xs text-faint">{label}</p>
+    </div>
+  );
+}
+
+/**
+ * 尾流的「边界守望」页签。
+ *
+ * 数据一次取全（`/office/seat/weiliu/tab/guard` 已经把快照、24 小时汇总、
+ * 待授权与封禁史归并好了）。只有"画像"是按需再取 —— 它要去两台主机现采用户名，
+ * 十几秒起步，不适合跟着页签一起等。
+ */
+function GuardPane({ seat }: { seat: string }) {
+  const { data, error, loading, reload } = useSeatTab(seat, 'guard', true);
+  const { notify } = useStore();
+  const guard = data?.kind === 'guard' ? data : null;
+  const [busy, setBusy] = useState('');
+  const [profile, setProfile] = useState<ProfileState | null>(null);
+
+  async function decide(p: OfficeGuardPending, approve: boolean) {
+    const tip = approve
+      ? `批准封禁 ${p.ip}？\n\n批准后会立刻在 frps 上执行 ipset add，记录到期 ${p.expiresAt || '—'}。\n理由：${p.reason || '（未填）'}`
+      : `拒绝 ${p.ip} 这条封禁申请？`;
+    if (!window.confirm(tip)) return;
+    setBusy(p.ticket);
+    try {
+      await api.office.securityDecide(p.ticket, approve);
+      notify?.(approve ? `已封禁 ${p.ip}` : `已拒绝 ${p.ip} 的封禁申请`);
+      reload();
+    } catch (e) {
+      notify?.(e instanceof Error ? e.message : '操作失败', 'crit');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function openProfile(ip: string) {
+    setProfile({ ip, loading: true, error: '', data: null });
+    try {
+      const d = await api.office.securityProfile(ip);
+      setProfile({ ip, loading: false, error: '', data: d });
+    } catch (e) {
+      setProfile({ ip, loading: false, error: e instanceof Error ? e.message : '画像读取失败', data: null });
+    }
+  }
+
+  const high = (guard?.topIps || []).filter((r) => r.severity === 'HIGH' || r.severity === 'CRITICAL');
+  const shown = (high.length ? high : guard?.topIps || []).slice(0, 8);
+  const maxHour = Math.max(1, ...(guard?.hourly || []).map((x) => x.n));
+
+  return (
+    <div className="space-y-3">
+      {guard ? <SourceNote text={`${guard.source} · 生成于 ${fmtDateTime(guard.generatedAt)}`} /> : null}
+      {error ? <PaneError text={error} onRetry={reload} /> : null}
+      {loading && !guard ? <Skeleton className="h-64" /> : null}
+
+      {guard ? (
+        <>
+          {!guard.ok && guard.error ? (
+            <p className="flex items-start gap-2 rounded-field bg-crit-soft px-3 py-2 text-2xs leading-relaxed text-crit">
+              <AlertTriangle size={13} aria-hidden className="mt-0.5 shrink-0" />
+              <span>采集异常：{guard.error}</span>
+            </p>
+          ) : null}
+
+          {/* 采集健康度：哪个源瞎了一眼看出来，而不是整体一个「正常」 */}
+          <p className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-field bg-bg-2 px-3 py-2 text-2xs text-muted">
+            <span className="flex items-center gap-1.5 font-medium text-ink">
+              <Shield size={12} aria-hidden />
+              分析窗口 {guard.windowMin} 分钟
+            </span>
+            <span className={guard.ok ? 'text-ok' : 'text-crit'}>{guard.ok ? '采集正常' : '采集异常'}</span>
+            {guard.health.map((h) => (
+              <span
+                key={h.src}
+                title={[h.error, h.lastOk ? `最后成功 ${h.lastOk}` : ''].filter(Boolean).join(' · ')}
+                className="whitespace-nowrap"
+              >
+                {h.label} <b className={healthCls(h.level)}>{h.levelLabel}</b>
+                {h.ok === false && h.fails ? <span className="text-crit"> ×{h.fails}</span> : null}
+              </span>
+            ))}
+            {guard.degraded.length ? <span className="text-warn">降级：{guard.degraded.join('、')}</span> : null}
+          </p>
+
+          {profile ? <GuardProfileCard state={profile} onClose={() => setProfile(null)} /> : null}
+
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <GuardStat
+              label={`当前窗口 ${guard.windowMin} 分钟来源`}
+              value={num(guard.current.sources)}
+              tone={guard.current.level === 'CRITICAL' ? 'crit' : undefined}
+            />
+            <GuardStat label="当前窗口连接" value={num(guard.current.total)} />
+            <GuardStat label="近 24 小时连接" value={num(guard.summary24h.total)} />
+            <GuardStat label="近 24 小时独立来源" value={num(guard.summary24h.sources)} />
+          </div>
+
+          {guard.pending.length ? (
+            <GuardBlock title="待你授权" hint="白饭只能申请，执行必须你批准 · 授权码 6 小时内有效">
+              <ul className="space-y-2">
+                {guard.pending.map((p) => (
+                  <li key={p.id} className="rounded-field border border-warn/40 bg-warn-soft/60 px-3 py-2.5">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <ShieldAlert size={13} aria-hidden className="text-warn" />
+                      <span className="num text-sm font-semibold tracking-wide text-ink">{p.ip}</span>
+                      <Badge tone="warn">申请 #{p.id}</Badge>
+                      <code className="rounded bg-panel px-1.5 py-0.5 text-2xs tracking-[0.15em] text-ink">{p.ticket}</code>
+                    </div>
+                    <p className="mt-1 text-2xs leading-relaxed text-muted">{p.reason || '（未填理由）'}</p>
+                    <p className="mt-1 text-2xs text-faint">
+                      申请 {p.requestedAt || '—'} · 记录到期 {p.expiresAt || '—'} · 来自 {p.requestedBy || 'agent'}
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      <Button size="sm" disabled={busy === p.ticket} onClick={() => void decide(p, true)}>
+                        {busy === p.ticket ? <Spinner /> : <Check size={12} />}
+                        批准封禁
+                      </Button>
+                      <Button variant="ghost" size="sm" disabled={busy === p.ticket} onClick={() => void decide(p, false)}>
+                        <X size={12} />
+                        拒绝
+                      </Button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </GuardBlock>
+          ) : null}
+
+          <div className="grid gap-3 lg:grid-cols-2">
+            <GuardBlock title="当前窗口来源" hint={high.length ? `其中高危 ${high.length} 个` : '窗口内没有高危'}>
+              {shown.length && !high.length ? (
+                <p className="mb-1.5 text-2xs leading-relaxed text-faint">
+                  窗口内没有高危来源，扫描噪声只入库未告警；下面是全部来源。
+                </p>
+              ) : null}
+              <ul className="space-y-1.5">
+                {shown.map((r: OfficeGuardIp) => (
+                  <li key={r.ip} className="rounded-field bg-bg-2 px-2.5 py-2">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <Badge tone={SEV_TONE[r.severity]}>{r.severityLabel}</Badge>
+                      <span className="num text-xs font-medium text-ink">{r.ip}</span>
+                      <span className="text-2xs text-muted">{num(r.hits)} 次</span>
+                      {r.dual ? <span className="text-2xs text-accent">双源确认</span> : null}
+                      {r.shell ? <Badge tone="crit">交互流量 {num(r.maxBytes)}B</Badge> : r.maxBytes ? (
+                        <span className="num text-2xs text-faint">{num(r.maxBytes)}B</span>
+                      ) : null}
+                      <button
+                        type="button"
+                        onClick={() => void openProfile(r.ip)}
+                        className="ml-auto shrink-0 rounded-full border border-line px-2 py-0.5 text-2xs text-muted transition-colors hover:border-accent hover:text-accent"
+                      >
+                        画像
+                      </button>
+                    </div>
+                    <p className="mt-1 text-2xs leading-relaxed text-faint">
+                      {r.services.slice(0, 3).map((s) => `${s.name}×${s.hits}`).join('、') || '—'}
+                      {r.anomalies.length ? ` · 突增 ${r.anomalies[0].name} ${r.anomalies[0].ratio}x` : ''}
+                      {r.slow ? ` · 慢速 ${r.slow.days} 天/${r.slow.total} 次` : ''}
+                    </p>
+                  </li>
+                ))}
+                {!shown.length ? <li className="text-2xs text-faint">窗口内没有高危来源，扫描噪声只入库未告警。</li> : null}
+              </ul>
+            </GuardBlock>
+
+            <GuardBlock title="近 24 小时" hint={`${num(guard.summary24h.services)} 个服务被扫`}>
+              {guard.hourly.length ? (
+                <>
+                  <span className="flex h-[52px] items-end gap-[2px]" aria-hidden>
+                    {guard.hourly.map((x) => (
+                      <span
+                        key={x.h}
+                        title={`${x.h}:00 · ${x.n} 次`}
+                        style={{ height: `${Math.max(2, Math.round((x.n / maxHour) * 48))}px` }}
+                        className="flex-1 rounded-t-[2px] bg-accent/70"
+                      />
+                    ))}
+                  </span>
+                  <p className="mt-1 text-2xs text-faint">按小时（悬停看数值）</p>
+                </>
+              ) : null}
+              {guard.topProxy.length ? (
+                <ul className="mt-2 space-y-0.5">
+                  {guard.topProxy.slice(0, 5).map((x) => (
+                    <li key={x.name} className="flex items-baseline gap-2 text-2xs">
+                      <span className="min-w-0 flex-1 truncate text-muted">{x.name}</span>
+                      <span className="num shrink-0 font-medium text-ink">{num(x.n)}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </GuardBlock>
+          </div>
+
+          <div className="grid gap-3 lg:grid-cols-2">
+            <GuardBlock
+              title="同段协同"
+              hint={
+                guard.dictOverlap
+                  ? `与 ${guard.dictOverlap.a} 共用 ${num(guard.dictOverlap.shared)} 个生僻名`
+                  : undefined
+              }
+            >
+              <ul className="space-y-1">
+                {guard.subnets.slice(0, 5).map((s) => (
+                  <li key={s.cidr} className="flex flex-wrap items-baseline gap-x-2 text-2xs">
+                    <Badge tone={SEV_TONE[s.severity]}>{s.severityLabel}</Badge>
+                    <span className="num text-ink">{s.cidr}</span>
+                    <span className="text-muted">
+                      {s.ipCount} IP / {num(s.hits)} 次
+                    </span>
+                  </li>
+                ))}
+                {!guard.subnets.length ? <li className="text-2xs text-faint">窗口内没有成段协同的迹象。</li> : null}
+              </ul>
+            </GuardBlock>
+
+            <GuardBlock title="SSH 字典" hint="主机级：sshd 只看到 haproxy 的地址">
+              <ul className="space-y-1">
+                {guard.dict.slice(0, 2).map((x) => (
+                  <li key={x.host} className="text-2xs leading-relaxed">
+                    <span className="text-ink">{x.host}</span>
+                    <span className="text-muted">
+                      {' '}
+                      · <b className="num text-ink">{x.users}</b> 用户名 / {num(x.total)} 次
+                      {x.capped ? '（采样封顶）' : ''}
+                    </span>
+                    {x.targeted.length ? (
+                      <p className="text-warn">⚠️ 疑似针对性：{x.targeted.slice(0, 4).map((u) => u.user).join('、')}</p>
+                    ) : null}
+                  </li>
+                ))}
+                {!guard.dict.length ? <li className="text-2xs text-faint">还没有采到用户名。</li> : null}
+              </ul>
+            </GuardBlock>
+          </div>
+
+          <div className="grid gap-3 lg:grid-cols-2">
+            <GuardBlock title="暴露面" hint="失联 / 未登记比扫描次数更值得看">
+              <ul className="space-y-1">
+                {guard.assets.slice(0, 8).map((a) => (
+                  <li key={`${a.name}-${a.target}`} className="flex items-baseline gap-2 text-2xs">
+                    <span
+                      aria-hidden
+                      className={cls('mt-1 h-1.5 w-1.5 shrink-0 rounded-full', a.active ? 'bg-ok' : 'bg-crit')}
+                    />
+                    <span className="min-w-0 flex-1 truncate text-muted">{a.name}</span>
+                    {!a.registered ? <span className="shrink-0 text-warn">未登记</span> : null}
+                    {!a.external ? <span className="shrink-0 text-faint">非对外</span> : null}
+                    {!a.active ? <span className="shrink-0 text-crit">失联</span> : null}
+                  </li>
+                ))}
+                {!guard.assets.length ? <li className="text-2xs text-faint">没有暴露面记录。</li> : null}
+              </ul>
+            </GuardBlock>
+
+            <GuardBlock title="宿主机登录" hint="真被打穿的硬证据">
+              <ul className="space-y-1">
+                {guard.authOk.slice(0, 4).map((a, i) => (
+                  <li key={`${a.user}-${a.fromIp}-${i}`} className="flex flex-wrap items-baseline gap-x-2 text-2xs">
+                    <KeyRound size={11} aria-hidden className="text-faint" />
+                    <span className="text-ink">{a.user}</span>
+                    <span className="text-faint">←</span>
+                    <span className="num text-muted">{a.fromIp}</span>
+                    <span className="text-muted">{a.n} 次</span>
+                    {a.weak ? <Badge tone="crit">弱口令</Badge> : null}
+                    {a.isNew ? <Badge tone="warn">新来源</Badge> : null}
+                  </li>
+                ))}
+                {!guard.authOk.length ? <li className="text-2xs text-faint">窗口内没有成功登录记录。</li> : null}
+              </ul>
+            </GuardBlock>
+          </div>
+
+          <GuardBlock title="封禁记录" hint={guard.blocks.length ? `最近 ${Math.min(guard.blocks.length, 6)} 条` : undefined}>
+            <ul className="space-y-1">
+              {guard.blocks.slice(0, 6).map((b) => (
+                <li key={b.id} className="flex flex-wrap items-baseline gap-x-2 text-2xs">
+                  <span className="num shrink-0 text-faint">{(b.requestedAt || '').slice(5, 16) || '—'}</span>
+                  <span className="num text-ink">{b.ip}</span>
+                  <span
+                    className={cls(
+                      'font-medium',
+                      b.status === 'executed' ? 'text-crit' : b.status === 'failed' ? 'text-warn' : 'text-faint',
+                    )}
+                  >
+                    {b.statusLabel}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-muted">{b.reason}</span>
+                </li>
+              ))}
+              {!guard.blocks.length ? <li className="text-2xs text-faint">还没有封禁记录。</li> : null}
+            </ul>
+          </GuardBlock>
+
+          <p className="flex items-start gap-1.5 text-2xs leading-relaxed text-faint">
+            <Activity size={12} aria-hidden className="mt-0.5 shrink-0" />
+            判定线：单 IP {guard.thresholds.hitsHigh} 次/窗口为高危、{guard.thresholds.hitsCrit} 次为严重；同段{' '}
+            {guard.thresholds.subnetIps} 个 IP 协同即报段扫描；haproxy 字节数 ≥ {guard.thresholds.bytesShell} 直接判严重（疑似已登入）。
+            普通扫描只入库不发消息，只有跨档才唤醒白饭；白名单与内网来源不参与判定。
+          </p>
+        </>
       ) : null}
     </div>
   );
@@ -970,6 +1413,7 @@ export function SeatModal({
               {tab === 'config' ? <DocPane seat={employee.id} /> : null}
               {tab === 'skills' ? <SkillsPane seat={employee.id} /> : null}
               {tab === 'evo' ? <EvoPane seat={employee.id} /> : null}
+              {tab === 'guard' ? <GuardPane seat={employee.id} /> : null}
               {tab === 'memory' ? <MemoryPane seat={employee.id} /> : null}
             </div>
           )}
