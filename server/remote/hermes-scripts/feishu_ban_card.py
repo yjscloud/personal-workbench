@@ -129,9 +129,12 @@ def build_card(b: dict) -> dict:
         f"**目标 IP**：{b['ip']}\n"
         + (f"**归属地**：{geo}\n" if geo else "")
         + f"**封禁时长**：{ttl}\n"
-        f"**授权码**：{b['ticket']}\n"
         f"**申请时间**：{b.get('requested_at') or '-'}\n"
-        f"**理由**：{b['reason'] or '-'}"
+        f"**理由**：{b['reason'] or '-'}\n"
+        # 授权码以前直接印在这里，群内任何看到卡片的人都能拿去用。现在只在按钮
+        # value 里带一次，面板侧按所有者 open_id 校验点击人；要核对申请单，
+        # 在面板「待你授权」里看得到同一串码。
+        "（批准请点下方按钮，仅所有者可操作）"
     )
     approve = {"hermes_local_action": "ban_approve", "code": b["ticket"], "ip": b["ip"]}
     reject = {"hermes_local_action": "ban_reject", "code": b["ticket"], "ip": b["ip"]}

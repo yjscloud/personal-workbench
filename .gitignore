@@ -34,3 +34,7 @@ trash.yaml
 
 # PVE 私有 CA（部署环境自带的证书，不是本项目的东西）
 server/data/pve-ca.pem
+
+# Python 字节码缓存：助手侧脚本在部署机上跑出来的，二进制且每次版本不同
+__pycache__/
+*.pyc

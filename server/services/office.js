@@ -188,6 +188,10 @@ const briefOf = (u) => ({
     input: Number(u?.today?.input) || 0,
     output: Number(u?.today?.output) || 0,
     cache_read: Number(u?.today?.cache_read) || 0,
+    /* 推理 token 与输出是分开记的两列（DeepSeek 的 reasoning 部分），
+       total 里算进去了，所以拆分必须带上它 —— 不带的话
+       "未命中 + 缓存 + 输出" 永远比 total 少一截，看着像算错了 */
+    reasoning: Number(u?.today?.reasoning) || 0,
     api_calls: Number(u?.today?.api_calls) || 0,
     sources: u?.today?.sources && typeof u.today.sources === 'object' ? u.today.sources : {},
     /* 今日花费（元）。桥按时段单价算，取不到就是 0，前端据此决定显不显示 */
@@ -975,6 +979,47 @@ export function securityAutoBan(enabled) {
   }).finally(() => invalidateLocal('/local/security'));
 }
 
+/**
+ * 手动解封。
+ *
+ * 面板上唯一的「撤销」入口：自动封禁误伤、或者自己人换了出口 IP 被当成
+ * 攻击者时，不该逼人去 ssh 敲命令。真正删没删掉由 Python 侧决定 ——
+ * 它删不成功就不会把记录改成 revoked，页面看到的状态就是事实。
+ */
+export function securityUnblock(ip) {
+  const target = String(ip || '').trim();
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(target)) throw new Error('IP 不合法');
+  return bridgeCall('/local/security/unblock', {
+    method: 'POST',
+    body: { ip: target },
+    timeout: 45000,
+  }).finally(() => invalidateLocal('/local/security'));
+}
+
+/** 白名单：读。返回 [{value, note}]，文件在助手机 ~/.hermes/scripts/frp_guard_allow.txt */
+export function securityAllowList() {
+  return bridgeCall('/local/security/allow', { timeout: 15000 }).then(normalizeAllow);
+}
+
+/** 白名单：增 / 删。真正的格式校验在桥那侧（挡 0.0.0.0/0 这类写法） */
+export function securityAllowSave(entry, action = 'add') {
+  return bridgeCall('/local/security/allow', {
+    method: 'POST',
+    body: { entry: String(entry || '').trim(), action: action === 'remove' ? 'remove' : 'add' },
+    timeout: 15000,
+  }).then(normalizeAllow);
+}
+
+function normalizeAllow(d) {
+  return {
+    path: String(d?.path || ''),
+    entries: (d?.entries || []).map((e) => ({
+      value: String(e.value || ''),
+      note: String(e.note || ''),
+    })),
+  };
+}
+
 const SEV_LABEL = { CRITICAL: '严重', HIGH: '高危', MED: '关注', LOW: '低' };
 
 /**
@@ -1094,6 +1139,9 @@ function normalizeSecurity(d) {
     })),
     degraded: sn.health?.degraded || [],
     blind: sn.health?.blind || [],
+    /* 告警实际走哪条路：cron 投递还是 webhook 直推。没配 webhook 时
+       告警完全依赖 cron，那条链路断了就没人知道 —— 页面要能把这件事说出来。 */
+    alertChannel: String(sn.health?.alert_channel || 'cron'),
 
     /* 境外 IP 自动封禁开关：开着就不等人点按钮，程序自己批。默认关。 */
     autoBan: {
@@ -1166,6 +1214,10 @@ function normalizeSecurity(d) {
       requestedAt: String(b.requested_at || ''),
       expiresAt: String(b.expires_at || ''),
       approvedBy: String(b.approved_by || ''),
+      /* 执行结果 / 失败原因（如「ssh: connect ... timed out」）。
+         只有状态没有原因时，「执行失败」四个字看不出是没连上 frps 还是
+         ipset 拒绝执行，用户只能猜要不要重封。截断到 200 字，够看关键行。 */
+      result: String(b.result || '').slice(0, 200),
     })),
 
     /* 只留界面上会写的几个阈值：整份 thresholds 里还有冷却、日上限这类内部参数 */

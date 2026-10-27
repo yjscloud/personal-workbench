@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import {
   Area,
@@ -1220,10 +1220,13 @@ function GrowthPanel() {
  * 版面借的是一张参考图：左"今日"、右"累计"，各一个大数；今日下面压一条进度条；
  * 底部一行按用途拆开的小字。改动的是两组数字的**含义**——
  *
- * 进度条的分母用「近 30 天最高的一天」，不是"预算"：预算得由人来定，
- * 而这台机器上没人定过。用历史峰值当基准不需要任何配置，回答的还是同一个
- * 问题："今天是不是异常高的一天"。只有历史上有过别的日子才可能报黄 ——
- * 库刚建起来的第一天，today 必然等于 peak，那不是异常。
+ * 进度条的分母是**预算**（网关给的 budget_tokens，与智能办公室那张卡同一份），
+ * 不再是"近 14 天最高的一天"：同一个 808 万，办公室那张按 1000 万算 81%、
+ * 这里按峰值算 44%，两页对不上，看着就是坏的。
+ *
+ * 峰值仍然有用（"是不是异常高的一天"），所以它退到两条小字里：正文那行报
+ * 「是近 14 天最高的一天」，底部来源行报峰值具体是多少。取不到预算时才回退
+ * 成拿峰值当分母 —— 总比画一条全是 0 的条子强。
  */
 function TokenPanel() {
   const usage = useAiUsage();
@@ -1276,10 +1279,21 @@ function TokenPanel() {
   const windowLabel = gwSeries?.length ? '近 14 天' : '近 30 天';
   const windowLen = gwSeries?.length ? gwSeries.length : localDays.length;
   const record = windowLen >= 2 && today > 0 && today >= peak;
+  /* 进度条的分母是**预算**（网关给的 budget_tokens，和智能办公室那张同一份），
+     不再是"近 14 天峰值"：同一个 808 万，在办公室那张卡上画 81%、在这里画 44%，
+     两页对不上。而且峰值取的是 total、柱状图用的是 billed，本来也不同源。
+     峰值仍然留着用（最高一天的判断 + 口径写清楚），只是不再当分母 */
+  const budget = gw?.budget_tokens ?? 0;
+  const ratio = budget > 0 ? today / budget : peak > 0 ? today / peak : 0;
+  const nearBudget = budget > 0 ? ratio >= 0.9 : record;
   const delta = yesterday > 0 ? ((today - yesterday) / yesterday) * 100 : null;
   /* 输入里绝大部分是 agent 的固定脚手架加上正文，输出只是那一小截答复。
-     把两者并排摆出来，比单说"一共花了多少"更能说明钱花在哪儿 */
-  const outShare = inTokens > 0 ? (outTokens / inTokens) * 100 : 0;
+     把两者并排摆出来，比单说"一共花了多少"更能说明钱花在哪儿。
+     分母是**全部输入**（未命中 + 缓存命中）：缓存那 761 万也是真喂进去的
+     prompt，只拿未命中那 33.6 万当分母，就把"答复只占 1%"报成"占 25%"，
+     和同一张卡上面那行"含缓存命中 761 万"自相矛盾 */
+  const inputAll = inTokens + (gw?.today.cache_read ?? 0);
+  const outShare = inputAll > 0 ? (outTokens / inputAll) * 100 : 0;
   /* 面板自己的账（网关账的子集）：累计那行留着它 —— "面板自己花了多少"
      仍是排查时最常问的一句，但它不该冒充全站数字 */
   const total = usedTokens(usage.total);
@@ -1311,16 +1325,33 @@ function TokenPanel() {
           <p className="text-2xs text-muted">今日消耗 Token</p>
           <p className="mt-1 flex flex-wrap items-baseline gap-x-1.5">
             <span className="num text-[26px] font-semibold leading-none tracking-display text-ink">{fmtTokens(today)}</span>
-            <span className="num text-2xs text-faint">/ {windowLabel}峰值 {fmtTokens(peak)}</span>
+            {/* 分母和下面那条进度条必须一致：换了分母却没换标签，就是"数字和条子对不上" */}
+            <span className="num text-2xs text-faint">
+              {budget > 0 ? `/ 预算 ${gw?.budget_label || fmtTokens(budget)}` : `/ ${windowLabel}峰值 ${fmtTokens(peak)}`}
+            </span>
           </p>
-          {/* 总消耗含缓存命中：不写这一句，4.2M 会看着像"今天读了四百多万字新内容" */}
-          <p className="mt-1.5 text-2xs leading-relaxed text-faint">
-            含缓存命中 {fmtTokens(gw?.today.cache_read ?? 0)} · 未命中 {fmtTokens(inTokens)} · 输出{' '}
-            {outTokens.toLocaleString('zh-CN')}
-            {/* 金额是按 billed 算的，不把 billed 摆出来，¥ 和主数字除一下对不上任何单价 */}
-            {gw ? ` · 计费口径 ${fmtTokens(gw.today.billed)}` : ''}
+          {/* 总消耗含缓存命中：不写这一句，4.2M 会看着像"今天读了四百多万字新内容"。
+              每一项单独 nowrap —— 之前"计费口径 47.6 / 万"会被折行拆开，
+              数字和单位分家看着像算错了 */}
+          <p className="mt-1.5 flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 text-2xs leading-relaxed text-faint">
+            {[
+              `含缓存命中 ${fmtTokens(gw?.today.cache_read ?? 0)}`,
+              `未命中 ${fmtTokens(inTokens)}`,
+              `输出 ${fmtTokens(outTokens)}`,
+              /* 推理那部分在 total 里，不列出来的话前三项加不出上面的总数 */
+              gw?.today.reasoning ? `推理 ${fmtTokens(gw.today.reasoning)}` : '',
+              /* 金额是按 billed 算的，不把 billed 摆出来，¥ 和主数字除一下对不上任何单价 */
+              gw ? `计费口径 ${fmtTokens(gw.today.billed)}` : '',
+            ]
+              .filter(Boolean)
+              .map((item, i) => (
+                <Fragment key={item}>
+                  {i > 0 ? <span aria-hidden>·</span> : null}
+                  <span className="whitespace-nowrap">{item}</span>
+                </Fragment>
+              ))}
           </p>
-          <Meter ratio={peak > 0 ? today / peak : 0} tone={record ? 'warn' : 'accent'} className="mt-3" />
+          <Meter ratio={ratio} tone={nearBudget ? 'warn' : 'accent'} className="mt-3" />
           {cost === null ? null : (
             <p className="mt-2 flex flex-wrap items-baseline gap-x-1.5 text-2xs text-muted">
               <span>今日消费</span>
@@ -1346,7 +1377,7 @@ function TokenPanel() {
               {outTokens.toLocaleString('zh-CN')}
             </span>
             <span className="num text-2xs text-faint">
-              / 占输入 {outShare < 1 ? outShare.toFixed(2) : outShare.toFixed(1)}%
+              / 占总输入 {outShare < 1 ? outShare.toFixed(2) : outShare.toFixed(1)}%
             </span>
           </p>
           <p className="mt-3 text-2xs leading-relaxed text-faint">
@@ -1402,7 +1433,7 @@ function TokenPanel() {
         {gw ? (
           <p className="text-2xs leading-relaxed text-muted">
             今日按来源 {gatewaySplit || '—'}
-            {gw.budget_label ? ` · 预算 ${gw.budget_label}` : ''}
+            {windowLen >= 1 ? ` · ${windowLabel}峰值 ${fmtTokens(peak)}` : ''}
             {gw.at ? ` · 网关快照 ${fmtRelative(gw.at)}` : ''}
           </p>
         ) : null}

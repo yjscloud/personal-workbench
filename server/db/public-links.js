@@ -18,6 +18,10 @@ const COLS =
 /** 单条链接每天最多收多少条。防的是"链接被转到公开群之后被刷" */
 export const DAY_CAP = 200;
 
+/** 单条链接每天允许的附件总字节：20MB ≈ 4 次"带满附件"的提交。
+    只按条数限的话，200 条 × 3 个 × 1.5MB ≈ 900MB/天，磁盘是被这样吃掉的 */
+export const DAY_BYTES_CAP = 20 * 1024 * 1024;
+
 const toIso = (value) => {
   if (!value) return null;
   const d = value instanceof Date ? value : new Date(value);
@@ -158,22 +162,32 @@ export async function removeLink(id) {
  * 记一次提交。**先占额度再建任务**：并发下"先查再写"会同时挤进来。
  * 条件写进 WHERE，命中不了就说明当天额度或总量已经用完。
  * 返回 false 表示没占到额度（调用方按 429 处理），不是数据库出错。
+ *
+ * bytes 是这次提交的附件总字节。条数与字节在**同一条 UPDATE** 里判定：
+ * 分成"先查当日字节、够了再写"两步的话，两个并发请求会各自读到旧值，
+ * 于是都能通过 —— 那正是当初写 day_count 时想避免的问题。
  */
-export async function consumeQuota(id, dayKey, now = new Date()) {
+export async function consumeQuota(id, dayKey, bytes = 0, now = new Date()) {
   /* 时间戳用 JS 的 Date 传进来，不用 SQL 的 NOW()：这张表的时间列在别处
      都是 JS Date 写入的，混用 NOW() 会跟着连接的时区解释走，读回来能差 8 小时
-     （界面上就会显示成「最近 8 小时后」）。 */
+     （界面上就会显示成「最近 8 小时后」）。
+
+     SET 的求值顺序是 left→right（MySQL 的行为），所以凡是要读"旧 day_key"
+     的赋值都必须排在 `day_key = ?` 之前；WHERE 用的则始终是更新前的行。 */
+  const size = Math.max(0, Math.floor(Number(bytes) || 0));
   const [res] = await pool.query(
     'UPDATE `public_links` SET ' +
       '`uses` = `uses` + 1, ' +
       '`day_count` = IF(`day_key` = ?, `day_count` + 1, 1), ' +
+      '`day_bytes` = IF(`day_key` = ?, `day_bytes` + ?, ?), ' +
       '`day_key` = ?, ' +
       '`last_used_at` = ?, ' +
       '`updated_at` = ? ' +
       'WHERE `id` = ? ' +
       'AND (`max_uses` IS NULL OR `uses` < `max_uses`) ' +
-      'AND (`day_key` <> ? OR `day_count` < ?)',
-    [dayKey, dayKey, now, now, String(id), dayKey, DAY_CAP],
+      'AND (`day_key` <> ? OR `day_count` < ?) ' +
+      'AND (`day_key` <> ? OR `day_bytes` + ? <= ?)',
+    [dayKey, dayKey, size, size, dayKey, now, now, String(id), dayKey, DAY_CAP, dayKey, size, DAY_BYTES_CAP],
   );
   return Number(res.affectedRows) > 0;
 }

@@ -1149,6 +1149,8 @@ export type OfficeGuardBlock = {
   requestedAt: string;
   expiresAt: string;
   approvedBy: string;
+  /** 执行结果或失败原因（failed 时是 ssh / ipset 的原始报错），无则空串 */
+  result: string;
 };
 
 export type OfficeGuardIp = {
@@ -1187,6 +1189,8 @@ export type OfficeTabGuard = {
   health: OfficeGuardHealth[];
   degraded: string[];
   blind: string[];
+  /** 告警实际通道：'webhook'（直推）或 'cron'（只有 cron 投递这一条路） */
+  alertChannel: 'webhook' | 'cron';
   topIps: OfficeGuardIp[];
   subnets: { cidr: string; geo: string; ipCount: number; hits: number; severity: OfficeGuardSeverity; severityLabel: string; members: string[] }[];
   /** 暴露面档案：失联 / 未登记的新入口比扫描次数更值得看 */
@@ -1224,6 +1228,23 @@ export type OfficeGuardProfile = {
 
 /** 工位卡片上的边界守望摘要（尾流） */
 export type OfficeGuardBrief = { pending: number; high: number; ok: boolean };
+
+/** 边界守望白名单：文件位置 + 生效条目（注释里通常写着这条是谁的出口） */
+export type OfficeSecurityAllow = {
+  path: string;
+  entries: { value: string; note: string }[];
+};
+
+/** 破坏性操作日志：重置 / 导入 / 云恢复 / 批量彻底删除 / 封禁决策与解封 */
+export type OperationLogItem = {
+  seq: number;
+  at: string;
+  actor: string;
+  ip: string;
+  action: string;
+  target: string;
+  detail: string;
+};
 
 /** 页签名。与上游控制台一致（边界守望只给尾流） */
 export type OfficeSeatTabKey = 'config' | 'skills' | 'evo' | 'guard' | 'memory' | 'chat';
@@ -1398,6 +1419,8 @@ export type AiGatewayUsage = {
     input: number;
     output: number;
     cache_read: number;
+    /** 推理 token：与输出分开记账，total 里已经包含，拆分时要单独列出来 */
+    reasoning: number;
     api_calls: number;
     /** 按来源的 token 数：cron（员工定时任务）/ api_server（接口调用）… */
     sources: Record<string, number>;
@@ -1625,6 +1648,14 @@ const assistantStream = (message: string, onEvent: (event: AssistantStreamEvent)
 
 /* ── 接口 ──────────────────────────────────────────────────────────── */
 export const api = {
+  /**
+   * 破坏性操作日志（新在前）。
+   *
+   * 这些动作（重置、整库导入、云恢复、批量彻底删除、封禁决策/解封/白名单）
+   * 在别处都不留痕，所以这个入口是用来「事后翻账」的。
+   */
+  operations: (limit = 20) => req<{ items: OperationLogItem[] }>(`/operations?limit=${limit}`),
+
   /* 登录：账号在服务端的 .env 里（AUTH_USER / AUTH_PASSWORD）。
      enabled=false 表示服务端没开登录，页面直接放行。 */
   auth: {
@@ -1633,6 +1664,12 @@ export const api = {
     login: (username: string, password: string) =>
       req<{ user: string }>('/auth/login', send('POST', { username, password })),
     logout: () => req<{ ok: boolean }>('/auth/logout', send('POST', {})),
+    /**
+     * 二次认证：用一次登录密码换一张 5 分钟票据。
+     * 导出全量备份（整库 + 加密后的密钥）之前必须先拿它，光有会话不够。
+     */
+    verify: (password: string) =>
+      req<{ token: string; ttl: number }>('/auth/verify', send('POST', { password })),
     /** 改密码。服务端会在同一个响应里换发新会话 cookie（旧会话全部失效） */
     changePassword: (current: string, next: string) =>
       req<{ user: string }>('/auth/password', send('POST', { current, next })),
@@ -2043,6 +2080,20 @@ export const api = {
         '/office/security/auto-ban',
         send('POST', { enabled }),
       ),
+    /**
+     * 手动解封。**会在 frps 上真的执行 ipset del**，所以必须先二次确认。
+     * 删不掉时后端不会把记录改成「已撤销」—— 状态就是事实，不会假装成功。
+     */
+    securityUnblock: (ip: string) =>
+      req<{ ok?: boolean; ip?: string; output?: string }>(
+        '/office/security/unblock',
+        send('POST', { ip }),
+      ),
+    /** 白名单：读。这份名单同时作用于告警与封禁，是误封自己的最后一道阀 */
+    securityAllow: () => req<OfficeSecurityAllow>('/office/security/allow'),
+    /** 白名单：增删。格式校验在服务端，前端传什么都要过一遍 */
+    securityAllowSave: (entry: string, action: 'add' | 'remove' = 'add') =>
+      req<OfficeSecurityAllow>('/office/security/allow', send('POST', { entry, action })),
   },
 
   search: {
@@ -2062,6 +2113,36 @@ export const api = {
 
   backup: {
     exportUrl: '/api/backup',
+    /**
+     * 导出全量备份，需要二次认证票据。
+     *
+     * 不走 req()：那个封装只发 JSON、也带不了自定义头，而这里要 X-Sudo 且
+     * 响应是文件流。浏览器导航（<a download>）同样带不了头，所以用 fetch + blob。
+     */
+    download: async (sudoToken: string) => {
+      const res = await fetch(`${BASE}/backup`, {
+        headers: { 'X-Sudo': sudoToken },
+        credentials: 'same-origin',
+      });
+      if (!res.ok) {
+        let msg = `导出失败（HTTP ${res.status}）`;
+        try {
+          const j = await res.json();
+          if (j?.error) msg = String(j.error);
+        } catch { /* 非 JSON 响应，保留状态码 */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `workbench-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      return blob.size;
+    },
     restore: (payload: unknown) => req<{ restored: boolean }>('/backup/restore', send('POST', payload)),
     reset: () => req<{ reset: boolean }>('/backup/reset', send('POST')),
     save: () => req<{ savedAt: string }>('/backup/save', send('POST')),

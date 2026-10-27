@@ -74,6 +74,9 @@ async function grabImage(href, { insecure }) {
     accept: 'image/*,*/*',
     insecure,
     timeout: 6000,
+    /* 打的是用户自己的书签地址，内网面板要放行；但回环、云元数据不行 */
+    guard: 'lan',
+    redirects: 3,
   });
   if (!body.length || body.length > ICON_MAX) return null;
   const mime = sniffImage(body);
@@ -105,6 +108,8 @@ export async function fetchSiteIcon(url) {
       limit: HTML_LIMIT,
       accept: 'text/html,application/xhtml+xml,*/*',
       insecure: true,
+      guard: 'lan',
+      redirects: 3,
     });
     base = page.url;
     siteReachable = true;

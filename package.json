@@ -48,6 +48,7 @@
     "db:init": "mysql -uroot -p < server/db/bootstrap.sql",
     "db:migrate": "node server/db/migrate.js",
     "hermes:probe": "node server/tools/hermes-probe.js",
+    "feishu:card-check": "node server/tools/feishu-card-check.js",
     "auth:reset": "node server/tools/auth-reset.js",
     "bridge:deploy": "bash scripts/deploy-bridge.sh"
   },

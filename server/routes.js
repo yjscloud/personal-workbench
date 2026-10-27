@@ -27,6 +27,9 @@ import {
   securityProfile,
   securityDecide,
   securityAutoBan,
+  securityUnblock,
+  securityAllowList,
+  securityAllowSave,
 } from './services/office.js';
 import { readGovernor, GOVERNORS } from './services/cpu.js';
 import { backgroundStatus, saveBackground, clearBackground } from './services/background.js';
@@ -80,6 +83,7 @@ import {
 } from './services/auth.js';
 import { ask, askStream } from './services/assistant.js';
 import { listMessages, addMessage, clearMessages, countMessages } from './db/messages.js';
+import { logOperation, listOperations } from './db/audit.js';
 import { listComments, addComment, removeComment, clearTicketComments, countComments } from './db/comments.js';
 import {
   listAttachments,
@@ -472,8 +476,13 @@ router.post(
   wrap(async (req, res) => {
     /* 无状态 token 本来"退不掉"，这里把会话代号 +1，让此前签发的所有
        token 立即失效（见 services/auth.js 的 revokeAllSessions）。
-       本机这张 Cookie 照样由浏览器丢弃。 */
-    if (authConfig().enabled) await revokeAllSessions();
+       本机这张 Cookie 照样由浏览器丢弃。
+
+       要求"确实有人在登着"：这个接口此前在 index.js 的 API_OPEN 白名单里，
+       任何人都能反复调用，把所有设备一起踢下线。 */
+    const enabled = authConfig().enabled;
+    if (enabled && !currentUser(req)) return fail(res, 401, '登录已过期，请重新登录');
+    if (enabled) await revokeAllSessions();
     res.setHeader('Set-Cookie', expiredCookie(isSecure(req)));
     ok(res, { ok: true });
   }),
@@ -488,6 +497,96 @@ router.post(
  * 密码一改，**所有**旧会话（包括这台）都会失效；不续发一张，
  * 用户会被自己刚做的操作踢到登录页。
  */
+/* ── 二次认证票据（sudo） ────────────────────────────────────────────
+   为什么要它：导出备份那一下等于把整库 + 加密后的密钥打成一个包，一个会话
+   cookie 就够拿走 —— 代价和「看一眼设置页」完全不对等。这里要一张 5 分钟的
+   票据，拿票的前提是「刚刚重新输过一次登录密码」。
+
+   票据只存内存：单进程服务，重启即失效。它不该落库 —— 落库就等于把「刚证明
+   过是本人」这件事也变成了可被转储的资产。 */
+const SUDO_TTL_MS = 5 * 60 * 1000;
+const sudoTickets = new Map();
+
+/** 导出频次：同一用户 10 分钟内最多 3 次。正常搬家不会这么勤，连刷就是异常 */
+const EXPORT_WINDOW_MS = 10 * 60 * 1000;
+const EXPORT_LIMIT = 3;
+const exportHits = new Map();
+
+function issueSudo(user) {
+  const token = globalThis.crypto.randomUUID().replace(/-/g, '');
+  sudoTickets.set(token, { user, exp: Date.now() + SUDO_TTL_MS });
+  for (const [k, v] of sudoTickets) if (v.exp < Date.now()) sudoTickets.delete(k);
+  return token;
+}
+
+function hasSudo(req, user) {
+  const token = String(req.headers['x-sudo'] || '').trim();
+  if (!token) return false;
+  const hit = sudoTickets.get(token);
+  if (!hit) return false;
+  if (hit.exp < Date.now() || hit.user !== user) {
+    sudoTickets.delete(token);
+    return false;
+  }
+  return true;
+}
+
+/** 记一次导出，返回是否还在配额内 */
+function exportAllowed(user) {
+  const now = Date.now();
+  const hits = (exportHits.get(user) || []).filter((t) => now - t < EXPORT_WINDOW_MS);
+  if (hits.length >= EXPORT_LIMIT) {
+    exportHits.set(user, hits);
+    return false;
+  }
+  hits.push(now);
+  exportHits.set(user, hits);
+  return true;
+}
+
+/**
+ * 二次认证：用一次登录密码换 5 分钟票据。
+ *
+ * 没开登录（authEnabled() 为 false）时没有密码可验，直接发票 —— 那种部署
+ * 本身就没有会话概念，加这一层只会变成摆设。
+ */
+router.post(
+  '/auth/verify',
+  wrap(async (req, res) => {
+    const user = currentUser(req);
+    if (!user) return fail(res, 401, '登录已过期，请重新登录');
+
+    const cfg = authConfig();
+    if (!cfg.enabled) return ok(res, { token: issueSudo(user), ttl: Math.floor(SUDO_TTL_MS / 1000) });
+
+    /* 走和登录同一套闸门：锁定 → 频率 → 失败计数/延迟。
+       只调 verifyCurrent 的话，这里就成了"无限速试口令换 sudo"的旁路。 */
+    const ip = req.ip || 'unknown';
+    const wait = blockedFor(ip, cfg.user);
+    if (wait) {
+      res.setHeader('Retry-After', String(wait));
+      return fail(res, 429, `尝试过于频繁，请 ${Math.ceil(wait / 60)} 分钟后再试`);
+    }
+    if (!withinLoginRate(ip)) {
+      res.setHeader('Retry-After', '60');
+      return fail(res, 429, '验证过于频繁，请一分钟后再试');
+    }
+
+    const who = checkCredentials(ip, cfg.user, String(req.body?.password || ''));
+    if (who === 'blocked') {
+      res.setHeader('Retry-After', String(blockedFor(ip, cfg.user) || 60));
+      return fail(res, 429, '尝试过于频繁，请稍后再试');
+    }
+    if (!who) {
+      const delay = loginDelayMs(ip, cfg.user);
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      await auditOp(req, 'auth.verify.failed', user, '二次认证失败（密码不正确）');
+      return fail(res, 403, '密码不正确');
+    }
+    ok(res, { token: issueSudo(user), ttl: Math.floor(SUDO_TTL_MS / 1000) });
+  }),
+);
+
 router.post(
   '/auth/password',
   wrap(async (req, res) => {
@@ -496,7 +595,27 @@ router.post(
     if (!currentUser(req)) return fail(res, 401, '登录已过期，请重新登录');
 
     const { current = '', next = '' } = req.body || {};
-    if (!verifyCurrent(cfg.user, String(current))) return fail(res, 400, '当前密码不正确');
+    /* 改密码同样要过登录那套闸门：不然它就是一个"可以无限次试当前口令"的接口 */
+    const ip = req.ip || 'unknown';
+    const wait = blockedFor(ip, cfg.user);
+    if (wait) {
+      res.setHeader('Retry-After', String(wait));
+      return fail(res, 429, `尝试过于频繁，请 ${Math.ceil(wait / 60)} 分钟后再试`);
+    }
+    if (!withinLoginRate(ip)) {
+      res.setHeader('Retry-After', '60');
+      return fail(res, 429, '操作过于频繁，请一分钟后再试');
+    }
+    const who = checkCredentials(ip, cfg.user, String(current));
+    if (who === 'blocked') {
+      res.setHeader('Retry-After', String(blockedFor(ip, cfg.user) || 60));
+      return fail(res, 429, '尝试过于频繁，请稍后再试');
+    }
+    if (!who) {
+      const delay = loginDelayMs(ip, cfg.user);
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      return fail(res, 400, '当前密码不正确');
+    }
 
     const pass = String(next);
     if (pass.length < 6) return fail(res, 400, '新密码至少 6 位');
@@ -772,6 +891,8 @@ router.post(
       removedComments += comments;
       removedAttachments += files;
     }
+    await auditOp(req, 'tickets.batch-delete', targets.join(','),
+      `彻底删除 ${targets.length} 个任务（评论 ${removedComments} / 附件 ${removedAttachments} 一并清掉）`);
     ok(res, { removed: targets.length, removedComments, removedAttachments });
   }),
 );
@@ -2011,6 +2132,7 @@ router.post(
     update((d) => {
       d.knowledge = d.knowledge.filter((k) => !targets.includes(k.id));
     });
+    await auditOp(req, 'knowledge.batch-delete', targets.join(','), `彻底删除 ${targets.length} 篇知识库条目`);
     ok(res, { removed: targets.length });
   }),
 );
@@ -2489,9 +2611,11 @@ router.delete(
  */
 router.post(
   '/backup/cos/run',
-  wrap(async (_req, res) => {
+  wrap(async (req, res) => {
     try {
-      ok(res, await runBackup({ trigger: 'manual' }));
+      const r = await runBackup({ trigger: 'manual' });
+      await auditOp(req, 'backup.cos.run', String(r?.key || r?.name || ''), '手动上传云备份');
+      ok(res, r);
     } catch (err) {
       fail(res, 502, err.message);
     }
@@ -2541,6 +2665,7 @@ router.post(
     try {
       const result = await restoreFromCos(req.body?.key);
       applyBackupSchedule();
+      await auditOp(req, 'backup.cos.restore', String(req.body?.key || ''), '从云备份覆盖整库');
       ok(res, result);
     } catch (err) {
       fail(res, 502, err.message);
@@ -2548,28 +2673,76 @@ router.post(
   }),
 );
 
-router.get('/backup', (_req, res) => {
-  res.setHeader('Content-Disposition', `attachment; filename="workbench-backup-${new Date().toISOString().slice(0, 10)}.json"`);
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.send(JSON.stringify(exportAll(), null, 2));
-});
+/**
+ * 导出全量备份。
+ *
+ * 这是整个应用里「一次拿走最多东西」的接口：全部业务数据 + 配置 +
+ * 12 类密钥（应用层加密后的密文）+ storage 段（库名 / 主机）。所以它不能和
+ * 普通 GET 一个门槛 —— 一个会话 cookie 就够，代价太低。
+ *
+ * 三道门：二次认证票据（5 分钟）→ 频次（10 分钟 3 次）→ 审计留痕。
+ * 密文密钥仍保留在包里：备份本来就是搬家用的，真正的隔离靠 SETTINGS_KEY
+ * 不跟着走（见 services/secrets.js 里「挡得住 / 挡不住」那段）。
+ */
+router.get(
+  '/backup',
+  wrap(async (req, res) => {
+    const user = currentUser(req) || '未登录';
+    if (authConfig().enabled) {
+      if (!hasSudo(req, user)) {
+        return fail(res, 403, '导出需要二次认证：请重新输入登录密码');
+      }
+      if (!exportAllowed(user)) {
+        return fail(res, 429, `导出过于频繁（${EXPORT_WINDOW_MS / 60000} 分钟内最多 ${EXPORT_LIMIT} 次）`);
+      }
+    }
+
+    const body = JSON.stringify(exportAll(), null, 2);
+    await auditOp(req, 'backup.export', `${Math.round(body.length / 1024)} KB`,
+      '导出全量备份（业务数据 + 配置 + 加密后的密钥）');
+    res.setHeader('Content-Disposition', `attachment; filename="workbench-backup-${new Date().toISOString().slice(0, 10)}.json"`);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.send(body);
+  }),
+);
 
 router.post(
   '/backup/restore',
   wrap(async (req, res) => {
+    /* 恢复是可破坏性操作，和导出同一个门槛：只要有会话就能覆盖全库，
+       等于把"偷一个 cookie"升级成"换掉主人" */
+    const user = currentUser(req) || '未登录';
+    if (authConfig().enabled && !hasSudo(req, user)) {
+      return fail(res, 403, '恢复备份需要二次认证：请重新输入登录密码');
+    }
     const payload = req.body?.data || req.body;
     if (!payload || typeof payload !== 'object' || !payload.todos) {
       return fail(res, 400, '备份文件格式不正确');
     }
-    await replaceAll(payload);
-    ok(res, { restored: true });
+    /* 认证配置不从备份里恢复：备份文件是可以被拷走的，能写 passwordHash
+       就等于能换主人。restore 只负责业务数据与集成配置。 */
+    const droppingAuth = Boolean(payload.settings && payload.settings.auth);
+    const sanitized = droppingAuth
+      ? { ...payload, settings: Object.fromEntries(Object.entries(payload.settings).filter(([k]) => k !== 'auth')) }
+      : payload;
+    await replaceAll(sanitized);
+    await auditOp(req, 'backup.import', String(payload.exportedAt || ''),
+      `整库导入：任务 ${Array.isArray(payload.todos) ? payload.todos.length : 0} 条${droppingAuth ? '（已忽略包内的认证配置）' : ''}`);
+    ok(res, { restored: true, authIgnored: droppingAuth });
   }),
 );
 
 router.post(
   '/backup/reset',
-  wrap(async (_req, res) => {
+  wrap(async (req, res) => {
+    /* 重置会把库清回示例数据、连口令哈希一起清掉 —— 未设 AUTH_PASSWORD 的
+       部署里，这一步等于把面板对所有人开放。所以同样要 sudo。 */
+    const user = currentUser(req) || '未登录';
+    if (authConfig().enabled && !hasSudo(req, user)) {
+      return fail(res, 403, '重置数据需要二次认证：请重新输入登录密码');
+    }
     await resetToSeed();
+    await auditOp(req, 'backup.reset', '', '重置为示例数据（清空当前全部数据）');
     ok(res, { reset: true });
   }),
 );
@@ -2579,6 +2752,20 @@ router.post(
   wrap(async (_req, res) => {
     await persist();
     ok(res, { savedAt: new Date().toISOString(), tables: await dbStats() });
+  }),
+);
+
+/**
+ * 破坏性操作日志（只读）。
+ *
+ * 存在的意义只有一个：事后能回答「谁干的」。重置、整库导入、云恢复、批量彻底
+ * 删除、封禁决策与解封，除了这里没有别的地方留痕。默认给最近 100 条，
+ * 不做分页检索 —— 它是翻账入口，不是审计系统。
+ */
+router.get(
+  '/operations',
+  wrap(async (req, res) => {
+    ok(res, { items: await listOperations(req.query?.limit) });
   }),
 );
 
@@ -2912,6 +3099,27 @@ function needsHermes(res) {
   return false;
 }
 
+/**
+ * 破坏性操作留痕。
+ *
+ * 审计是旁路：写失败只打日志，不能让一次已经成功的重置/解封变成 500。
+ * 「谁」取会话用户名，「从哪来」取反代后的 X-Forwarded-For 首段 ——
+ * 直连时那是 nginx 的地址，没有排查价值。
+ */
+function auditOp(req, action, target = '', detail = '') {
+  const user = (() => {
+    try { return currentUser(req) || '未登录'; } catch (e) { return '未知'; }
+  })();
+  const fwd = String(req.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
+  return logOperation({
+    actor: user,
+    ip: fwd || String(req.socket?.remoteAddress || ''),
+    action,
+    target,
+    detail,
+  });
+}
+
 /** 本机数据（用量 / 待办 / 配置 / 守望 / 拾贝）只依赖 SSH 数据桥，与网关 Key 无关 */
 function needsLocal(res) {
   if (isLocalConfigured()) return true;
@@ -3069,7 +3277,14 @@ router.post(
   '/office/security/decide',
   wrap(async (req, res) => {
     if (!needsLocal(res)) return;
-    ok(res, await securityDecide(req.body?.code, req.body?.approve === true));
+    const code = String(req.body?.code || '').toUpperCase();
+    const approve = req.body?.approve === true;
+    const r = await securityDecide(code, approve);
+    /* 批/拒都留痕：封禁决策是这套系统里唯一能改变 frps 规则的人工动作，
+       事后要能回答「这个 IP 是谁在什么时候放进/挡住的」 */
+    await auditOp(req, approve ? 'security.approve' : 'security.reject', code,
+      approve ? '批准封禁（执行 ipset add）' : '拒绝封禁申请');
+    ok(res, r);
   }),
 );
 
@@ -3086,7 +3301,57 @@ router.post(
   '/office/security/auto-ban',
   wrap(async (req, res) => {
     if (!needsLocal(res)) return;
-    ok(res, await securityAutoBan(req.body?.enabled === true));
+    const on = req.body?.enabled === true;
+    const r = await securityAutoBan(on);
+    /* 这是整套防护里唯一「无需授权码就能改变封禁行为」的开关，必须留痕 */
+    await auditOp(req, 'security.auto-ban', on ? 'on' : 'off',
+      on ? '开启：境外来源自动封禁（跳过人工审批）' : '关闭：恢复人工审批');
+    ok(res, r);
+  }),
+);
+
+/**
+ * 手动解封。
+ *
+ * 和批准封禁一样会真的在 frps 上执行 ipset del，所以只挂 POST；
+ * 与 decide 的区别是**不需要授权码** —— 解封是「收回」，多一道审批只会
+ * 让误封自救更慢。是否真的删掉由 Python 侧决定，成功才改记录状态。
+ */
+router.post(
+  '/office/security/unblock',
+  wrap(async (req, res) => {
+    if (!needsLocal(res)) return;
+    const ip = String(req.body?.ip || '');
+    const r = await securityUnblock(ip);
+    await auditOp(req, 'security.unblock', ip, '手动解封（撤销 ipset 记录）');
+    ok(res, r);
+  }),
+);
+
+/**
+ * 白名单：读 / 增删。
+ *
+ * 白名单是「自己人不会被自己封」的最后一道阀，所以必须能从页面改 ——
+ * 只能 ssh 编辑等于没有。格式校验（IPv4 / CIDR、掩码不小于 /8）在桥那侧，
+ * 这里不做第二套规则。
+ */
+router.get(
+  '/office/security/allow',
+  wrap(async (_req, res) => {
+    if (!needsLocal(res)) return;
+    ok(res, await securityAllowList());
+  }),
+);
+router.post(
+  '/office/security/allow',
+  wrap(async (req, res) => {
+    if (!needsLocal(res)) return;
+    const entry = String(req.body?.entry || '');
+    const act = req.body?.action === 'remove' ? 'remove' : 'add';
+    const r = await securityAllowSave(entry, act);
+    /* 白名单改一条就可能让某个来源「永不告警、永不可封」，属于防护配置变更 */
+    await auditOp(req, 'security.allow.' + act, entry, act === 'add' ? '加入白名单' : '移出白名单');
+    ok(res, r);
   }),
 );
 

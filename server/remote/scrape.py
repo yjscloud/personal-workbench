@@ -24,8 +24,13 @@
  1. 仅允许 http / https
  2. 解析目标全部 IP，命中私有/回环/链路本地/保留网段一律拒绝
     （内网调试可用环境变量 SCRAPE_ALLOW_PRIVATE=1 临时放开，线上请勿开启）
- 3. 默认遵守 robots.txt，可用 robots:false 显式跳过
- 4. 限制抓取条数、单条长度与总耗时
+ 3. 校验用的地址就是连接的地址：浏览器模式把它钉进 --host-resolver-rules，
+    不让抓取器自己再解析一遍（防 DNS rebinding）；fast 模式钉不住，只能靠
+    Scrapling 自带的 follow_redirects="safe"
+ 4. 重定向最多 MAX_REDIRECTS 跳，翻页链接逐跳重新校验，落地后再看一次最终地址；
+    robots.txt 的请求同样逐跳校验
+ 5. 默认遵守 robots.txt，可用 robots:false 显式跳过
+ 6. 限制抓取条数、单条长度与总耗时
 """
 import ipaddress
 import json
@@ -34,6 +39,7 @@ import re
 import socket
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -46,6 +52,7 @@ PAGE_DELAY_S = 0.6      # 翻页之间的礼貌间隔
 MAX_FIELDS = 12         # 字段映射最多几个字段
 MAX_SAMPLE_CHARS = 12000   # 喂给模型的 HTML 样本上限（控制 token）
 MAX_TEXT_CHARS = 200000    # 供回校验用的全页纯文本上限
+MAX_REDIRECTS = 3          # 重定向跳数上限（和面板侧 http.js 的那个 3 对齐）
 
 BLOCKED_NETWORKS = [
     ipaddress.ip_network("127.0.0.0/8"),      # 回环：含本机 Hermes 网关 8642
@@ -59,8 +66,17 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("100.64.0.0/10"),
     ipaddress.ip_network("192.0.0.0/24"),
-    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("192.0.2.0/24"),     # 文档示例段
+    ipaddress.ip_network("198.51.100.0/24"),
+    ipaddress.ip_network("203.0.113.0/24"),
+    ipaddress.ip_network("198.18.0.0/15"),    # RFC2544 保留段，见 guard() 里的 fake-ip 例外
 ]
+
+# 本机 DNS 走了透明代理的 fake-ip 模式：公网域名一律解析成 198.18.x.x 的占位
+# 地址，真正连的是代理（实测连上去 200）。把它当内网拦掉的话，这台机器上一个
+# 公网站点都抓不了 —— 所以只对「域名解析出来的」放行，域名直接写成
+# 198.18.x.x 的照旧拒绝：那种才是真在打这个网段。
+FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
 
 
 def log(msg):
@@ -73,45 +89,82 @@ def die(msg):
 
 
 def guard(url):
-    """SSRF 前置检查，返回 (host, error)"""
+    """SSRF 前置检查，返回 (host, pinned_ip, error)
+
+    pinned_ip 是这次校验**用的那个地址**。把它交给抓取器钉死（浏览器模式走
+    --host-resolver-rules，fast 模式做不到，见 do_fetch），校验的地址和真正
+    连的地址才是同一个 —— 否则中间换成内网 IP 就是一次 DNS rebinding。
+    字面量 IP 或放开内网调试（SCRAPE_ALLOW_PRIVATE=1）时不给钉子。
+    """
     try:
         u = urllib.parse.urlsplit(url.strip())
     except Exception as exc:
-        return None, "URL 解析失败: %s" % exc
+        return None, None, "URL 解析失败: %s" % exc
 
     if u.scheme not in ("http", "https"):
-        return None, "仅支持 http/https，收到: %s" % (u.scheme or "空")
+        return None, None, "仅支持 http/https，收到: %s" % (u.scheme or "空")
     host = u.hostname
     if not host:
-        return None, "URL 缺少主机名"
+        return None, None, "URL 缺少主机名"
 
     # 允许 /etc/agent-office/scrape-allow.txt 里的域名白名单（可选）
     allow_file = os.environ.get("SCRAPE_ALLOW_FILE", "")
     if allow_file and os.path.isfile(allow_file):
         allowed = [ln.strip().lower() for ln in open(allow_file, encoding="utf-8") if ln.strip()]
         if allowed and not any(host.lower() == a or host.lower().endswith("." + a) for a in allowed):
-            return None, "域名不在白名单中: %s" % host
+            return None, None, "域名不在白名单中: %s" % host
 
     if os.environ.get("SCRAPE_ALLOW_PRIVATE") == "1":
-        return host, None
+        return host, None, None
+
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        literal = True
+    except ValueError:
+        literal = False
 
     try:
         port = u.port or (443 if u.scheme == "https" else 80)
         infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except Exception as exc:
-        return None, "DNS 解析失败: %s" % exc
+        return None, None, "DNS 解析失败: %s" % exc
 
+    ips = []
     for _, _, _, _, sockaddr in infos:
         ip_raw = sockaddr[0]
         try:
             ip = ipaddress.ip_address(ip_raw)
         except ValueError:
-            return None, "非法 IP: %s" % ip_raw
+            return None, None, "非法 IP: %s" % ip_raw
         # 用 nginx/网关地址也一并拦掉：即便解析到本机也不放行
         for net in BLOCKED_NETWORKS:
             if ip in net:
-                return None, "目标指向内网/保留地址，已拒绝: %s (%s)" % (host, ip)
-    return host, None
+                if net == FAKE_IP_NET and not literal:
+                    break          # 透明代理的 fake-ip 占位地址，见 FAKE_IP_NET
+                return None, None, "目标指向内网/保留地址，已拒绝: %s (%s)" % (host, ip)
+        ips.append(str(ip))
+
+    if literal:
+        return host, None, None        # 本来就是字面量 IP，没什么可钉的
+    # 去重保序，钉第一个：一条 MAP 规则只能给一个地址，浏览器本来也只挑一个用
+    return host, (list(dict.fromkeys(ips))[0] if ips else None), None
+
+
+class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+    """robots.txt 的请求也要逐跳校验：一个 302 就能把它带去内网。
+
+    urlopen 默认会自己跟重定向，且不看落点；这里在跳之前先过一遍 guard。
+    """
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _, _, err = guard(newurl)
+        if err:
+            raise urllib.error.URLError("重定向被拒绝: %s" % err)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_ROBOTS_OPENER = urllib.request.build_opener(_GuardedRedirect())
 
 
 def robots_allows(url, timeout=6):
@@ -121,7 +174,7 @@ def robots_allows(url, timeout=6):
         rp = urllib.robotparser.RobotFileParser()
         rp.set_url(base + "/robots.txt")
         req = urllib.request.Request(base + "/robots.txt", headers={"User-Agent": "HarvesterBot/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _ROBOTS_OPENER.open(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", "ignore")
         rp.parse(body.splitlines())
         return rp.can_fetch("HarvesterBot/1.0", url)
@@ -170,15 +223,111 @@ def normalize_url(raw):
     return scheme + host + tail, note, root
 
 
-def do_fetch(url, mode, timeout_s):
+def resolver_rule(url, pinned_ip):
+    """把「域名 -> 校验过的那个 IP」写进 Chromium 的解析器。
+
+    Scrapling 没有给固定 DNS 的参数（fast / dynamic / stealth 都没有），
+    但浏览器模式的 extra_flags 是原样拼进启动参数的，所以用 Chromium 自己的
+    --host-resolver-rules 钉住：它解析这个域名时只会拿到我们校验过的地址，
+    也就关掉了「校验时是公网、连接时变成内网」的窗口。IPv6 要加方括号。
+    """
+    if not pinned_ip:
+        return None
+    host = urllib.parse.urlsplit(url).hostname
+    if not host:
+        return None
+    ip = "[%s]" % pinned_ip if ":" in pinned_ip else pinned_ip
+    return "--host-resolver-rules=MAP %s %s" % (host, ip)
+
+
+# 本轮被抓掉的地址，只用来给报错补一句人话
+_BLOCKED_URLS = []
+
+
+def route_guard(page):
+    """给浏览器加一层请求拦截：子资源（图片 / iframe / XHR）打内网时直接掐掉。
+
+    --host-resolver-rules 只钉得住起始域名，页面里塞一个指向
+    http://192.168.1.1/ 的 <img>，Chromium 照样会连过去。这里每个请求判一次
+    （按主机名缓存结果，不会每个子资源都去解析一遍）。
+
+    一个必须说清楚的边界：Playwright 的 page.route **拦不到重定向产生的新请求**
+    （实测 302 到 127.0.0.1 时事件根本不触发），所以主文档被跳转只能靠
+    fetch_page 落地后的最终地址校验兜底 —— 那一跳的内容已经拉回来了，只是
+    不往上层返。子资源这一层是真拦在发出之前的。
+    """
+    seen = {}
+
+    def allowed(target):
+        if target.startswith(("data:", "blob:", "about:", "chrome:", "devtools:")):
+            return True
+        try:
+            host = urllib.parse.urlsplit(target).hostname or ""
+        except Exception:
+            return False
+        if not host:
+            return True
+        if host not in seen:
+            seen[host] = guard(target)[2] is None
+        return seen[host]
+
+    def handler(route):
+        target = route.request.url
+        if allowed(target):
+            route.continue_()
+        else:
+            if len(_BLOCKED_URLS) < 5:
+                _BLOCKED_URLS.append(target)
+            route.abort()
+
+    page.route("**/*", handler)
+
+
+def do_fetch(url, mode, timeout_s, pinned_ip=None):
+    """抓一页。pinned_ip 来自 guard()，浏览器模式下会被钉死。"""
     if mode == "fast":
         from scrapling.fetchers import Fetcher
-        return Fetcher.get(url, timeout=timeout_s)
+        # fast 走 curl_cffi，没有钉 DNS 的口子（只能连 IP 再手动补 Host 头，
+        # 那样 https 的证书校验就没法看了）。它自带的重定向策略能顶一部分：
+        # follow_redirects="safe" 会拒绝跳到内网/保留地址的重定向。默认就是
+        # 它，这里写明是为了不被上游改默认值悄悄带走；跳数也从 30 收到 3。
+        return Fetcher.get(url, timeout=timeout_s,
+                           follow_redirects="safe", max_redirects=MAX_REDIRECTS)
+
+    flags = resolver_rule(url, pinned_ip)
+    extra = [flags] if flags else None
     if mode == "dynamic":
         from scrapling.fetchers import DynamicFetcher
-        return DynamicFetcher.fetch(url, headless=True, disable_resources=True, timeout=timeout_s * 1000)
+        return DynamicFetcher.fetch(url, headless=True, disable_resources=True,
+                                    timeout=timeout_s * 1000, extra_flags=extra,
+                                    page_setup=route_guard)
     from scrapling.fetchers import StealthyFetcher
-    return StealthyFetcher.fetch(url, headless=True, timeout=timeout_s * 1000)
+    return StealthyFetcher.fetch(url, headless=True, timeout=timeout_s * 1000,
+                                 extra_flags=extra, page_setup=route_guard)
+
+
+def fetch_page(url, mode, timeout_s, pinned_ip=None):
+    """抓一页，并且确认它最终落在允许的地址上。
+
+    两层保险：跳之前每个请求都过 route_guard（浏览器模式），落地后再看一次
+    最终地址 —— 万一哪条路绕过了拦截，内容和样本也一律不往上层返。
+    """
+    del _BLOCKED_URLS[:]
+    try:
+        page = do_fetch(url, mode, timeout_s, pinned_ip)
+    except Exception as exc:
+        if _BLOCKED_URLS:
+            raise RuntimeError("拦截了指向内网/保留地址的请求: %s" % _BLOCKED_URLS[0])
+        # curl 那边把内网 IP 直接写进英文错误里（Redirect to internal IP ...）：
+        # 换成人话，也别把地址原样回显出去
+        if "SSRF protection" in str(exc):
+            raise RuntimeError("目标站点重定向到内网/保留地址，已拒绝")
+        raise
+    final = str(getattr(page, "url", "") or url)
+    _, _, err = guard(final)
+    if err:
+        raise RuntimeError("重定向到了不允许的地址: %s" % err)
+    return page
 
 
 def clean_sample(html):
@@ -489,7 +638,7 @@ def main():
     except Exception:
         timeout_s = 20
 
-    host, err = guard(url)
+    host, pinned_ip, err = guard(url)
     if err:
         log("拒绝: %s -> %s" % (url, err))
         return die(err)
@@ -500,10 +649,10 @@ def main():
     # ---- sample 模式：只抓首页，回样本给 AI 用（不抽取、不翻页）----
     if req.get("sample"):
         try:
-            page = do_fetch(url, mode, timeout_s)
+            page = fetch_page(url, mode, timeout_s, pinned_ip)
             if getattr(page, "status", None) == 404 and root and root != url:
                 try:
-                    page2 = do_fetch(root, mode, timeout_s)
+                    page2 = fetch_page(root, mode, timeout_s, pinned_ip)
                     if getattr(page2, "status", None) != 404:
                         page, url = page2, root
                         note = (note + "；" if note else "") + "该路径 404，已回退到站点首页"
@@ -540,17 +689,18 @@ def main():
     items, page_reports = [], []
     visited = {url}
     current = url
+    current_ip = pinned_ip
     first_page = None
     first_status = None
 
     while len(page_reports) < pages_wanted:
         try:
-            page = do_fetch(current, mode, timeout_s)
+            page = fetch_page(current, mode, timeout_s, current_ip)
             # 中文拼出来的路径多半不存在：首页 404 时自动回退站点首页再抓一次
             if not page_reports and getattr(page, "status", None) == 404 and root and root != current:
                 log("404，回退站点首页: %s" % root)
                 try:
-                    page2 = do_fetch(root, mode, timeout_s)
+                    page2 = fetch_page(root, mode, timeout_s, current_ip)
                     if getattr(page2, "status", None) != 404:
                         page, current = page2, root
                         visited.add(root)
@@ -585,13 +735,19 @@ def main():
         if not nxt:
             notes.append("第 %d 页后没有「下一页」链接，已停止翻页" % len(page_reports))
             break
+        # 「下一页」是站点给的链接，可能直接写着内网地址：每一跳都重新校验，
+        # 并且用这一跳自己解析出来的 IP 去钉，不沿用首页那一个
+        _, nxt_ip, nxt_err = guard(nxt)
+        if nxt_err:
+            notes.append("「下一页」指向不允许的地址（%s），已停止翻页" % nxt_err)
+            break
         if respect_robots and not robots_allows(nxt):
             notes.append("「下一页」robots.txt 不允许抓取，已停止翻页")
             break
         log("翻页 -> %s (%s)" % (nxt, why))
         time.sleep(PAGE_DELAY_S)
         visited.add(nxt)
-        current = nxt
+        current, current_ip = nxt, nxt_ip
 
     if not items and not page_reports:
         return die("没有抓到任何内容")

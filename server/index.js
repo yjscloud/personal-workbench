@@ -112,7 +112,8 @@ app.use('/api', (req, res, next) => {
 const API_OPEN = [
   { method: 'GET', path: '/auth/me' },
   { method: 'POST', path: '/auth/login' },
-  { method: 'POST', path: '/auth/logout' },
+  /* logout 不在白名单里：它会把**所有设备**的会话一起吊销，未登录也能调
+     等于给了任何能访问端口的人一个反复踢人的开关。 */
   { method: 'GET', path: '/health' },
   { method: 'GET', path: '/version' },
   // 登录页要先能取到自己的背景图；但上传 / 删除必须登录

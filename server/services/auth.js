@@ -21,7 +21,14 @@ import { db, flush, update } from '../store.js';
    没有限速的话一个脚本就能把密码试到底。 */
 
 const COOKIE = 'wb_session';
-const TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * 会话有效期。
+ *
+ * 默认 7 天（原来的硬编码值），但管理类后台 7 天确实偏长：一次会话被拿走，
+ * 攻击者能用一整周。想收紧就在 .env 里设 SESSION_TTL_HOURS=12，代价是
+ * 每天要重登一次 —— 这个取舍交给使用者，不再埋在代码里。
+ */
+const TTL_MS = Math.min(Math.max(Number(process.env.SESSION_TTL_HOURS) || 168, 1), 720) * 60 * 60 * 1000;
 
 /* 失败阈值与锁定时长定义在下面的「限速」一节：那里 IP 与账号两个维度一起记 */
 

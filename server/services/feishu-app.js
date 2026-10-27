@@ -3,6 +3,7 @@ import { feishuBotConfig } from './feishu-bot.js';
 import { ask } from './assistant.js';
 import { bridgeCall } from './hermes-local.js';
 import { enrichIps } from './geo.js';
+import { db, update } from '../store.js';
 
 /** 超过这个时间还没出结果，就先回一句"正在查"（飞书要求 3 秒内响应） */
 const SLOW_MS = 2500;
@@ -174,6 +175,43 @@ export function startFeishuApp(settings) {
   return feishuAppStatus();
 }
 
+/* ── 所有者白名单 ────────────────────────────────────────────────────────
+ * 这个机器人是"所有者本人的一个客户端"，不是给群里人用的助手。之前的实现只
+ * 过滤了机器人自己的消息，谁发都答 —— 等于给了租户内任何人一个免登录入口，
+ * 而消息进去之后能在模型之前触发写动作（改 PVE 调频、在本机执行命令）。
+ *
+ * 现在只认 settings.feishuBot.allowOpenIds 里的人。名单为空时走"首次认领"：
+ * 第一条消息的发送者被记成所有者并落库，同时回一句说明。单用户部署下这是
+ * 唯一不把人挡在门外的做法（否则升级完谁也进不来），而且认领只发生一次。
+ * ──────────────────────────────────────────────────────────────────── */
+
+/** 当前名单（open_id 数组，已去空） */
+function ownerList() {
+  const raw = feishuBotConfig(db().settings).allowOpenIds;
+  return (Array.isArray(raw) ? raw : []).map((v) => String(v || '').trim()).filter(Boolean);
+}
+
+/** 只读判断：这个人是不是所有者。不给任何"顺手认领"的机会（卡片回调要用） */
+function isOwner(openId) {
+  const id = String(openId || '').trim();
+  return Boolean(id) && ownerList().includes(id);
+}
+
+/** 消息入口用：名单为空时把当前发送者记成所有者 */
+function claimOwner(openId) {
+  const id = String(openId || '').trim();
+  if (!id) return false;
+  if (isOwner(id)) return true;
+  if (ownerList().length) return false;
+  update((d) => {
+    if (!d.settings.feishuBot) d.settings.feishuBot = {};
+    const cur = Array.isArray(d.settings.feishuBot.allowOpenIds) ? d.settings.feishuBot.allowOpenIds : [];
+    if (!cur.length) d.settings.feishuBot.allowOpenIds = [id];
+  });
+  log(`首次认领：把 ${id} 记为所有者（可在设置里改 feishuBot.allowOpenIds）`);
+  return true;
+}
+
 /**
  * 收到消息 → 交给工作台助手回答。
  *
@@ -217,13 +255,25 @@ function handleMessage(client, data) {
     return;
   }
 
-  void answer(client, msg, text);
+  /* 身份这一关必须在进助手之前过：ask() 会在模型之前跑写动作，等到里面再判断
+     就晚了。open_id 拿不到（老事件格式）也一律当外人处理。 */
+  const openId = data?.sender?.sender_id?.open_id || '';
+  if (!claimOwner(openId)) {
+    log(`拒绝非所有者消息 ${msg.message_id}（${openId || '无 open_id'}）`);
+    void replyText(client, msg.message_id, '这个机器人只对所有者开放。').catch(() => {});
+    return;
+  }
+
+  void answer(client, msg, text, { openId, chatId: msg.chat_id || '' });
 }
 
 /** 真正的查询与回复。慢慢来没关系，回执已经先发走了 */
-async function answer(client, msg, text) {
+async function answer(client, msg, text, identity) {
   try {
-    const task = ask(text).catch((err) => ({ reply: `查询失败：${err?.message || err}`, engine: 'error' }));
+    /* identity 一路带进 ask()：到了 localAction 那一层还要用它做"是不是本人 +
+       有没有确认"的判断，光在入口挡一次不够（HTTP 侧也会调 ask） */
+    const task = ask(text, { identity, trusted: true })
+      .catch((err) => ({ reply: `查询失败：${err?.message || err}`, engine: 'error' }));
 
     let timer = null;
     const slow = new Promise((resolve) => {
@@ -290,7 +340,20 @@ function handleCardAction(client, data) {
 
   const approve = action === 'ban_approve';
   const messageId = data?.context?.open_message_id || data?.open_message_id || null;
-  const operator = data?.operator?.name || data?.operator?.open_id || '未知';
+  const operatorOpenId = String(data?.operator?.open_id || '').trim();
+  const operator = data?.operator?.name || operatorOpenId || '未知';
+
+  /* 按钮在群里，谁都能点 —— 之前只把 operator 写进日志，等于"看到就能批"。
+     这里把点击者绑到所有者名单上：名单为空说明还没完成首次认领，也拒绝。 */
+  if (!isOwner(operatorOpenId)) {
+    log(`拒绝非所有者卡片操作：${operatorOpenId || '无 open_id'} → ${action}`);
+    return {
+      toast: {
+        type: 'error',
+        content: ownerList().length ? '只有所有者可以审批这次封禁' : '请先私聊机器人发一条消息，完成所有者绑定',
+      },
+    };
+  }
 
   /* 按钮被连点/事件重投时只执行一次。授权码本身是一次性的，第二次必然失败，
      但那会让卡片被改写成"执行失败"，比直接告诉他"已经点过了"更让人迷惑 */
@@ -315,7 +378,11 @@ async function runDecision(client, { code, approve, ip, messageId, operator }) {
        这里经由飞书，不受页面等待时间约束，但也不能比桥的 45 秒上限还短） */
     const res = await bridgeCall(`/local/security/${approve ? 'approve' : 'reject'}`, {
       method: 'POST',
-      body: { code },
+      /* by: 这条是飞书点的。桥据此写审计里的批准人，并且不再重复 PATCH 卡片 ——
+         结果卡由下面 patchResultCard 改成带操作人名的版本。 */
+      /* operator 一起送过去：桥把它拼进审计里的批准人，否则所有飞书审批都只
+         记成"飞书授权"，出了事没人说得清是谁点的 */
+      body: { code, by: '飞书', operator },
       timeout: 60000,
     });
     log(`卡片授权已执行：${approve ? '批准' : '拒绝'} ${code}（${operator}）`);

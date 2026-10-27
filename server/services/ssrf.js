@@ -41,6 +41,27 @@ const V4_BLOCKS = [
   ['240.0.0.0', 4], // 保留 + 广播
 ];
 
+/**
+ * 「允许内网」模式下仍然封的段。
+ *
+ * 书签图标 / 取色打的是用户自己的内网面板（10/172.16/192.168 都要放行），
+ * 但下面这些不属于「内网面板」，而属于「本机与元数据面」：
+ *   · 127/8        本机的 MySQL、Agent 网关、别的本机服务，打了就等于送端口扫描器
+ *   · 169.254/16  链路本地，含 169.254.169.254 云元数据 —— 能换到临时凭据
+ *   · 0/8          未指定
+ *   · 组播 / 保留
+ * 这几条即使在宽松模式下也不放行。
+ */
+const V4_BLOCKS_LAN = [
+  ['0.0.0.0', 8],
+  ['127.0.0.0', 8],
+  ['169.254.0.0', 16],
+  ['192.0.0.0', 24],
+  ['192.88.99.0', 24],
+  ['224.0.0.0', 4],
+  ['240.0.0.0', 4],
+];
+
 const v4ToInt = (ip) => ip.split('.').reduce((acc, part) => ((acc << 8) + Number(part)) >>> 0, 0);
 
 const inV4Block = (ip, base, bits) => {
@@ -48,20 +69,24 @@ const inV4Block = (ip, base, bits) => {
   return (v4ToInt(ip) & mask) === (v4ToInt(base) & mask);
 };
 
-function ipv4Blocked(ip) {
-  return V4_BLOCKS.some(([base, bits]) => inV4Block(ip, base, bits));
+function ipv4Blocked(ip, allowPrivate = false) {
+  const blocks = allowPrivate ? V4_BLOCKS_LAN : V4_BLOCKS;
+  return blocks.some(([base, bits]) => inV4Block(ip, base, bits));
 }
 
-function ipv6Blocked(ip) {
+function ipv6Blocked(ip, allowPrivate = false) {
   const lower = ip.toLowerCase();
   if (lower === '::1' || lower === '::') return true;
 
   /* ::ffff:127.0.0.1 这种"v4 映射地址"要按 v4 判：只做字符串前缀匹配会漏 */
   const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(lower);
-  if (mapped) return ipv4Blocked(mapped[1]);
+  if (mapped) return ipv4Blocked(mapped[1], allowPrivate);
 
-  /* 其余只放行全球单播 2000::/3。fc00::/7（内网）、fe80::/10（链路本地）、
-     ff00::/8（组播）、64:ff9b::/96（NAT64，能把 v6 转回 v4 内网）都在外面 */
+  /* fc00::/7 是 v6 内网（ULA）。宽松模式下放行 —— 和放行 10/8 是同一个理由 */
+  if (allowPrivate && /^f[cd][0-9a-f]{2}:/.test(lower)) return false;
+
+  /* 其余只放行全球单播 2000::/3。fe80::/10（链路本地）、ff00::/8（组播）、
+     64:ff9b::/96（NAT64，能把 v6 转回 v4 内网）都在外面 */
   const first = parseInt(lower.split(':')[0] || '0', 16);
   if (!(first >= 0x2000 && first <= 0x3fff)) return true;
   /* 文档示例段，不该出现在真实访问里 */
@@ -69,10 +94,16 @@ function ipv6Blocked(ip) {
   return false;
 }
 
-export function isBlockedAddress(address) {
+/**
+ * @param {string} address
+ * @param {{allowPrivate?: boolean}} [opts]
+ *   allowPrivate=true 只放行 RFC1918 / ULA，回环与元数据仍然拒绝。
+ *   默认 false = 只允许公网（导入文章那条路必须用默认值）。
+ */
+export function isBlockedAddress(address, { allowPrivate = false } = {}) {
   const ip = String(address || '').replace(/^\[|\]$/g, '');
-  if (net.isIPv4(ip)) return ipv4Blocked(ip);
-  if (net.isIPv6(ip)) return ipv6Blocked(ip);
+  if (net.isIPv4(ip)) return ipv4Blocked(ip, allowPrivate);
+  if (net.isIPv6(ip)) return ipv6Blocked(ip, allowPrivate);
   // 认不出来的地址一律拒绝，别让"没判到"变成放行
   return true;
 }
@@ -89,8 +120,13 @@ export class SsrfError extends Error {
 /**
  * 校验并解析目标，返回**要连的那个 IP**。
  * 调用方拿到 address 之后直接连它，域名只用于 Host 头与 TLS SNI。
+ *
+ * @param {URL} parsed
+ * @param {{allowPrivate?: boolean}} [opts]
+ *   allowPrivate=true 用于「书签图标 / 取色」这类要打用户内网面板的场景：
+ *   放行 10/172.16/192.168/ULA，但仍拒绝回环、链路本地（云元数据）、组播。
  */
-export async function resolvePublicTarget(parsed) {
+export async function resolvePublicTarget(parsed, { allowPrivate = false } = {}) {
   if (!/^https?:$/.test(parsed.protocol)) {
     throw new SsrfError('只支持 http / https 地址');
   }
@@ -102,7 +138,11 @@ export async function resolvePublicTarget(parsed) {
   if (!hostname) throw new SsrfError('地址里没有主机名');
 
   if (net.isIP(hostname)) {
-    if (isBlockedAddress(hostname)) throw new SsrfError('这个地址指向内网，不能从这里抓取');
+    if (isBlockedAddress(hostname, { allowPrivate })) {
+      throw new SsrfError(allowPrivate
+        ? '这个地址指向本机或云元数据，不能从这里抓取'
+        : '这个地址指向内网，不能从这里抓取');
+    }
     return { address: hostname, family: net.isIPv6(hostname) ? 6 : 4 };
   }
 
@@ -113,8 +153,12 @@ export async function resolvePublicTarget(parsed) {
     throw new SsrfError(`找不到「${hostname}」这个域名`);
   }
   if (!list.length) throw new SsrfError(`找不到「${hostname}」这个域名`);
-  if (list.some((entry) => isBlockedAddress(entry.address))) {
-    throw new SsrfError(`「${hostname}」指向内网地址，不能从这里抓取`);
+  /* 全部记录都要过：只要有任意一条是禁的，就整条拒绝 —— 否则轮询解析
+     可以让第二次请求落到那个被禁的地址上 */
+  if (list.some((entry) => isBlockedAddress(entry.address, { allowPrivate }))) {
+    throw new SsrfError(allowPrivate
+      ? `「${hostname}」指向本机或云元数据，不能从这里抓取`
+      : `「${hostname}」指向内网地址，不能从这里抓取`);
   }
 
   return { address: list[0].address, family: list[0].family };

@@ -32,6 +32,13 @@ export function feishuBotDefaults() {
     appSecret: '',
     /** 群会话 id（oc_ 开头）。应用机器人发消息必须指定 */
     chatId: '',
+    /**
+     * 所有者白名单（open_id，ou_ 开头）。应用机器人的"收"这一半只认这里的人：
+     * 不在名单里的消息不进助手、卡片按钮也点不动。
+     * 留空时走首次认领 —— 第一个给机器人发消息的人被记进来（见 feishu-app.js），
+     * 单用户部署下这是唯一不会把人挡在门外的做法；想换人或加人就直接改这个数组。
+     */
+    allowOpenIds: [],
     /** 通知范围：自动封禁 / 值守报告。分开是因为前者希望你秒知道，后者可以少吵 */
     notifyBan: true,
     notifyOps: true,

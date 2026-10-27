@@ -129,30 +129,71 @@ async function hermesReply() {
 /* ── 规则引擎 ───────────────────────────────────────────────────────── */
 /* 本地写操作：必须由工作台自己落库，不能交给模型 */
 
+/* ── 写动作的确认闸门 ────────────────────────────────────────────────────
+ * 改节能会 SSH 到 PVE 改 governor、发 webhook、跑本机命令，副作用不可回滚；
+ * 而这些命令此前是"说一句就执行"：否定句（"不要开启节能"）照样会开启，疑问句
+ * 也会执行。现在分两步：第一次只登记意图，必须再回一句「确认开启节能」才执行，
+ * 且 2 分钟内有效。同一个意思说两遍才动手，也顺带把否定句/疑问句挡住了。
+ */
+const CONFIRM_TTL_MS = 120 * 1000;
+const pendingEco = new Map();
+const confirmKey = (identity) => String((identity && (identity.openId || identity.user || identity.platform)) || 'panel');
+
+async function applyEcoAction(enabled) {
+  const settings = db().settings;
+  update((d) => {
+    d.settings.power.eco = enabled;
+  });
+  const link = await applyEco(enabled, db().settings);
+  const note = link.errors?.length ? `\n联动提示：${link.errors.join('；')}` : '';
+  return {
+    reply: `已${enabled ? '开启' : '关闭'}节能模式。\n功耗模型上限调整为 ${settings.power.maxW}W × ${enabled ? settings.power.ecoFactor : 1}${
+      link.webhook === 'ok' || link.command === 'ok' ? '\n已通知外部联动。' : ''
+    }${note}`,
+    actions: [{ type: 'refresh' }],
+  };
+}
+
 /**
  * 开关节能模式、加待办——这两件事都要改工作台自己的库。
  * 交给大模型只会换来一句「已开启」而库里什么都没变：假成功比不执行更糟，
  * 所以 ask() 会在模型之前先跑这里。返回 null 表示「不是写操作」，继续往下走。
+ *
+ * trusted=false 时一律不写库：这是给"未经所有者确认的入口"留的开关，
+ * 现在飞书入口已经按 open_id 挡在外面，HTTP 侧则应该传自己的身份。
  */
-async function localAction(text) {
+async function localAction(text, { identity = null, trusted = true } = {}) {
   const lower = text.toLowerCase();
-  const settings = db().settings;
+  if (!trusted) return null;
 
   /* 节能模式 */
   const ecoOn = /(开启|打开|启用|进入)\s*节能/.test(text) || /eco\s*(on|enable)/i.test(lower);
   const ecoOff = /(关闭|取消|退出|停止)\s*节能/.test(text) || /eco\s*(off|disable)/i.test(lower);
+
+  /* 第二步：确认语。只有这一句能真正执行，别的说法都只算"表达意图" */
+  const confirmed = /^确认\s*(开启|打开|启用|进入|关闭|取消|退出|停止)\s*节能[。.!！]?$/.exec(text.trim());
+  if (confirmed) {
+    const enabled = /^(开启|打开|启用|进入)$/.test(confirmed[1]);
+    const key = confirmKey(identity);
+    const pending = pendingEco.get(key);
+    pendingEco.delete(key);
+    if (!pending || pending.enabled !== enabled || Date.now() - pending.at > CONFIRM_TTL_MS) {
+      return { reply: '这条确认已经过期了。要改节能模式，先说「开启节能」或「关闭节能」，我回一句确认再执行。', actions: [] };
+    }
+    return applyEcoAction(enabled);
+  }
+
   if (ecoOn || ecoOff) {
+    /* 否定句不是指令："不要开启节能" 里同时含"开启"和"节能"，
+       旧实现直接开了。看到否定词就只回一句"不动"，连意图都不登记 */
+    if (/(不要|不用|别|无需|没必要|先不|暂不)/.test(text)) {
+      return { reply: '好，节能模式不动。', actions: [] };
+    }
     const enabled = ecoOn;
-    update((d) => {
-      d.settings.power.eco = enabled;
-    });
-    const link = await applyEco(enabled, db().settings);
-    const note = link.errors?.length ? `\n联动提示：${link.errors.join('；')}` : '';
+    pendingEco.set(confirmKey(identity), { enabled, at: Date.now() });
     return {
-      reply: `已${enabled ? '开启' : '关闭'}节能模式。\n功耗模型上限调整为 ${settings.power.maxW}W × ${enabled ? settings.power.ecoFactor : 1}${
-        link.webhook === 'ok' || link.command === 'ok' ? '\n已通知外部联动。' : ''
-      }${note}`,
-      actions: [{ type: 'refresh' }],
+      reply: `要${enabled ? '开启' : '关闭'}节能模式吗？会影响 PVE 调频与本机联动，所以多问一句：\n回「确认${enabled ? '开启' : '关闭'}节能」就执行（2 分钟内有效）。`,
+      actions: [],
     };
   }
 
@@ -346,7 +387,13 @@ const assistantMessages = (message, context) => [
 ];
 
 /* ── 对外入口 ──────────────────────────────────────────────────────── */
-export async function ask(message) {
+/**
+ * @param message 用户那句话
+ * @param options.identity 调用方身份（{ platform, openId } 之类），写动作按它登记确认
+ * @param options.trusted  false = 不执行任何写动作（未通过所有者校验的入口用）
+ */
+export async function ask(message, options = {}) {
+  const { identity = null, trusted = true } = options || {};
   const text = String(message || '').slice(0, 2000);
   if (!text.trim()) return { reply: '说点什么吧。', actions: [] };
 
@@ -354,7 +401,7 @@ export async function ask(message) {
   // 交给模型的话，它回一句「已开启」而库里没变——这种假成功比不执行更糟；
   // 顺带也省掉一次动辄上万 token 的模型调用。
   try {
-    const local = await localAction(text);
+    const local = await localAction(text, { identity, trusted });
     if (local) return { ...local, engine: 'local' };
   } catch (err) {
     // 能走到执行环节才会抛错，说明多半是写操作失败了，这时绝不能转手给模型
@@ -388,7 +435,8 @@ export async function ask(message) {
  * 已经出了半截答案再回退，两段文字会接在一起，比直接报错更难懂。
  * done.reply 为 null 表示"保留已经流出去的内容"，由前端按此处理。
  */
-export async function askStream(message, emit) {
+export async function askStream(message, emit, options = {}) {
+  const { identity = null, trusted = true } = options || {};
   const text = String(message || '').slice(0, 2000);
   if (!text.trim()) {
     emit({ type: 'done', reply: '说点什么吧。', actions: [], engine: 'local' });
@@ -396,7 +444,7 @@ export async function askStream(message, emit) {
   }
 
   try {
-    const local = await localAction(text);
+    const local = await localAction(text, { identity, trusted });
     if (local) {
       emit({ type: 'done', reply: local.reply, actions: local.actions, engine: 'local' });
       return;

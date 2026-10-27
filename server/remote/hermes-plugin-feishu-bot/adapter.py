@@ -375,7 +375,7 @@ async def _deliver(
     chat_id: str = "",
     title: str | None = None,
     tone: str = "info",
-    source: str = "Hermes · 助手机",
+    source: str = "吃白饭的大肥鱼向您报告",
 ) -> dict[str, Any]:
     """统一出口：应用机器人优先，webhook 回落；一律按统一卡片格式发。
 

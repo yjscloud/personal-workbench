@@ -402,7 +402,14 @@ function dominantColor(img) {
 /* ── 对外 ──────────────────────────────────────────────────────────── */
 
 async function fetchIconColor(url) {
-  const { body, type } = await fetchBytes(url, { limit: ICON_LIMIT, accept: 'image/*,*/*', insecure: true });
+  const { body, type } = await fetchBytes(url, {
+    limit: ICON_LIMIT,
+    accept: 'image/*,*/*',
+    insecure: true,
+    /* 用户自己的面板要放行（内网段），但回环与云元数据仍然拒绝 */
+    guard: 'lan',
+    redirects: 3,
+  });
   if (!body.length) return null;
 
   if (isPng(body)) {
@@ -426,7 +433,13 @@ async function fetchIconColor(url) {
  * @returns {Promise<{color: string, source: 'theme-color'|'icon'} | null>}
  */
 export async function probeSiteColor(url) {
-  const page = await fetchBytes(url, { limit: HTML_LIMIT, accept: 'text/html,application/xhtml+xml,*/*', insecure: true });
+  const page = await fetchBytes(url, {
+    limit: HTML_LIMIT,
+    accept: 'text/html,application/xhtml+xml,*/*',
+    insecure: true,
+    guard: 'lan',
+    redirects: 3,
+  });
   const html = decodeText(page.body, page.type);
 
   const declared = metaThemeColor(html);

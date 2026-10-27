@@ -676,12 +676,14 @@ export function TokenPanel({
             <span className="num text-2xl font-semibold text-ink">{wan(shown)}</span>
             <span className="num text-xs text-faint">/ {usage.budget_label}</span>
           </p>
-          {/* 进度条按**计费口径**算，不是按上面的总数：缓存按 1/10 计价，
-              拿含缓存的总量去比预算会把进度条顶到 80% 以上，看着像要超支了 */}
+          {/* 进度条按**上面那个总数**（未命中 + 缓存命中 + 输出）比预算：
+              预算 1000万 说的是 token 量，条子却按计费口径算的话，缓存那 760万
+              被折掉，808万 / 1000万 会画成 4% —— 数字和条子对不上，看着就是坏的。
+              计费口径仍然单独写在下面那行说明里，不再拿它当进度 */}
           <Meter
             className="mt-2.5"
-            ratio={usage.budget_tokens ? (today.billed ?? today.total) / usage.budget_tokens : 0}
-            tone="accent"
+            ratio={usage.budget_tokens ? (today.total || 0) / usage.budget_tokens : 0}
+            tone={usage.budget_tokens && today.total / usage.budget_tokens >= 0.9 ? 'warn' : 'accent'}
             height={5}
           />
           <dl className="mt-3.5 grid grid-cols-2 gap-x-4 gap-y-1.5 text-2xs">
@@ -701,8 +703,8 @@ export function TokenPanel({
           <p className="mt-1.5 text-2xs text-faint">
             总计 {wan(today.total)} = 未命中 {wan(today.input)} + 命中缓存 {wan(today.cache_read)} + 输出{' '}
             {wan(today.output)}
-            {today.reasoning ? ` + 推理 ${wan(today.reasoning)}` : ''}；进度条按计费口径{' '}
-            {wan(today.billed ?? today.input + today.output)}
+            {today.reasoning ? ` + 推理 ${wan(today.reasoning)}` : ''}；计费口径{' '}
+            {wan(today.billed ?? today.input + today.output)}（缓存按 1/10 计价，只影响钱）
           </p>
           {split ? <p className="mt-2.5 border-t border-line pt-2.5 text-2xs text-muted">来源 {split}</p> : null}
           <p className="mt-2 text-2xs text-faint">

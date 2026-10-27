@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS `public_links` (
   `uses`         INT          NOT NULL DEFAULT 0 COMMENT '累计提交数',
   `day_key`      CHAR(10)     NOT NULL DEFAULT '' COMMENT 'UTC 日期 yyyy-mm-dd',
   `day_count`    INT          NOT NULL DEFAULT 0 COMMENT '当日提交数，防刷用',
+  `day_bytes`    BIGINT       NOT NULL DEFAULT 0 COMMENT '当日附件累计字节，防刷用',
   `expires_at`   DATETIME(3)  NULL COMMENT '过期时间（UTC），NULL = 不过期',
   `last_used_at` DATETIME(3)  NULL,
   `created_at`   DATETIME(3)  NULL,
@@ -356,3 +357,24 @@ CREATE TABLE IF NOT EXISTS `assistant_messages` (
   UNIQUE KEY `uk_msg_id` (`id`),
   KEY `idx_msg_role` (`role`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI 助手对话历史';
+
+-- 破坏性操作留痕（重置 / 导入 / 云恢复 / 批量彻底删除 / 封禁决策 / 白名单）。
+--
+-- 为什么单独建表、不进 store.js 的内存镜像：镜像按「整表 DELETE + 全量 INSERT」
+-- 落库、并按整表 JSON 指纹判重；日志是只追加且持续增长的，走镜像等于每写一条
+-- 都要重写全部历史。和 assistant_messages 同一个理由，读写都在 db/audit.js。
+--
+-- 只记「谁在什么时候干了哪一类事、对象是什么」，不存请求体：备份导入动辄几 MB、
+-- 批量删除可能带上百个 id，记全量只会把这张表撑爆，事后要查的也不是原文。
+CREATE TABLE IF NOT EXISTS `operation_log` (
+  `seq`    BIGINT       NOT NULL AUTO_INCREMENT,
+  `at`     DATETIME(3)  NOT NULL COMMENT '操作时间（UTC）',
+  `actor`  VARCHAR(64)  NOT NULL COMMENT '登录用户名',
+  `ip`     VARCHAR(64)  NOT NULL DEFAULT '' COMMENT '来源 IP（反代时取 X-Forwarded-For 首段）',
+  `action` VARCHAR(64)  NOT NULL COMMENT '动作标识，如 backup.reset',
+  `target` VARCHAR(200) NOT NULL DEFAULT '' COMMENT '对象：备份 key / IP / 条目 id 等',
+  `detail` VARCHAR(500) NOT NULL DEFAULT '' COMMENT '补充说明',
+  PRIMARY KEY (`seq`),
+  KEY `idx_op_at` (`at`),
+  KEY `idx_op_action` (`action`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='破坏性操作审计';

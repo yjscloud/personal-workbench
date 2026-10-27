@@ -6,6 +6,7 @@ import {
   type HaOptions,
   type HaSocket,
   type LoginBackground,
+  type OperationLogItem,
   type SearchEngine,
   type Settings as SettingsShape,
 } from '@/lib/api';
@@ -45,6 +46,9 @@ const newEngineId = () => `se_new_${Date.now().toString(36)}_${(engineSeq += 1)}
 export default function Settings() {
   const { settings, saveSettings, notify, refreshAll } = useStore();
   const [draft, setDraft] = useState<SettingsShape | null>(null);
+  /* 破坏性操作日志：null = 还没读到 */
+  const [ops, setOps] = useState<OperationLogItem[] | null>(null);
+  const [exporting, setExporting] = useState(false);
   const [health, setHealth] = useState<{
     db: { label?: string; host?: string; database?: string; reachable?: boolean };
     pveConfigured: boolean;
@@ -102,6 +106,17 @@ export default function Settings() {
     // 只在"令牌是否可用"这个状态变化时拉，输入过程中不该反复请求
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings?.ha?.hasToken]);
+
+  /* 操作日志：打开设置页拉一次，之后靠卡片上的「刷新」取最新。
+     不轮询 —— 这里看的是「上个月谁重置过」，不是实时监控。 */
+  useEffect(() => {
+    let alive = true;
+    api
+      .operations(20)
+      .then((r) => { if (alive) setOps(r.items); })
+      .catch(() => { if (alive) setOps([]); });
+    return () => { alive = false; };
+  }, []);
 
   /* 搜索引擎的排序交互：和工具箱的分组排序共用 components/reorder.tsx 那一份。
      hook 必须声明在 early return 之前（下面那个"草稿还没到"的分支），
@@ -710,6 +725,32 @@ export default function Settings() {
       setHaTestResult({ ok: false, text: `连接失败：${err instanceof Error ? err.message : '未知错误'}` });
     } finally {
       setHaTesting(false);
+    }
+  }
+
+  /**
+   * 导出全量备份。
+   *
+   * 包里是整库 + 配置 + 12 类密钥（加密后的密文）—— 以前一个 <a> 就能整份拿走，
+   * 代价和「看一眼设置页」完全不对等。现在先验一次登录密码换 5 分钟票据。
+   * 密码用 prompt 收：本机单用户，为这一下做个弹层不划算。
+   */
+  async function exportAll() {
+    const pw = window.prompt(
+      '导出会打包全部业务数据、配置与（加密后的）密钥。\n请重新输入登录密码确认（票据 5 分钟内有效）：',
+    );
+    if (!pw) return;
+    setExporting(true);
+    try {
+      const { token } = await api.auth.verify(pw);
+      const size = await api.backup.download(token);
+      notify(`已导出备份（${fmtBytes(size)}）`);
+      /* 导出会写一条审计，顺手把日志刷出来 */
+      void api.operations(20).then((r) => setOps(r.items)).catch(() => {});
+    } catch (err) {
+      notify(err instanceof Error ? err.message : '导出失败', 'crit');
+    } finally {
+      setExporting(false);
     }
   }
 
@@ -1737,13 +1778,13 @@ export default function Settings() {
         />
 
         <div className="flex flex-wrap items-center gap-2">
-          {/* 下载链接必须是 <a>（要交给浏览器下载，不能用 button），
-              所以外观照着 Button 取类 —— 同一行里三个按钮一个矮 4px，
-              那种"挤"其实是不齐 */}
-          <a href={api.backup.exportUrl} className={buttonClass('soft', 'md')}>
-            <Download size={14} />
+          {/* 导出不再是纯链接：包里是整库 + 加密后的密钥，一个会话 cookie 就够
+              拿走太重了。现在先验一次密码换 5 分钟票据，再用 fetch+blob 下载
+              （自定义头没法带在 <a download> 上）。 */}
+          <Button variant="soft" disabled={exporting} onClick={() => void exportAll()}>
+            {exporting ? <Spinner /> : <Download size={14} />}
             导出备份
-          </a>
+          </Button>
           <Button variant="soft" onClick={() => fileRef.current?.click()} disabled={importing}>
             {importing ? <Spinner /> : <Upload size={14} />}
             导入备份
@@ -1793,6 +1834,72 @@ export default function Settings() {
         <div className="flex items-center gap-2 border-t border-line pt-3.5">
           <SaveAction className="ml-auto" dirty={dirtyOf('autoBackup')} busy={savingSection === 'misc'} onSave={saveMisc} />
         </div>
+      </Card>
+
+      {/* 操作日志
+          重置、整库导入、云恢复、批量彻底删除、封禁决策与解封 —— 这些动作除了
+          这里没有第二处留痕。前端原本只有一道 window.confirm，它挡误点、挡不住
+          脚本调用，也不留证据。日志是服务端写的旁路记录，只读。 */}
+      <Card>
+        <CardHead
+          level={2}
+          title="操作日志"
+          hint="最近 20 条破坏性操作：谁、从哪来、动了什么。重置 / 导入 / 解封之后点右侧刷新即可看到"
+          right={
+            <button
+              type="button"
+              onClick={() => {
+                void api
+                  .operations(20)
+                  .then((r) => setOps(r.items))
+                  .catch((e) => {
+                    setOps([]);
+                    notify(e instanceof Error ? e.message : '操作日志读取失败', 'crit');
+                  });
+              }}
+              className="flex shrink-0 items-center gap-1 text-2xs text-muted transition-colors hover:text-accent"
+            >
+              <RefreshCcw size={12} />
+              刷新
+            </button>
+          }
+        />
+
+        {ops === null ? (
+          <p className="text-2xs text-faint">读取中…</p>
+        ) : ops.length === 0 ? (
+          <p className="text-2xs leading-relaxed text-faint">
+            还没有记录。第一次重置、导入备份、从云端恢复或解封 IP 之后就会出现在这里。
+          </p>
+        ) : (
+          <ul className="space-y-1">
+            {ops.map((o) => (
+              <li key={o.seq} className="flex flex-wrap items-baseline gap-x-2 text-2xs">
+                <span className="num shrink-0 text-faint">
+                  {new Date(o.at).toLocaleString('zh-CN', {
+                    month: '2-digit',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    hour12: false,
+                  })}
+                </span>
+                <span className="shrink-0 text-ink">{o.actor}</span>
+                <span className="shrink-0 text-muted">{o.action}</span>
+                {o.target ? (
+                  <span className="num min-w-0 flex-1 truncate text-faint" title={o.target}>
+                    {o.target}
+                  </span>
+                ) : (
+                  <span className="flex-1" />
+                )}
+                <span className="num shrink-0 text-faint" title={o.detail}>
+                  {o.ip}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
       </Card>
 
       {/* 知识库备份（腾讯云 COS）

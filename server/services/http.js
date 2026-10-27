@@ -69,8 +69,17 @@ export async function fetchBytes(
   if (!/^https?:$/.test(parsed.protocol)) throw new Error(`不支持的协议 ${parsed.protocol}`);
 
   /* 解析 + 校验在建立连接之前完成。失败时抛 SsrfError（code=SSRF_BLOCKED），
-     路由层据此返回一句"这个地址不允许抓取"，而不是把内网细节带出去。 */
-  const pinned = guard ? await resolvePublicTarget(parsed) : null;
+     路由层据此返回一句"这个地址不允许抓取"，而不是把内网细节带出去。
+
+     guard 是三态：
+       false  不校验（关掉了，调用方自己负责）
+       true   只允许公网 —— 导入文章这类「地址由用户填、抓的是服务器所在网络」
+       'lan'  放行内网段（10/172.16/192.168/ULA），但回环、链路本地（云元数据）、
+              组播仍然拒绝 —— 书签图标 / 取色要打用户自己的面板，但不该顺手
+              把本机 MySQL 和 169.254.169.254 也变成可读对象 */
+  const pinned = guard
+    ? await resolvePublicTarget(parsed, { allowPrivate: guard === 'lan' })
+    : null;
 
   return new Promise((resolve, reject) => {
     const mod = parsed.protocol === 'https:' ? https : http;

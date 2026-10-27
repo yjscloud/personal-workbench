@@ -35,6 +35,14 @@ const ADDITIVE_COLUMNS = [
     'dropped_count',
     "INT NOT NULL DEFAULT 0 COMMENT '最近一次被分数门槛挡掉的条数' AFTER `last_error`",
   ],
+  /* 外链每日附件总字节。day_count 只管"投了几条"，管不住"每条都带满附件"：
+     200 条 × 3 个 × 1.5MB 一天能写进近 900MB 的 MEDIUMTEXT。
+     老库补上这一列后从 0 起算，等同于"今天还没收到附件"。 */
+  [
+    'public_links',
+    'day_bytes',
+    "BIGINT NOT NULL DEFAULT 0 COMMENT '当日附件累计字节，防刷用' AFTER `day_count`",
+  ],
   /* 任务的项目分类。schema.sql 现在也有这一列了，但**在补上之前就建过库**
      的环境（以及那段时间里全新初始化出来的库）没有 —— 所以这里必须再登记
      一份。ADDITIVE_COLUMNS 存在的意义就是这个：建表语句只对新库生效，

@@ -11,6 +11,7 @@ import {
   FolderArchive,
   KeyRound,
   MessagesSquare,
+  Plus,
   RefreshCw,
   Send,
   Shield,
@@ -26,6 +27,7 @@ import {
   api,
   type OfficeChatEvent,
   type OfficeEmployee,
+  type OfficeGuardBlock,
   type OfficeGuardHealth,
   type OfficeGuardIp,
   type OfficeGuardPending,
@@ -651,6 +653,10 @@ function GuardPane({ seat }: { seat: string }) {
   const guard = data?.kind === 'guard' ? data : null;
   const [busy, setBusy] = useState('');
   const [profile, setProfile] = useState<ProfileState | null>(null);
+  /* 白名单：null 表示还没读到（桥不通），空数组表示「确实一条都没有」——
+     这两种要分开显示，后者才是需要用户处理的状态 */
+  const [allow, setAllow] = useState<{ value: string; note: string }[] | null>(null);
+  const [allowInput, setAllowInput] = useState('');
 
   /* 有待授权单时自己对一次。
      两个理由：① 开单到执行常常是同一秒的事（自动封禁），快照恰好在中间取的
@@ -675,6 +681,53 @@ function GuardPane({ seat }: { seat: string }) {
       reload();
     } catch (e) {
       notify?.(e instanceof Error ? e.message : '操作失败', 'crit');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  /**
+   * 手动解封。
+   *
+   * 自动封禁误伤、或自己换了出口 IP 被当成攻击者时，这是唯一的自救入口。
+   * 删除本身在 Python 侧做：删不掉就不会把记录改成「已撤销」，所以这里
+   * 失败后必须 reload —— 让页面显示真实状态，而不是假装成功。
+   */
+  async function unblock(ip: string) {
+    const tip = `解封 ${ip}？\n\n会在 frps 上执行 ipset del。删除成功这条记录才变为「已撤销」；\n失败会保持封禁并显示原因。`;
+    if (!window.confirm(tip)) return;
+    setBusy('unblock:' + ip);
+    try {
+      await api.office.securityUnblock(ip);
+      notify?.(`已解封 ${ip}`);
+    } catch (e) {
+      notify?.(e instanceof Error ? e.message : '解封失败', 'crit');
+    } finally {
+      setBusy('');
+      reload();
+    }
+  }
+
+  /* 白名单挂载就拉：空名单本身就是最重要的信息（自己的出口 IP 没被保护），
+     不该藏在某个折叠区里等用户想起来去看 */
+  useEffect(() => {
+    let alive = true;
+    api.office
+      .securityAllow()
+      .then((d) => { if (alive) setAllow(d.entries); })
+      .catch(() => { if (alive) setAllow(null); });
+    return () => { alive = false; };
+  }, []);
+
+  async function saveAllow(entry: string, action: 'add' | 'remove') {
+    setBusy('allow');
+    try {
+      const d = await api.office.securityAllowSave(entry, action);
+      setAllow(d.entries);
+      setAllowInput('');
+      notify?.(action === 'add' ? `已加入白名单 ${entry}` : `已移出白名单 ${entry}`);
+    } catch (e) {
+      notify?.(e instanceof Error ? e.message : '白名单保存失败', 'crit');
     } finally {
       setBusy('');
     }
@@ -716,6 +769,13 @@ function GuardPane({ seat }: { seat: string }) {
   const high = (guard?.topIps || []).filter((r) => r.severity === 'HIGH' || r.severity === 'CRITICAL');
   const shown = (high.length ? high : guard?.topIps || []).slice(0, 8);
   const maxHour = Math.max(1, ...(guard?.hourly || []).map((x) => x.n));
+
+  /* 失败单置顶：它是最需要人动手的一类（批了但没封上），
+     按时间排的话很快被新记录挤到 6 条之外 —— 等于没显示。sort 是稳定的，
+     同组内仍保持时间倒序。 */
+  const badBlock = (b: OfficeGuardBlock) => (b.status === 'failed' ? 0 : 1);
+  const blockList = (guard?.blocks || []).slice().sort((a, b) => badBlock(a) - badBlock(b));
+  const failedCount = blockList.filter((b) => b.status === 'failed').length;
 
   return (
     <div className="space-y-3">
@@ -763,6 +823,17 @@ function GuardPane({ seat }: { seat: string }) {
               分析窗口 {guard.windowMin} 分钟
             </span>
             <span className={guard.ok ? 'text-ok' : 'text-crit'}>{guard.ok ? '采集正常' : '采集异常'}</span>
+            {/* 告警走哪条路必须看得见：只有 cron 投递时，那条链路断了就等于没人知道 */}
+            {guard.alertChannel === 'cron' ? (
+              <span
+                className="text-warn"
+                title="没有配置 NOTIFY_WEBHOOK：高危告警只走 cron 投递这一条链，投递失败就没人知道"
+              >
+                告警仅 cron 投递
+              </span>
+            ) : (
+              <span className="text-ok">告警 webhook 直推</span>
+            )}
             {guard.health.map((h) => (
               <span
                 key={h.src}
@@ -797,7 +868,8 @@ function GuardPane({ seat }: { seat: string }) {
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                       <ShieldAlert size={13} aria-hidden className="text-warn" />
                       <span className="num text-sm font-semibold tracking-wide text-ink">{p.ip}</span>
-                      {p.geo ? <span className="text-2xs text-faint">{p.geo}</span> : null}
+                      {/* 归属地在批准前就是最重要的判断依据：机房段扫描和同城家宽不该同样处理 */}
+                      {p.geo ? <span className="text-2xs text-muted">{p.geo}</span> : null}
                       <Badge tone="warn">申请 #{p.id}</Badge>
                       <code className="rounded bg-panel px-1.5 py-0.5 text-2xs tracking-[0.15em] text-ink">{p.ticket}</code>
                     </div>
@@ -969,26 +1041,130 @@ function GuardPane({ seat }: { seat: string }) {
             </GuardBlock>
           </div>
 
-          <GuardBlock title="封禁记录" hint={guard.blocks.length ? `最近 ${Math.min(guard.blocks.length, 6)} 条` : undefined}>
+          <GuardBlock
+            title="封禁记录"
+            hint={
+              failedCount
+                ? `${failedCount} 条执行失败（已置顶）`
+                : guard.blocks.length
+                  ? `最近 ${Math.min(guard.blocks.length, 6)} 条`
+                  : undefined
+            }
+          >
             <ul className="space-y-1">
-              {guard.blocks.slice(0, 6).map((b) => (
-                <li key={b.id} className="flex flex-wrap items-baseline gap-x-2 text-2xs">
-                  <span className="num shrink-0 text-faint">{(b.requestedAt || '').slice(5, 16) || '—'}</span>
-                  <span className="num text-ink">{b.ip}</span>
-                  {b.geo ? <span className="text-faint">{b.geo}</span> : null}
-                  <span
-                    className={cls(
-                      'font-medium',
-                      b.status === 'executed' ? 'text-crit' : b.status === 'failed' ? 'text-warn' : 'text-faint',
-                    )}
-                  >
-                    {b.statusLabel}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate text-muted">{b.reason}</span>
+              {blockList.slice(0, 6).map((b) => (
+                <li key={b.id} className="text-2xs">
+                  <div className="flex flex-wrap items-baseline gap-x-2">
+                    <span className="num shrink-0 text-faint">{(b.requestedAt || '').slice(5, 16) || '—'}</span>
+                    <span className="num text-ink">{b.ip}</span>
+                    {b.geo ? <span className="text-faint">{b.geo}</span> : null}
+                    <span
+                      className={cls(
+                        'font-medium',
+                        b.status === 'executed' ? 'text-crit' : b.status === 'failed' ? 'text-warn' : 'text-faint',
+                      )}
+                    >
+                      {b.statusLabel}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-muted">{b.reason}</span>
+                    {/* 仍在封禁中的记录给一个解封入口：误封之后不该逼人去 ssh 敲命令。
+                        expire_failed 也要给 —— 那正是「该解封但没删掉」的状态。 */}
+                    {b.status === 'executed' || b.status === 'expire_failed' ? (
+                      <button
+                        type="button"
+                        disabled={busy === 'unblock:' + b.ip}
+                        onClick={() => void unblock(b.ip)}
+                        className="ml-auto shrink-0 rounded-full border border-line px-2 py-0.5 text-2xs text-muted transition-colors hover:border-crit hover:text-crit disabled:opacity-50"
+                      >
+                        {busy === 'unblock:' + b.ip ? '解封中…' : '解封'}
+                      </button>
+                    ) : null}
+                  </div>
+                  {/* 失败原因单独占一行：单行里塞会被 reason 挤掉，而「为什么没封上」
+                      恰恰是这条记录唯一值得看的信息。 */}
+                  {b.result ? (
+                    <p
+                      title={b.result}
+                      className={cls(
+                        'mt-0.5 truncate pl-[3.6rem]',
+                        b.status === 'failed' ? 'text-warn' : 'text-faint',
+                      )}
+                    >
+                      {b.result}
+                    </p>
+                  ) : null}
                 </li>
               ))}
-              {!guard.blocks.length ? <li className="text-2xs text-faint">还没有封禁记录。</li> : null}
+              {!blockList.length ? <li className="text-2xs text-faint">还没有封禁记录。</li> : null}
             </ul>
+          </GuardBlock>
+
+          {/* 白名单：同时作用于告警与封禁，是「不被自己人封掉」的最后一道阀。
+              空名单不是「暂时没配」，而是「你从外面访问时会被当成攻击者」 */}
+          <GuardBlock
+            title="白名单"
+            hint={
+              allow === null
+                ? '读取失败'
+                : allow.length
+                  ? `生效 ${allow.length} 条`
+                  : '空 · 自己的出口没有保护'
+            }
+          >
+            {allow === null ? (
+              <p className="text-2xs leading-relaxed text-faint">
+                白名单读取失败（数据桥不通时读不到文件）。这不代表名单为空，先去确认助手机是否可达。
+              </p>
+            ) : (
+              <>
+                <ul className="space-y-1">
+                  {allow.map((a) => (
+                    <li key={a.value} className="flex items-center gap-2 text-2xs">
+                      <span className="num text-ink">{a.value}</span>
+                      {a.note ? (
+                        <span className="min-w-0 flex-1 truncate text-faint">{a.note}</span>
+                      ) : (
+                        <span className="flex-1" />
+                      )}
+                      <button
+                        type="button"
+                        disabled={busy === 'allow'}
+                        onClick={() => void saveAllow(a.value, 'remove')}
+                        className="shrink-0 rounded-full border border-line px-2 py-0.5 text-2xs text-muted transition-colors hover:border-warn hover:text-warn disabled:opacity-50"
+                      >
+                        移除
+                      </button>
+                    </li>
+                  ))}
+                  {!allow.length ? (
+                    <li className="text-2xs leading-relaxed text-warn">
+                      还没有任何白名单。内网段已自动放行，但你在外面用 4G / 家宽访问 NAS、远程桌面时，
+                      自己的出口 IP 会被判成攻击者 —— 建议把常用出口加进来。
+                    </li>
+                  ) : null}
+                </ul>
+                <div className="mt-2 flex gap-1.5">
+                  <input
+                    value={allowInput}
+                    onChange={(e) => setAllowInput(e.target.value)}
+                    placeholder="1.2.3.4 或 5.6.7.0/24"
+                    className="min-w-0 flex-1 rounded-field border border-line bg-bg-2 px-2 py-1 text-2xs text-ink outline-none transition-colors placeholder:text-faint focus:border-accent"
+                  />
+                  <button
+                    type="button"
+                    disabled={busy === 'allow' || !allowInput.trim()}
+                    onClick={() => void saveAllow(allowInput.trim(), 'add')}
+                    className="flex shrink-0 items-center gap-1 rounded-field border border-line bg-bg-2 px-2.5 py-1 text-2xs text-ink transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
+                  >
+                    {busy === 'allow' ? <Spinner /> : <Plus size={12} />}
+                    加入
+                  </button>
+                </div>
+                <p className="mt-1 text-2xs leading-relaxed text-faint">
+                  名单里的来源永远不会被告警，也不允许被封禁；内网段（10/8、172.16/12、192.168/16 等）已自动放行。
+                </p>
+              </>
+            )}
           </GuardBlock>
 
           <p className="flex items-start gap-1.5 text-2xs leading-relaxed text-faint">

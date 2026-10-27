@@ -1299,14 +1299,39 @@ function securityPayload() {
       `select substr(ts, 12, 2) h, count(*) n from events where ts >= '${since24}'
         group by h order by h`);
 
+    /* geo / message_id 是后补的列（补列在 frp_guard.py 的 _init_schema 里）。
+       先看一眼表结构再拼 SQL —— 老库上直接 select 不存在的列会让整块快照黑掉，
+       而这块黑了，页面连「谁被封了」都看不到。 */
+    let bcols = new Set();
+    try { bcols = new Set(sqliteAll(SECURITY_DB, 'pragma table_info(blocks)').map((c) => c.name)); } catch (e) { /* 表还没建 */ }
+    const geoCol = bcols.has('geo') ? "coalesce(geo,'') geo" : "'' geo";
+    const midCol = bcols.has('message_id') ? "coalesce(message_id,'') message_id" : "'' message_id";
+
     const pending = sqliteAll(SECURITY_DB,
-      `select id, ip, reason, ticket, requested_by, requested_at, expires_at
+      `select id, ip, reason, ticket, requested_by, requested_at, expires_at, ${geoCol}, ${midCol}
          from blocks where status = 'pending' order by id desc limit 20`);
 
     const blocks = sqliteAll(SECURITY_DB,
       `select id, ip, reason, status, requested_by, approved_by, requested_at,
-              approved_at, expires_at, result
+              approved_at, expires_at, result, ${geoCol}
          from blocks where status <> 'pending' order by id desc limit 15`);
+
+    /* 归属地：补丁之后新开的单在申请时就写进库了，但老单这一列是空的。
+       这里用 frp_guard 的 geo 缓存批量补一次 —— 同一份 30 天缓存，不额外打外部接口。
+       申请卡上没有归属地，人就少了「机房扫描还是同城家宽」这个判断依据。 */
+    const geoFill = [];
+    pending.forEach((p) => { if (p.ip && !p.geo && !geoFill.includes(p.ip)) geoFill.push(p.ip); });
+    blocks.forEach((b) => { if (b.ip && !b.geo && !geoFill.includes(b.ip)) geoFill.push(b.ip); });
+    if (geoFill.length) {
+      const g = await runFrpGuard(['geo', '--ips', geoFill.slice(0, 60).join(',')], 15000);
+      let geoMap = {};
+      try { geoMap = g.ok && g.output ? JSON.parse(g.output) : {}; } catch (e) { geoMap = {}; }
+      const fill = (row) => {
+        if (!row.geo) row.geo = String((geoMap[row.ip] || {}).place || '');
+      };
+      pending.forEach(fill);
+      blocks.forEach(fill);
+    }
 
     const live = await runFrpGuard(['json'], 40000);
     let snapshot = null;
@@ -1332,9 +1357,26 @@ function securityPayload() {
     /* 24h 涉及服务数按中文名去重（双源合并后口径） */
     const services24 = new Set(svcRowsRaw.map((r) => alias[r.proxy] || r.proxy)).size;
 
+    /* 自动封禁开关的真实状态。
+       不返回它，面板上那个 Toggle 只能显示默认的「关闭」—— 用户以为没开、
+       实际开着，值守脚本照旧自动执行。老库没有 settings 表时按关闭处理，
+       与 frp_guard.py 的 auto_ban_enabled() 保持同一语义。 */
+    let autoBan = { enabled: false, updated_at: '', updated_by: '' };
+    try {
+      const row = sqliteAll(SECURITY_DB,
+        "select value, updated_at, updated_by from settings where key = 'auto_ban_foreign'")[0];
+      const v = String((row && row.value) || '').trim().toLowerCase();
+      autoBan = {
+        enabled: ['1', 'true', 'on', 'yes'].includes(v),
+        updated_at: (row && row.updated_at) || '',
+        updated_by: (row && row.updated_by) || '',
+      };
+    } catch (e) { /* 没有 settings 表：保持关闭 */ }
+
     return {
       summary24h: { total: sum.n || 0, sources: sum.ips || 0, services: services24 },
       topIps, topProxy, hourly, pending, blocks,
+      auto_ban: autoBan,
       snapshot,
       snapshot_ok: live.ok,
       snapshot_error: live.error || '',
@@ -1357,6 +1399,29 @@ function securityPayload() {
   });
 }
 
+/**
+ * 审批完成后把飞书那张卡改成结果态。
+ *
+ * 卡片是助手机上的 feishu_ban_card.py 发的，message_id 也记在 blocks 里，
+ * 所以这里只给授权码，让脚本自己去查。**页面这条路以前完全不管卡片** ——
+ * 在页面上点了批准，群里那张卡还停在「待审批」、按钮还亮着，看起来像没生效。
+ *
+ * best-effort：改卡失败不影响封禁已经执行这件事，更不能把接口返回变成失败。
+ */
+function syncBanCard(code, approve, detail) {
+  const script = path.join(HERMES_HOME, 'scripts', 'feishu_ban_card.py');
+  if (!fs.existsSync(script)) return;
+  try {
+    const child = spawn('python3', [
+      script, 'update', '--code', code,
+      '--state', approve ? 'approved' : 'rejected',
+      '--by', '网页', '--detail', String(detail || '').slice(0, 120),
+    ], { stdio: 'ignore', detached: true });
+    child.on('error', () => {});
+    child.unref();
+  } catch (e) { /* 卡片只是通知，不是事实来源 */ }
+}
+
 /* 授权封禁：必须同时具备「已登录会话」+「有效授权码」。
  * 授权码由白饭通过 frp_guard.py request 生成，6 位、6 小时过期、一次性。
  * 服务端只做转发，真正的校验在 Python 侧（ticket + pending + 有效期 + 白名单 + 配额）。 */
@@ -1367,16 +1432,133 @@ async function handleSecurityDecision(req, res, approve) {
 
   if (!/^[A-Z0-9]{6}$/.test(code)) return send({ error: '授权码格式不正确' }, 400);
 
+  /* 谁批的：网页和飞书这两条路都会走到这里，审计要分得清。
+     飞书那侧自己会把卡片改成结果态（还带操作人名），所以这里不再重复 PATCH。
+     operator 是飞书回调里的点击者姓名：面板侧已经按所有者白名单校验过身份，
+     这里负责把"是谁"落到审计里 —— 只写"飞书授权"的话，事后查不出人。 */
+  const by = String((body && body.by) || '').trim() === '飞书' ? '飞书' : '网页';
+  const operator = String((body && body.operator) || '').trim().slice(0, 40);
+  const byLabel = by + '授权' + (operator ? `（${operator}）` : '');
+
   const d = approve
-    ? await runFrpGuard(['approve', '--code', code, '--by', '网页授权', '--apply'], 45000)
-    : await runFrpGuard(['reject', '--code', code, '--by', '网页拒绝'], 20000);
+    ? await runFrpGuard(['approve', '--code', code, '--by', byLabel, '--apply'], 45000)
+    : await runFrpGuard(['reject', '--code', code, '--by', byLabel.replace('授权', '拒绝')], 20000);
 
   _cache.delete('security');   /* 决策后立刻失效缓存，页面能马上看到状态 */
+  /* 决策落库之后同步飞书卡片：不 await，卡片慢不该拖住接口 */
+  if (d.ok && by !== '飞书') syncBanCard(code, approve, d.output);
+
   /* 失败时必须给出原因：Python 侧 stderr 可能是空的，只回 ok:false 的话
      面板只能显示"数据桥失败（HTTP 400）"，人完全不知道发生了什么 */
   const detail = String(d.error || '').trim() || String(d.output || '').trim()
     || '助手侧未给出原因（命令可能没有执行）';
   return send({ ok: d.ok, output: d.output, error: detail }, d.ok ? 200 : 400);
+}
+
+/**
+ * 手动解封。
+ *
+ * 和封禁一样会真的改 frps 规则，所以只挂在 POST 上、只收 IP 字面量；
+ * 是否真删掉由 frp_guard.py 决定（它删不成功就不会把记录改成 revoked）。
+ */
+async function handleSecurityUnblock(req, res) {
+  const body = await readJsonBody(req, 8 * 1024);
+  const ip = String((body && body.ip) || '').trim();
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return sendJson(res, 400, { error: 'IP 格式不正确' });
+
+  const d = await runFrpGuard(['unblock', '--ip', ip, '--apply', '--by', '网页解封'], 45000);
+  _cache.delete('security');
+  const detail = String(d.error || '').trim() || String(d.output || '').trim();
+  if (!d.ok) return sendJson(res, 400, { ok: false, error: detail || '助手机未给出原因' });
+  return sendJson(res, 200, { ok: true, ip, output: d.output });
+}
+
+/* 白名单文件与 frp_guard.py 的 ALLOW_FILE 同一个：它是「自己人不会被自己封」
+   的最后一道阀，页面能改才算真正可用（以前只能 ssh 上去编辑）。 */
+const ALLOW_FILE = path.join(HERMES_HOME, 'scripts', 'frp_guard_allow.txt');
+
+function readAllowLines() {
+  try {
+    return fs.readFileSync(ALLOW_FILE, 'utf8').split('\n');
+  } catch (e) { return []; }
+}
+
+function allowEntries() {
+  const out = [];
+  readAllowLines().forEach((line) => {
+    const body = line.split('#')[0].trim();
+    if (!body) return;
+    out.push({ value: body, note: (line.split('#')[1] || '').trim() });
+  });
+  return out;
+}
+
+/* 写之前先校验。一个手滑的 0.0.0.0/0 等于把整套防护关掉，
+   这种事不能靠人自觉 —— 掩码比 /8 还宽的一律拒掉。 */
+function parseAllowEntry(raw) {
+  const v = String(raw || '').trim();
+  if (!v) return null;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(v)) {
+    return v.split('.').every((n) => Number(n) <= 255) ? v : null;
+  }
+  const m = v.match(/^(\d{1,3}(?:\.\d{1,3}){3})\/(\d{1,2})$/);
+  if (!m) return null;
+  if (!m[1].split('.').every((n) => Number(n) <= 255)) return null;
+  const bits = Number(m[2]);
+  if (bits < 8 || bits > 32) return null;
+  return v;
+}
+
+async function handleSecurityAllow(req, res) {
+  if (req.method === 'GET') {
+    return sendJson(res, 200, { path: ALLOW_FILE, entries: allowEntries() });
+  }
+  let body;
+  try { body = await readJsonBody(req, 8 * 1024); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+  const action = String(body?.action || 'add');
+  const entry = parseAllowEntry(body?.entry);
+  if (!entry) return sendJson(res, 400, { error: '只接受 IPv4 或 CIDR（掩码不小于 /8）' });
+
+  const lines = readAllowLines();
+  const exists = allowEntries().some((e) => e.value === entry);
+  if (action === 'add' && !exists) {
+    /* 追加前补一个换行：文件末尾没有换行时直接 push 会把两条粘成一条 */
+    if (lines.length && lines[lines.length - 1].trim()) lines.push(entry);
+    else lines.push(entry);
+  } else if (action === 'remove' && exists) {
+    const kept = lines.filter((l) => l.split('#')[0].trim() !== entry);
+    lines.length = 0;
+    kept.forEach((l) => lines.push(l));
+  }
+  try {
+    fs.writeFileSync(ALLOW_FILE, lines.join('\n'), { mode: 0o600 });
+    /* mode 只在新建文件时生效；覆盖已有文件会保留旧权限，
+       所以显式再 chmod 一次，别在磁盘上留一份 0644 的名单 */
+    try { fs.chmodSync(ALLOW_FILE, 0o600); } catch (e) { /* 文件系统不支持就算了 */ }
+  } catch (e) {
+    return sendJson(res, 500, { error: '写白名单失败：' + e.message });
+  }
+  return sendJson(res, 200, { ok: true, entries: allowEntries() });
+}
+
+/**
+ * 境外 IP 自动封禁总开关。
+ *
+ * 这个接口以前根本没实现：面板上那个 Toggle 一点就 405（Method Not Allowed），
+ * 所以"关掉了"其实什么也没关 —— 库里 auto_ban_foreign 还是老值，值守脚本
+ * 继续按旧状态自动执行。教训是：开关这种能改变"封禁要不要等人"的东西，
+ * 必须把写入链路走通，否则界面在撒谎。
+ *
+ * 只认显式布尔：传错类型一律按"关闭"处理，绝不因为缺参而把开关打开。
+ */
+async function handleSecurityAutoBan(req, res) {
+  const body = await readJsonBody(req, 8 * 1024);
+  const enabled = body?.enabled === true;
+  const d = await runFrpGuard(['auto-ban', enabled ? '--on' : '--off', '--by', '网页设置'], 20000);
+  _cache.delete('security');
+  const detail = String(d.error || '').trim() || String(d.output || '').trim();
+  if (!d.ok) return sendJson(res, 400, { ok: false, error: detail || '助手侧未给出原因（命令可能没有执行）' });
+  return sendJson(res, 200, { ok: true, enabled, output: d.output });
 }
 
 /* ---------- 公开的工位状态（登录页用，无需登录） ----------
@@ -2733,6 +2915,15 @@ async function handleLocal(req, res) {
     /* 边界守望：授权封禁（必须已登录 + 有效授权码；校验在 Python 侧） */
     if (req.method === 'POST' && route === '/local/security/approve') return handleSecurityDecision(req, res, true);
     if (req.method === 'POST' && route === '/local/security/reject') return handleSecurityDecision(req, res, false);
+    /* 自动封禁总开关：写 attacks.db 的 settings，由 frp_guard.py 落库并审计 */
+    if (req.method === 'POST' && route === '/local/security/auto-ban') return handleSecurityAutoBan(req, res);
+    /* 手动解封：误封（尤其自动封禁误伤）之后的自救入口，删不掉就不会改状态 */
+    if (req.method === 'POST' && route === '/local/security/unblock') return handleSecurityUnblock(req, res);
+    /* 白名单：读 / 增删。写操作只认 IP 或 CIDR，挡住 0.0.0.0/0 这种东西 */
+    if (route === '/local/security/allow') {
+      if (req.method === 'GET' || req.method === 'POST') return handleSecurityAllow(req, res);
+      return send({ error: 'Method Not Allowed' }, 405);
+    }
     /* 设置页保存飞书机器人配置时把这份推过来（见 services/feishu-bot.js） */
     if (req.method === 'POST' && route === '/local/feishu-config') return handleFeishuConfig(req, res);
     if (route === '/local/harvester/sites') {

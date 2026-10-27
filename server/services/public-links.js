@@ -1,5 +1,5 @@
 import { getLinkByToken, consumeQuota } from '../db/public-links.js';
-import { addAttachment } from '../db/attachments.js';
+import { addAttachment, ALLOWED_MIME, safeAttachmentName } from '../db/attachments.js';
 import { createTicket } from './tickets.js';
 import { notifyPanelCard, notifyPanelText, panelNotifyReady } from './feishu-bot.js';
 import { isEmail, mailConfigured, ownerAddress, sendMail } from './mail.js';
@@ -11,7 +11,8 @@ import { isEmail, mailConfigured, ownerAddress, sendMail } from './mail.js';
  * 全部不可信"来写：
  *   1. 令牌 32 字节随机，格式先校验再查库；
  *   2. 项目 / 分类 / 优先级由链接固定，请求体只能给标题与说明；
- *   3. 字段长度硬截断，不收附件、不收 HTML；
+ *   3. 字段长度硬截断，不收 HTML；附件走 MIME 白名单，且有条数 / 单个体积 /
+ *      每日总字节三重上限（html/svg/js 这类能执行脚本的类型不在白名单里）；
  *   4. 蜜罐 + 填写耗时挡脚本，单 IP 时间窗 + 单链接每日额度挡刷；
  *   5. 失败一律说"链接无效或已关闭"，不区分停用 / 过期 / 额度用完。
  * 真正的兜底是"可停用、可轮换"——链接一旦被转出去，指望它不被滥用不现实。
@@ -22,28 +23,16 @@ const NOTE_MAX = 5000;
 const NAME_MAX = 40;
 const CONTACT_MAX = 120;
 
-/** 外链允许的附件类型：图片、Office 文档、PDF、纯文本、压缩包。
-    刻意不收 svg / html / js —— 它们以 data URL 打开时能执行脚本，
-    而附件最终会以同样的形式回到面板里。 */
-const ALLOWED_MIME = new Set([
-  'image/png',
-  'image/jpeg',
-  'image/gif',
-  'image/webp',
-  'application/pdf',
-  'application/msword',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'application/vnd.ms-excel',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  'application/vnd.ms-powerpoint',
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  'text/plain',
-  'application/zip',
-]);
+/* 允许的附件类型从 db/attachments.js 复用（那边是唯一真源）：以前这里有一份
+   自己的白名单、面板侧什么类型都收，两个入口对同一张表给了不同的约束。 */
 
 /** 外链的附件比面板里更紧：最多 3 个、单个 1.5MB（与 db/attachments.js 的上限一致） */
 const PUB_FILES_MAX = 3;
 const PUB_FILE_BYTES = 1.5 * 1024 * 1024;
+
+/* 附件总字节的日上限不在这里，而在 db/public-links.js 的 DAY_BYTES_CAP：
+   它必须和 day_count 落在同一条 UPDATE 的 WHERE 里才挡得住并发，
+   常量跟着那句 SQL 走，两边才不会对不上。 */
 
 /** 正常填表不可能 1.2 秒内完成；低于这个值按脚本处理 */
 const MIN_FILL_MS = 1200;
@@ -115,15 +104,6 @@ export async function resolvePublicLink(token) {
   return linkClosed(link) ? null : link;
 }
 
-/** 文件名只留给人看的部分：去掉路径与控制字符，压到 120 字 */
-function safeName(name) {
-  return String(name || '附件')
-    .replace(/[\u0000-\u001f\u007f]/g, '')
-    .replace(/[\\/]/g, '_')
-    .trim()
-    .slice(0, 120);
-}
-
 /**
  * 校验附件。返回规范化后的数组；任何一项不合格就整单拒绝 ——
  * 静默丢掉附件会让提交者以为传上去了。
@@ -143,14 +123,14 @@ function cleanAttachments(input) {
     if (bytes > PUB_FILE_BYTES) {
       throw new PublicError(
         400,
-        `「${safeName(item?.name)}」${(bytes / 1024 / 1024).toFixed(1)}MB，超过 1.5MB 上限，请压缩后重新上传`,
+        `「${safeAttachmentName(item?.name)}」${(bytes / 1024 / 1024).toFixed(1)}MB，超过 1.5MB 上限，请压缩后重新上传`,
       );
     }
     // 请求头里声明的 mime 与 data URL 自带的必须一致，否则以内容为准
     if (item?.mime && String(item.mime).toLowerCase() !== mime) {
       throw new PublicError(400, '附件类型对不上');
     }
-    return { name: safeName(item?.name), mime, size: bytes, content };
+    return { name: safeAttachmentName(item?.name), mime, size: bytes, content };
   });
 }
 
@@ -168,29 +148,31 @@ function oneLine(value, max) {
  * 备注只取前 160 字：群消息是索引，不是正文。
  */
 function submitCard({ link, input, ticket, due, attachmentCount, at }) {
+  /* 提交人 / 标题 / 联系方式 / 备注全部来自匿名提交者，一律用 plain_text：
+     lark_md 会解析 [文案](链接) 和 <at id=all></at> 之类标签，靠转义挡不干净
+     （Feishu 的转义规则不受我们控制），而这张卡是往受信的通知群里发的。
+     代价是标签不再加粗 —— 换来的是匿名者改不了卡片的语义。 */
+  const plainField = (label, value) => ({
+    is_short: true,
+    text: { tag: 'plain_text', content: `${label}\n${value}` },
+  });
   const fields = [
-    { is_short: true, text: { tag: 'lark_md', content: `**项目**\n${link.project}${link.section ? ` / ${link.section}` : ''}` } },
-    { is_short: true, text: { tag: 'lark_md', content: `**提交人**\n${input.submitter || '未留名'}` } },
+    plainField('项目', `${link.project}${link.section ? ` / ${link.section}` : ''}`),
+    plainField('提交人', input.submitter || '未留名'),
   ];
-  if (input.contact) {
-    fields.push({ is_short: true, text: { tag: 'lark_md', content: `**联系方式**\n${oneLine(input.contact, 60)}` } });
-  }
-  if (due) {
-    fields.push({ is_short: true, text: { tag: 'lark_md', content: `**期望完成**\n${due}` } });
-  }
-  if (attachmentCount) {
-    fields.push({ is_short: true, text: { tag: 'lark_md', content: `**附件**\n${attachmentCount} 个` } });
-  }
+  if (input.contact) fields.push(plainField('联系方式', oneLine(input.contact, 60)));
+  if (due) fields.push(plainField('期望完成', due));
+  if (attachmentCount) fields.push(plainField('附件', `${attachmentCount} 个`));
 
   const elements = [
-    { tag: 'div', text: { tag: 'lark_md', content: `**${oneLine(input.title, 120)}**` } },
+    { tag: 'div', text: { tag: 'plain_text', content: oneLine(input.title, 120) } },
     { tag: 'div', fields },
   ];
 
   const excerpt = oneLine(input.note, 160);
   if (excerpt) {
     elements.push({ tag: 'hr' });
-    elements.push({ tag: 'div', text: { tag: 'lark_md', content: excerpt } });
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: excerpt } });
   }
 
   /* 面板地址只能从环境变量拿：服务端不知道自己的公网域名，
@@ -302,8 +284,13 @@ export async function submitToLink(link, body, { ip = '' } = {}) {
 
   if (tooFrequent(link.id, ip)) throw new PublicError(429, '提交太频繁了，请过几分钟再试');
 
-  const quota = await consumeQuota(link.id, todayKey());
-  if (!quota) throw new PublicError(429, '这条链接今天已经收满了，请联系发起人');
+  /* 附件字节一起占额度：只限条数时，200 条 × 3 个 × 1.5MB 一天能写进近 900MB，
+     而这一列是 MEDIUMTEXT —— 链接一旦被转到公开群，磁盘就是这么被填满的 */
+  const attachBytes = attachments.reduce((sum, file) => sum + file.size, 0);
+  const quota = await consumeQuota(link.id, todayKey(), attachBytes);
+  /* 条数用完与附件总量用完共用一句话：对提交者都不用区分，
+     区分了只会告诉他"换个方式还能塞" */
+  if (!quota) throw new PublicError(429, '这条链接今天已经收满了（提交条数或附件总量），请联系发起人');
 
   const ticket = createTicket(
     {

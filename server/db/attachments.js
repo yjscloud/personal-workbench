@@ -18,6 +18,41 @@ const MAX_INLINE = 20;
 /** 单个附件上限 1.5MB：base64 后约 2MB 字符，MEDIUMTEXT 与 4MB 的请求体都装得下 */
 const MAX_BYTES = 1.5 * 1024 * 1024;
 
+/**
+ * 允许的附件类型。**唯一真源**：公开外链入口（services/public-links.js）
+ * 直接复用这一份，别再各写一套 —— 之前两处不一致，面板侧什么 type 都收。
+ *
+ * 刻意不收 svg / html / js：它们以 data URL 打开时能执行脚本，而附件最终
+ * 会以 data URL 的形式回到浏览器（现在只进 <img>/<a download>，但那是
+ * 渲染侧的约定，不该当成存储侧的防线）。
+ */
+export const ALLOWED_MIME = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'text/plain',
+  'text/markdown',
+  'text/csv',
+  'application/zip',
+]);
+
+/** 文件名只留给人看的部分：去掉路径与控制字符，压到 120 字 */
+export function safeAttachmentName(name) {
+  return String(name || '附件')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[\\/]/g, '_')
+    .trim()
+    .slice(0, 120);
+}
+
 let counter = 0;
 function uid() {
   counter = (counter + 1) % 10000;
@@ -57,7 +92,16 @@ export async function listAttachments(ticketId) {
 export async function addAttachment(ticketId, { name, mime, size, content, inline = false }) {
   const isInline = Boolean(inline);
   const dataUrl = String(content ?? '');
-  if (!/^data:[^;]+;base64,/.test(dataUrl)) throw new Error('附件内容格式不对，应该是 data URL');
+  /* 类型以 data URL 自己声明的为准：请求体里的 mime 是客户端说了算的，
+     两边不一致就以内容为准，别让"名字叫 png、内容其实是 html"混进来 */
+  const match = /^data:([\w.+-]+\/[\w.+-]+);base64,/.exec(dataUrl);
+  if (!match) throw new Error('附件内容格式不对，应该是 base64 data URL');
+  const actualMime = match[1].toLowerCase();
+  if (!ALLOWED_MIME.has(actualMime)) {
+    throw new Error('这个文件类型不接受：只收图片、Word / Excel / PPT、PDF、txt / md / csv、zip');
+  }
+  const declaredMime = String(mime || '').trim().toLowerCase();
+  if (declaredMime && declaredMime !== actualMime) throw new Error('附件声明的类型与内容不一致');
 
   // base64 的体积可以反推：每 4 个字符还原 3 字节
   const bytes = Math.round((dataUrl.length * 3) / 4);
@@ -76,9 +120,9 @@ export async function addAttachment(ticketId, { name, mime, size, content, inlin
   const row = {
     id: uid(),
     ticketId: String(ticketId),
-    name: String(name || '未命名').slice(0, 200),
-    mime: String(mime || '').slice(0, 120),
-    size: Number(size) > 0 ? Math.trunc(Number(size)) : bytes,
+    name: safeAttachmentName(name),
+    mime: actualMime,
+    size: bytes,
     content: dataUrl,
     inline: isInline,
     createdAt: new Date(),
