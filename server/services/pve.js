@@ -501,7 +501,24 @@ export function parseSensorsText(text) {
     return { name, value: r.value, chip: r.chip, kind: chipKind(r.chip, r.label) };
   });
 
-  return { temperatures, power: [] };
+  /* 同一块 NVMe 会报两条一样的读数：Composite（综合值）通常就等于 Sensor 1。
+     同芯片下若有 Composite，就把与它数值相同的子传感器丢掉 —— 否则温度点数量
+     虚高，界面上两条一模一样的数字并排摆着，看着像两个独立热源。 */
+  const byChip = new Map();
+  for (const t of temperatures) {
+    if (!byChip.has(t.chip)) byChip.set(t.chip, []);
+    byChip.get(t.chip).push(t);
+  }
+  const deduped = [];
+  for (const group of byChip.values()) {
+    const composite = group.find((t) => /^composite$/i.test(t.name));
+    for (const t of group) {
+      if (composite && t !== composite && t.value === composite.value) continue;
+      deduped.push(t);
+    }
+  }
+
+  return { temperatures: deduped, power: [] };
 }
 
 function normalizeStatus(node, raw) {
@@ -710,10 +727,10 @@ export async function getOverview(settings, { node, timeframe = 'hour' } = {}) {
          注意 qm list 不区分模板，别拿它来验证筛没筛干净。 */
       qemu: (qemuRaw || [])
         .filter((g) => !isTemplate(g))
-        .map((g) => ({ vmid: g.vmid, name: g.name, status: g.status, cpu: num(g.cpu), maxmem: num(g.maxmem), mem: num(g.mem), uptime: num(g.uptime) })),
+        .map((g) => ({ vmid: g.vmid, name: g.name, status: g.status, cpu: num(g.cpu), maxcpu: num(g.maxcpu), maxmem: num(g.maxmem), mem: num(g.mem), uptime: num(g.uptime) })),
       lxc: (lxcRaw || [])
         .filter((g) => !isTemplate(g))
-        .map((g) => ({ vmid: g.vmid, name: g.name, status: g.status, cpu: num(g.cpu), maxmem: num(g.maxmem), mem: num(g.mem), uptime: num(g.uptime) })),
+        .map((g) => ({ vmid: g.vmid, name: g.name, status: g.status, cpu: num(g.cpu), maxcpu: num(g.maxcpu), maxmem: num(g.maxmem), mem: num(g.mem), uptime: num(g.uptime) })),
     },
     /** 被筛掉的模板数量：界面上要让人知道列表不是"少读了"，而是有意排除 */
     templateCount: (qemuRaw || []).filter(isTemplate).length + (lxcRaw || []).filter(isTemplate).length,
@@ -735,7 +752,7 @@ export async function getGrowth(settings, node, usedRatioNow) {
   const overview = await getOverview(settings, { node, timeframe: 'week' });
   const pts = (overview.series || []).filter((p) => p.rootused > 0 && p.roottotal > 0);
   if (pts.length < 6) {
-    return { perDayBytes: 0, daysLeft: null, samples: pts.length, available: false };
+    return { perDayBytes: 0, daysLeft: null, samples: pts.length, available: false, freeBytes: 0, spanDays: 0 };
   }
   const t0 = pts[0].time;
   const xs = pts.map((p) => (p.time - t0) / 86400);
@@ -750,9 +767,14 @@ export async function getGrowth(settings, node, usedRatioNow) {
     den += (xs[i] - mx) ** 2;
   }
   const slope = den === 0 ? 0 : num2 / den; // bytes / day
-  const total = pts[pts.length - 1].roottotal;
-  const used = pts[pts.length - 1].rootused;
-  const free = Math.max(0, total - used);
+  const lastPt = pts[pts.length - 1];
+  const total = lastPt.roottotal;
+  const used = lastPt.rootused;
+  /* 剩余空间用 rootfs.avail，不用 total - used：ext4 默认留 5% 给 root，
+     total-used 比真正能写的多一截，"还能用多少天"会跟着偏乐观。
+     avail 拿不到（非 ext4 / 字段缺失）再退回 total-used。 */
+  const avail = num(overview.status?.rootfs?.avail);
+  const free = avail > 0 ? avail : Math.max(0, total - used);
   const daysLeft = slope > 1024 * 1024 ? free / slope : null;
   return {
     perDayBytes: slope,
@@ -760,5 +782,8 @@ export async function getGrowth(settings, node, usedRatioNow) {
     samples: n,
     available: true,
     usedRatio: usedRatioNow ?? used / total,
+    /** 剩余可写字节数与实际样本跨度：前端要按真实跨度写"近 N 天"，不能写死 7 */
+    freeBytes: free,
+    spanDays: (lastPt.time - pts[0].time) / 86400,
   };
 }

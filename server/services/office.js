@@ -1,32 +1,36 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { authedRequest, hermesApi, hasHermesCredentials, openHermesStream, hermesSeats } from './hermes.js';
+import { bridgeCall, invalidateLocal } from './hermes-local.js';
+import { isLocalConfigured } from './hermes-config.js';
+import { applyUsageOverrides } from './usage-overrides.js';
 
 /* ────────────────────────────────────────────────────────────────────────
- * Hermes「Agent Office」—— 登录墙后面那半
+ * Hermes 智能办公 · 数据面
  * ────────────────────────────────────────────────────────────────────────
- * 免登录的 `/public/agents` 只给工位数量与在线标记（services/hermes.js 里已归一化）。
- * 这一层接的是要 Cookie 会话才读得到的东西，全部走面板自己的会话去调，
- * 浏览器不直接碰那台网关（跨域 + 混合内容 + 不该把会话交给前端）。
+ * 合并 agent_office 之后，这里直接对接 Hermes 的两条通道，不再有中间网页服务：
  *
- * 实测的接口面（路径都是相对那台控制台的）：
+ *   · 网关 HTTP（Bearer，services/hermes.js）
+ *       GET  /api/sessions?limit=&offset=        对话回溯
+ *       GET  /api/sessions/:id/messages          某次对话的逐条明细
+ *       POST /api/sessions/:id/chat/stream       对话（SSE，边想边推）
  *
- *   GET  /public/agents                       免登录：工位/在编/在线 + 每位员工在线标记
- *   GET  /hermes/api/sessions?limit=&offset=  对话回溯（网关侧，控制台以 /hermes 前缀代理）
- *   GET  /hermes/api/sessions/:id/messages    某次对话的逐条明细
- *   POST /hermes/api/sessions/:id/chat/stream 对话（SSE，边想边推）
- *   GET  /local/board                         全局待办工作表（任务 / 最近执行 / 异常）
- *   GET  /local/usage                         今日与近 7 日 token 用量、预算
- *   GET  /local/security                      边界守望：攻击快照 / 24h 汇总 / 待授权封禁
- *   GET  /local/security/profile?ip=          单个来源 IP 的画像（连接 / 字节 / 用户名 / 封禁史）
- *   POST /local/security/approve|reject       {code} 批准或拒绝一条封禁申请
- *   GET  /assets/*.png                        员工立绘（连图片也在登录墙后面）
+ *   · SSH 数据桥（services/hermes-local.js → server/remote/hwb-bridge.cjs）
+ *       /public/agents                           工位 / 在编 / 在线（本机真实探活）
+ *       /local/board                             全局待办工作表
+ *       /local/usage                             今日与近 7 日 token 用量、预算
+ *       /local/security                          边界守望：快照 / 24h 汇总 / 待授权封禁
+ *       /local/security/profile?ip=              单个来源 IP 的画像
+ *       POST /local/security/approve|reject      批准或拒绝一条封禁申请
+ *       /local/harvester/*                       拾贝：站点经验 / 计划 / 抽取 / 清洗 / 自愈
+ *       /api/office/avatar/:file                 员工立绘（已本地化到 server/data/office）
  *
  * ── 两个刻意的取舍 ──────────────────────────────────────────────────────
- * 1. **员工档案写在代码里**。控制台的 `/public/agents` 只回 id/name/en/online，
- *    岗位职责、工位号、立绘文件名都只存在于它自己的前端常量里（`AGENTS` 数组，
- *    在 index.html 内联）。这里照抄一份并注明来源，是因为没有别的接口可取；
- *    写死一个 id → 立绘的映射同时也是一道白名单：取立绘只认这几个文件名，
- *    不会变成"拿任意路径去打那台内网机器"的跳板。
- * 2. **不搬它的演示数据**。它前端那几栏「当前任务 / 今日 token」对部分员工是写死的
+ * 1. **员工档案写在代码里**。数据桥的 `/public/agents` 只回 id/name/en/online，
+ *    岗位职责与工位号在合并时一并写进这里；写死一个 id → 立绘的映射同时也是
+ *    一道白名单：取立绘只认这几个文件名，不会变成"拿任意路径读本机文件"的跳板。
+ * 2. **不搬演示数据**。原控制台前端那几栏「当前任务 / 今日 token」对部分员工是写死的
  *    示例值（鲸吞/蓝岚那些是演示员工，根本不在在编名单里）。这里只取能核实的：
  *    名字、岗位、工位号、在线与否，以及真实接口给的待办与用量。编不出来就不显示。
  * ──────────────────────────────────────────────────────────────────────── */
@@ -41,7 +45,7 @@ import { authedRequest, hermesApi, hasHermesCredentials, openHermesStream, herme
  * 能真的收发；其余岗位是工具集/守望/采集子系统，没有对话概念，界面上要如实标出来，
  * 不能装作在跟它聊。
  */
-export const EMPLOYEES = [
+const EMPLOYEES = [
   {
     id: 'hermes',
     name: '白饭',
@@ -105,36 +109,40 @@ export async function officeRoster() {
   };
 }
 
-/* ── 立绘代理 ──────────────────────────────────────────────────────────
- * 为什么不直接把那台机器的地址丢给浏览器：
- *   · 面板可以用 https 打开，而它是 http —— 混合内容会被浏览器直接拦掉；
- *   · 立绘在登录墙后面，浏览器没有那个会话 Cookie，拿到的只会是 401 的 JSON；
- *   · 那 4 张图每张 1MB 级，让它每次都被内网穿一遍没意义。
- * 所以由服务端取一次、缓存在内存里，浏览器只跟面板要。
+/* ── 立绘 ──────────────────────────────────────────────────────────────
+ * 4 张图随仓库放在 server/data/office/，由服务端读一次、缓存在内存里。
+ * 合并后不再跨机器取图：少一跳，也不受 https/http 混合内容影响。
  */
 const AVATAR_TTL = 30 * 60 * 1000;
 const AVATAR_MAX = 8 * 1024 * 1024;
 const avatarCache = new Map(); /* 文件名 → { at, contentType, buffer } */
 
+/** 立绘随工作台仓库走（server/data/office），不再跨机器取图 */
+const OFFICE_ASSET_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'data', 'office');
+
 /**
  * 取员工立绘（PNG 字节）。文件名必须是白名单里的，不认路径分隔符 ——
- * 这个函数对外暴露成一个 GET 路由，任何能走进来的字符串都会变成"用面板的
- * 会话去打内网网关"的一次请求，所以白名单是必须的，不是"顺手校验"。
+ * 这个函数对外暴露成一个 GET 路由，白名单是必须的，不是"顺手校验"。
  */
 export async function avatarFile(file) {
   const name = String(file || '').trim();
   if (!AVATAR_FILES.has(name)) throw new Error('没有这张立绘');
-  if (!hasHermesCredentials()) throw new Error('服务端没有配置 Hermes 口令，读不到立绘（它也在登录墙后面）');
 
   const hit = avatarCache.get(name);
   if (hit && Date.now() - hit.at < AVATAR_TTL) return hit;
 
-  const res = await authedRequest(`/assets/${name}`, { timeout: 15000, binary: true, maxBytes: AVATAR_MAX });
-  if (res.status !== 200 || !res.buffer?.length) throw new Error(`取立绘失败（HTTP ${res.status}）`);
+  let buffer;
+  try {
+    buffer = await fs.promises.readFile(path.join(OFFICE_ASSET_DIR, name));
+  } catch {
+    throw new Error(`立绘文件缺失：server/data/office/${name}`);
+  }
+  if (!buffer.length || buffer.length > AVATAR_MAX) throw new Error('立绘文件大小异常');
+
   const entry = {
     at: Date.now(),
-    contentType: String(res.headers['content-type'] || 'image/png'),
-    buffer: res.buffer,
+    contentType: 'image/png',
+    buffer,
   };
   avatarCache.set(name, entry);
   return entry;
@@ -142,11 +150,14 @@ export async function avatarFile(file) {
 
 /* ── 待办 / 用量 / 对话 ─────────────────────────────────────────────── */
 
-/** 全局待办工作表：会话统计、定时任务、最近执行、异常 */
-export const officeBoard = () => hermesApi('/local/board', { timeout: 12000 });
+/** 全局待办工作表：会话统计、定时任务、最近执行、异常（SSH 数据桥，精确读 state.db） */
+export const officeBoard = () => bridgeCall('/local/board', { timeout: 20000 });
 
-/** 今日与近 7 日 token 用量（含预算与模型） */
-export const officeUsage = () => hermesApi('/local/usage', { timeout: 12000 });
+/** 今日与近 7 日 token 用量（含预算与模型，按天精确分摊）
+ *  出门前套一层「官方校正」：过去分不清的日子，用 DeepSeek 账号账单上的
+ *  真实金额/用量覆盖（见 services/usage-overrides.js） */
+export const officeUsage = async () =>
+  applyUsageOverrides(await bridgeCall('/local/usage', { timeout: 20000 }));
 
 /* ── 给顶栏用的用量摘要 ──────────────────────────────────────────────
  * 顶栏那个「今日消耗 Token」原本只算面板自己调了几次模型，而办公室那几位
@@ -170,14 +181,37 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const briefOf = (u) => ({
   today: {
+    /** 真实处理量：输入（含缓存命中）+ 输出 + 推理 */
     total: Number(u?.today?.total) || 0,
+    /** 计费口径：不含缓存命中（缓存按 1/10 计价，不能直接相加） */
+    billed: Number(u?.today?.billed) || 0,
     input: Number(u?.today?.input) || 0,
     output: Number(u?.today?.output) || 0,
     cache_read: Number(u?.today?.cache_read) || 0,
     api_calls: Number(u?.today?.api_calls) || 0,
     sources: u?.today?.sources && typeof u.today.sources === 'object' ? u.today.sources : {},
+    /* 今日花费（元）。桥按时段单价算，取不到就是 0，前端据此决定显不显示 */
+    cost_cny: Number(u?.today?.cost_cny) || 0,
+    /* 这天含「官方账单校正」（见 services/usage-overrides.js）：界面要标出来，
+       否则用户没法判断这个数是他看到的账单，还是我们算出来的估算 */
+    manual: Boolean(u?.today?.manual),
+    manual_note: String(u?.today?.manual_note || ''),
+    manual_token_estimated: Boolean(u?.today?.manual_token_estimated),
   },
   yesterday: { total: Number(u?.yesterday?.total) || 0, api_calls: Number(u?.yesterday?.api_calls) || 0 },
+  /* 近 14 天：监控页那张卡片的柱状图靠它。只留画图要用的几个数，
+     整份 series 里还有 top_sessions / sources 这些大头，塞进顶栏轮询不值得 */
+  series: (Array.isArray(u?.series) ? u.series : []).map((d) => ({
+    day: String(d?.day || ''),
+    total: Number(d?.total) || 0,
+    billed: Number(d?.billed) || 0,
+    input: Number(d?.input) || 0,
+    output: Number(d?.output) || 0,
+    cache_read: Number(d?.cache_read) || 0,
+    api_calls: Number(d?.api_calls) || 0,
+    cost_cny: Number(d?.cost_cny) || 0,
+    manual: Boolean(d?.manual),
+  })),
   models: Array.isArray(u?.models) ? u.models : [],
   budget_tokens: Number(u?.budget_tokens) || 0,
   budget_label: String(u?.budget_label || ''),
@@ -213,7 +247,7 @@ export async function officeUsageBrief() {
   const now = Date.now();
   const stamp = usageMemo.val ? usageMemo.at : usageMemo.triedAt;
   const gap = usageMemo.val ? USAGE_TTL : USAGE_RETRY_GAP;
-  if (now - stamp >= gap && !usageMemo.inflight && hasHermesCredentials()) refreshUsage();
+  if (now - stamp >= gap && !usageMemo.inflight && isLocalConfigured()) refreshUsage();
 
   if (usageMemo.val) return usageMemo.error ? { ...usageMemo.val, error: usageMemo.error } : usageMemo.val;
 
@@ -224,30 +258,31 @@ export async function officeUsageBrief() {
 
 /** 对话回溯。网关侧那套返回 {object:'list', data, limit, offset, has_more} */
 export const officeSessions = ({ limit = 20, offset = 0 } = {}) =>
-  hermesApi(`/hermes/api/sessions?limit=${Number(limit) || 20}&offset=${Number(offset) || 0}`, { timeout: 12000 });
+  hermesApi(`/api/sessions?limit=${Number(limit) || 20}&offset=${Number(offset) || 0}`, { timeout: 12000 });
 
 /** 某次对话的逐条明细 */
 export const officeMessages = (sessionId, { limit = 30 } = {}) =>
   hermesApi(
-    `/hermes/api/sessions/${encodeURIComponent(String(sessionId))}/messages?limit=${Number(limit) || 30}&order=latest`,
+    `/api/sessions/${encodeURIComponent(String(sessionId))}/messages?limit=${Number(limit) || 30}&order=latest`,
     { timeout: 12000 },
   );
 
 /** 对话用的会话 id：默认就是控制台自己那条「网页端会话」，两边看到的是同一份历史 */
-const CHAT_SESSION = String(process.env.HERMES_CHAT_SESSION || 'agent_office_web');
+const CHAT_SESSION = String(process.env.HERMES_CHAT_SESSION || 'personal_workbench_office');
 
 /**
  * 幂等建会话：已存在网关回 409，那正是"可以用"。
  * 不建的话第一条消息会 404（会话得先存在才有 chat/stream 可打）。
  */
 async function ensureChatSession() {
-  const res = await authedRequest('/hermes/api/sessions', {
+  const res = await authedRequest('/api/sessions', {
     method: 'POST',
-    body: { id: CHAT_SESSION, title: 'Agent Office 网页端会话' },
+    body: { id: CHAT_SESSION, title: '个人工作台 · 智能办公会话' },
     timeout: 10000,
   });
-  if (res.status !== 200 && res.status !== 409) {
-    throw new Error(res.status === 401 ? 'Hermes 会话失效，且重登失败' : `建会话失败（HTTP ${res.status}）`);
+  /* 直连网关：新建会回 201，已存在回 409，都算「可以用」 */
+  if (![200, 201, 204, 409].includes(res.status)) {
+    throw new Error(`建会话失败（HTTP ${res.status}）：${String(res.text || '').slice(0, 160)}`);
   }
   return CHAT_SESSION;
 }
@@ -265,7 +300,7 @@ export async function chatHistory({ limit = 30 } = {}) {
 
 /* ── 员工详情（点开工位后那个弹窗）────────────────────────────────────
  * 与上游控制台同一套口径：抬头四个小标签 + 每个岗位各自的页签，
- * 数据全部来自它自己的 `/local/*` 与网关接口。
+ * 数据全部来自它自己的 SSH 数据桥 与网关接口。
  *
  * 两处**刻意不照抄**上游的地方：
  * 1. 上游的岗位元数据里混着演示值（尾流的「今日 Token 27.3万」「连续在线 9h 15m」
@@ -318,10 +353,13 @@ export async function seatDetail(seatId) {
  * 照抄过来才对得上：本体看网关记账、司册看 MCP 常驻进程、拾贝看它自己
  * 花掉的模型钱、值守看它的定时任务。写一套通用逻辑反而会张冠李戴。
  */
-export async function seatChips(seatId, online) {
+async function seatChips(seatId, online) {
   const emp = EMPLOYEES.find((e) => e.id === seatId);
   if (!emp) throw new Error('没有这位员工');
-  const usage = await officeUsage();
+  /* 尾流的两个数值来自待办（任务累计 token / 下次排期），不需要扫整份用量；
+     其余三位才读 usage。少一次 state.db 全量聚合，开抽屉更快。 */
+  const usage = seatId === 'weiliu' ? null : await officeUsage();
+  let board = null;
 
   const chips = [{ key: 'seat', icon: 'seat', label: '工位', value: emp.seat }];
 
@@ -381,11 +419,11 @@ export async function seatChips(seatId, online) {
       icon: 'clock',
       label: '连续在线',
       seconds: s.uptime_s,
-      tip: `本机采集服务（agent-office）已连续运行 ${durText(s.uptime_s)}${s.started_at ? `，启动于 ${atText(s.started_at)}` : ''}`,
+      tip: `Hermes 主机已连续运行 ${durText(s.uptime_s)}${s.started_at ? `，启动于 ${atText(s.started_at)}` : ''}（采集器按需启动）`,
     });
   } else {
     /* 值守：token 只有定时任务的**累计**数（上游那格是演示值，不抄） */
-    const board = await officeBoard();
+    board = await officeBoard();
     const jobs = (board.jobs || []).filter((j) => String(j.name).startsWith(OPS_JOB_PREFIX));
     const sum = jobs.reduce((s, j) => s + (Number(j.tokens) || 0), 0);
     chips.push({
@@ -415,35 +453,39 @@ export async function seatChips(seatId, online) {
     value: online ? '空闲待命' : '已下线休息',
   });
 
-  return { chips, tabs: SEAT_TABS[seatId] || ['config'], generated_at: usage.generated_at };
+  return {
+    chips,
+    tabs: SEAT_TABS[seatId] || ['config'],
+    generated_at: (usage && usage.generated_at) || (board && board.generated_at) || new Date().toISOString(),
+  };
 }
 
 /* ── 页签数据 ───────────────────────────────────────────────────────── */
 
 const fetchTab = {
   hermes: {
-    config: () => hermesApi('/local/config', { timeout: 12000 }),
-    skills: () => hermesApi('/local/skills', { timeout: 15000 }),
-    evo: () => hermesApi('/local/evolution', { timeout: 12000 }),
-    memory: () => hermesApi('/local/memories', { timeout: 12000 }),
+    config: () => bridgeCall('/local/config', { timeout: 12000 }),
+    skills: () => bridgeCall('/local/skills', { timeout: 15000 }),
+    evo: () => bridgeCall('/local/evolution', { timeout: 12000 }),
+    memory: () => bridgeCall('/local/memories', { timeout: 12000 }),
   },
   'mcp-filesystem': {
-    config: () => hermesApi('/local/mcp', { timeout: 12000 }),
-    skills: () => hermesApi('/local/mcp', { timeout: 12000 }),
-    memory: () => hermesApi('/local/mcp', { timeout: 12000 }),
+    config: () => bridgeCall('/local/mcp', { timeout: 12000 }),
+    skills: () => bridgeCall('/local/mcp', { timeout: 12000 }),
+    memory: () => bridgeCall('/local/mcp', { timeout: 12000 }),
   },
   weiliu: {
-    config: () => hermesApi('/local/watch', { timeout: 12000 }),
-    skills: () => hermesApi('/local/watch', { timeout: 12000 }),
+    config: () => bridgeCall('/local/watch', { timeout: 12000 }),
+    skills: () => bridgeCall('/local/watch', { timeout: 12000 }),
     /* 边界守望与值守任务不是同一份数据：它来自采集器落库的攻击记录（/local/security），
        窗口快照 + 24 小时汇总 + 封禁申请单，读一次要现采两端日志，给足超时 */
     guard: () => officeSecurity(),
-    memory: () => hermesApi('/local/watch', { timeout: 12000 }),
+    memory: () => bridgeCall('/local/watch', { timeout: 12000 }),
   },
   shabei: {
-    config: () => hermesApi('/local/harvester/sites', { timeout: 12000 }),
-    skills: () => hermesApi('/local/harvester/sites', { timeout: 12000 }),
-    memory: () => hermesApi('/local/harvester/history?limit=200', { timeout: 15000 }),
+    config: () => bridgeCall('/local/harvester/sites', { timeout: 12000 }),
+    skills: () => bridgeCall('/local/harvester/sites', { timeout: 12000 }),
+    memory: () => bridgeCall('/local/harvester/history?limit=200', { timeout: 15000 }),
   },
 };
 
@@ -462,7 +504,7 @@ function configDoc(seatId, d, usage) {
     return md([
       '# 白饭 · Hermes',
       '',
-      '> 数据来源：`/local/config` 直读 Hermes 安装目录与 `~/.hermes` 的真实文件',
+      '> 数据来源：SSH 数据桥 直读 Hermes 安装目录与 `~/.hermes` 的真实文件',
       '',
       '## 运行时',
       `- 版本: ${r.version || '—'}${r.sha ? ` (${r.sha})` : ''}`,
@@ -607,7 +649,7 @@ function configDoc(seatId, d, usage) {
   return md([
     '# 拾贝 · Harvester',
     '',
-    '> 数据来源：`/local/harvester/*` 与采集服务自己的落盘文件',
+    '> 数据来源：SSH 数据桥（拾贝） 与采集服务自己的落盘文件',
     '',
     '## 采集服务',
     '- 执行器: 本机采集器（纯抓取不经过模型，不消耗 token）',
@@ -642,7 +684,8 @@ export async function seatTab(seatId, tab) {
   }
 
   if (tab === 'config') {
-    const usage = await officeUsage();
+    /* 只有拾贝的配置文档会用到用量（今日 AI 消耗），其余三位不必扫 state.db */
+    const usage = seatId === 'shabei' ? await officeUsage() : null;
     const doc = configDoc(seatId, await load(), usage);
     return {
       kind: 'doc',
@@ -650,12 +693,12 @@ export async function seatTab(seatId, tab) {
           两处都写会变成"数据来源：数据来源：…" */
       source:
         seatId === 'hermes'
-          ? '`/local/config` 直读 Hermes 安装目录与 `~/.hermes` 的真实文件'
+          ? 'SSH 数据桥 直读 Hermes 安装目录与 `~/.hermes` 的真实文件'
           : seatId === 'mcp-filesystem'
             ? '`~/.hermes/config.yaml` 的 `mcp_servers` 段 + 实时 stdio 握手'
             : seatId === 'weiliu'
-              ? 'Hermes cron `/api/jobs` + `~/.hermes/cron/executions.db` + 探针 `infra_watch.py` + 边界守望采集库（`/local/security`）'
-              : '`/local/harvester/*` 本地采集服务的真实文件',
+              ? 'Hermes cron `/api/jobs` + `~/.hermes/cron/executions.db` + 探针 `infra_watch.py` + 边界守望采集库（SSH 数据桥）'
+              : 'SSH 数据桥（拾贝） 本地采集服务的真实文件',
       markdown: doc,
     };
   }
@@ -720,7 +763,7 @@ export async function seatTab(seatId, tab) {
     const cur = d.current || {};
     const cap = d.capability || {};
     const restarts = d.gateway_restarts || {};
-    const conf = await hermesApi('/local/config', { timeout: 12000 });
+    const conf = await bridgeCall('/local/config', { timeout: 12000 });
     const timeline = [];
     for (const [day, count] of Object.entries(cap.skill_days || {})) {
       timeline.push({
@@ -752,7 +795,7 @@ export async function seatTab(seatId, tab) {
     timeline.sort((a, b) => String(b.at).localeCompare(String(a.at)));
     return {
       kind: 'evo',
-      source: '`/local/*` 直读 Hermes 安装目录与 `~/.hermes` 真实文件（已脱敏）· 更新凭据 `~/.hermes/logs/update_receipts`、配置快照 `~/.hermes/backups/config`',
+      source: 'SSH 数据桥 直读 Hermes 安装目录与 `~/.hermes` 真实文件（已脱敏）· 更新凭据 `~/.hermes/logs/update_receipts`、配置快照 `~/.hermes/backups/config`',
       stats: [
         { label: '当前版本', value: cur.version || '—' },
         { label: '配置 Schema', value: String(cur.config_schema ?? '—') },
@@ -802,7 +845,7 @@ export async function seatTab(seatId, tab) {
     };
   }
   const d = await load();
-  const sites = await hermesApi('/local/harvester/sites', { timeout: 12000 });
+  const sites = await bridgeCall('/local/harvester/sites', { timeout: 12000 });
   return {
     kind: 'memory',
     records: (d.items || []).map((h) => ({
@@ -818,7 +861,7 @@ export async function seatTab(seatId, tab) {
  * 拾贝「即时交互」的历史抓取记录（原样给它，前端要按当时的卡片样子回放）。
  */
 export const harvestHistory = (limit = 200) =>
-  hermesApi(`/local/harvester/history?limit=${Number(limit) || 200}`, { timeout: 15000 });
+  bridgeCall(`/local/harvester/history?limit=${Number(limit) || 200}`, { timeout: 15000 });
 
 /* ── 边界守望（尾流 · Edge Sentry）────────────────────────────────────
  * 上游把"被扫描"这件事拆成三层：frps 入口日志（谁连了哪个代理）、PVE haproxy
@@ -835,7 +878,7 @@ export const harvestHistory = (limit = 200) =>
  *     不给它变成"拼接任意路径去打那台内网机器"的机会；
  *   · 批准的超时给得比拒绝长：它要 ssh 过去执行并回读结果。
  */
-export const officeSecurity = () => hermesApi('/local/security', { timeout: 20000 });
+const officeSecurity = () => bridgeCall('/local/security', { timeout: 20000 });
 
 /**
  * 工位卡片上那一行摘要：待授权几条、边界告警几项。
@@ -860,7 +903,7 @@ export async function securityProfile(ip) {
   const target = String(ip || '').trim();
   /* 只放行 IP 字面量：这个值是拼进查询串再打到内网的 */
   if (!/^[0-9a-fA-F:.]{3,45}$/.test(target)) throw new Error('IP 不合法');
-  const d = await hermesApi(`/local/security/profile?ip=${encodeURIComponent(target)}`, { timeout: 45000 });
+  const d = await bridgeCall(`/local/security/profile?ip=${encodeURIComponent(target)}`, { timeout: 45000 });
   return {
     ip: String(d?.ip || target),
     hours: Number(d?.hours) || 24,
@@ -910,14 +953,42 @@ export function securityDecide(code, approve) {
   const ticket = String(code || '').trim();
   if (!ticket) throw new Error('缺少授权码');
   if (ticket.length > 64 || /[\s/\\]/.test(ticket)) throw new Error('授权码格式不对');
-  return hermesApi(`/local/security/${approve ? 'approve' : 'reject'}`, {
+  return bridgeCall(`/local/security/${approve ? 'approve' : 'reject'}`, {
     method: 'POST',
     body: { code: ticket },
     timeout: approve ? 30000 : 15000,
-  });
+  }).finally(() => invalidateLocal('/local/security'));
+}
+
+/**
+ * 境外 IP 自动封禁开关。
+ *
+ * 这是唯一一个「不需要授权码就能改变封禁行为」的写接口，所以只接受显式布尔，
+ * 不做字符串推断（传错类型等于误开）。真正的写入落在 frp_guard.py：
+ * 它负责更新 settings 表并写一条 auto_ban_enabled/disabled 的审计。
+ */
+export function securityAutoBan(enabled) {
+  return bridgeCall('/local/security/auto-ban', {
+    method: 'POST',
+    body: { enabled: enabled === true },
+    timeout: 20000,
+  }).finally(() => invalidateLocal('/local/security'));
 }
 
 const SEV_LABEL = { CRITICAL: '严重', HIGH: '高危', MED: '关注', LOW: '低' };
+
+/**
+ * 归属地统一成「国家 城市」一行文本。
+ *
+ * 上游可能给对象（{place, isp, cc}）、字符串、或什么都不给（内网/保留段/
+ * 接口失败）。这里只取 place 一档，查不到返回空串 —— 前端据此决定渲不渲染，
+ * 不要在页面上留一个「未知地区」占位，那比不显示更碍眼。
+ */
+function geoText(g) {
+  if (!g) return '';
+  if (typeof g === 'string') return g.trim();
+  return String(g.place || '').trim();
+}
 const BLOCK_LABEL = {
   executed: '已封禁',
   expired: '已到期解封',
@@ -951,6 +1022,8 @@ function normalizeSecurity(d) {
 
   const topIps = (sn.ips || []).map((r) => ({
     ip: String(r.ip || ''),
+    /** 「国家 城市」；查不到就是空串，前端据此不渲染 */
+    geo: geoText(r.geo),
     hits: Number(r.hits) || 0,
     score: Number(r.score) || 0,
     severity: SEV_LABEL[r.severity] ? r.severity : 'LOW',
@@ -986,7 +1059,7 @@ function normalizeSecurity(d) {
 
   return {
     source:
-      '上游 `/local/security`：frps 入口日志 + PVE haproxy 连接特征 + 两台对外主机的 secure 日志（全部只读，未改任何 frps / haproxy 配置）',
+      '上游 SSH 数据桥：frps 入口日志 + PVE haproxy 连接特征 + 两台对外主机的 secure 日志（全部只读，未改任何 frps / haproxy 配置）',
     generatedAt: String(d?.generated_at || ''),
     ok: Boolean(d?.snapshot_ok),
     error: String(d?.snapshot_error || ''),
@@ -1022,9 +1095,18 @@ function normalizeSecurity(d) {
     degraded: sn.health?.degraded || [],
     blind: sn.health?.blind || [],
 
+    /* 境外 IP 自动封禁开关：开着就不等人点按钮，程序自己批。默认关。 */
+    autoBan: {
+      enabled: Boolean(d?.auto_ban?.enabled),
+      updatedAt: String(d?.auto_ban?.updated_at || ''),
+      updatedBy: String(d?.auto_ban?.updated_by || ''),
+    },
+
     topIps,
     subnets: (sn.subnets || []).map((s) => ({
       cidr: String(s.cidr || ''),
+      /** 整段通常来自同一家机房，取命中最多那个 IP 的归属地代表这一段 */
+      geo: geoText(s.geo),
       ipCount: Number(s.ip_count) || 0,
       hits: Number(s.hits) || 0,
       severity: SEV_LABEL[s.severity] ? s.severity : 'LOW',
@@ -1067,6 +1149,7 @@ function normalizeSecurity(d) {
     pending: (d?.pending || []).map((p) => ({
       id: p.id,
       ip: String(p.ip || ''),
+      geo: geoText(p.geo),
       ticket: String(p.ticket || ''),
       reason: String(p.reason || ''),
       requestedAt: String(p.requested_at || ''),
@@ -1076,6 +1159,7 @@ function normalizeSecurity(d) {
     blocks: (d?.blocks || []).map((b) => ({
       id: b.id,
       ip: String(b.ip || ''),
+      geo: geoText(b.geo),
       reason: String(b.reason || ''),
       status: String(b.status || ''),
       statusLabel: BLOCK_LABEL[b.status] || String(b.status || ''),
@@ -1105,24 +1189,161 @@ function normalizeSecurity(d) {
  *
  * 注意这条链路是**真的会去抓网页**的，所以它只挂在 POST 上，且必须走面板自己的会话。
  */
-export async function harvestRun(text) {
+/** 只有一条裸网址时不必请模型解析：省一次调用，也免得模型限流时连网址都抓不了 */
+function bareUrlPlan(ask) {
+  const t = ask.trim();
+  if (/\s/.test(t) || !/^https?:\/\/[\x21-\x7E]+$/i.test(t)) return null;
+  return { action: 'scrape', args: { url: t, selector: '', mode: 'fast', pages: 1, columns: [], fields: {} }, reply: '' };
+}
+
+/** 模型不可用时的兜底：至少把句子里的网址、页数与模式认出来 */
+function fallbackPlan(ask) {
+  const url = (ask.match(/https?:\/\/[^\s，。；]+/i) || [])[0];
+  if (!url) return null;
+  const pages = Number((ask.match(/翻\s*(\d+)\s*页/) || ask.match(/(\d+)\s*页/) || [])[1]) || 1;
+  const mode = /隐身|反爬|stealth/i.test(ask) ? 'stealth' : /动态|js\s*渲染|滚动加载|dynamic/i.test(ask) ? 'dynamic' : 'fast';
+  return { action: 'scrape', args: { url, selector: '', mode, pages: Math.min(10, pages), columns: [], fields: {} }, reply: '' };
+}
+
+export async function harvestRun(text, opts = {}) {
   const ask = String(text || '').trim();
   if (!ask) throw new Error('说点什么再发');
-  const plan = await hermesApi('/local/harvester/plan', { method: 'POST', body: { text: ask }, timeout: 60000 });
-  if (!plan?.ok || !plan.plan) throw new Error(plan?.reason || '模型没能把这句话解析成抓取计划');
-  const p = plan.plan;
+
+  const bare = bareUrlPlan(ask);
+  let p = bare;
+  let usage = null;
+  if (!p) {
+    const planRes = await bridgeCall('/local/harvester/plan', { method: 'POST', body: { text: ask }, timeout: 60000 }).catch(() => null);
+    if (planRes?.ok && planRes.plan) {
+      p = planRes.plan;
+      usage = { tokens: planRes.tokens, elapsed_ms: planRes.elapsed_ms, cached: planRes.cached };
+    } else {
+      p = fallbackPlan(ask);
+      if (!p) throw new Error(planRes?.reason || '模型没能把这句话解析成抓取计划，句子也没有识别出网址');
+    }
+  }
   if (p.action !== 'scrape') {
     /* chat / reject：模型认为这不是抓取指令，把它的话原样交回去 */
-    return { kind: 'reply', reply: p.reply || '这句话里没有可执行的抓取目标。', plan: p, usage: { tokens: plan.tokens, elapsed_ms: plan.elapsed_ms, cached: plan.cached } };
+    return { kind: 'reply', reply: p.reply || '这句话里没有可执行的抓取目标。', plan: p, usage };
   }
-  const args = p.args || {};
+
+  const args = { ...(p.args || {}) };
   if (!args.url) throw new Error('解析出的计划里没有网址');
-  const scraped = await hermesApi('/local/scrape', { method: 'POST', body: args, timeout: 120000 });
+
+  /* ① 用户点名了列名（计划里是 columns，不是选择器）：先让 AI 生成选择器并真抓一遍。
+        这一步对应上游的 ai-extract，缺了它「列出名言和作者」只能拿到裸文本。 */
+  const names = Array.isArray(args.columns) ? args.columns.filter(Boolean).slice(0, 12) : [];
+  if (names.length) {
+    const strategy = /语义抽取|直接抽|直接读值|写进表/.test(ask) ? 'values' : 'selectors';
+    const ext = await bridgeCall('/local/harvester/ai-extract', {
+      method: 'POST',
+      body: {
+        url: args.url,
+        mode: args.mode,
+        pages: args.pages,
+        limit: 20,
+        strategy,
+        fields: names,
+        fixed: args.fields || {},
+      },
+      timeout: 150000,
+    });
+    if (ext?.ok) {
+      const rows = ext.rows || [];
+      return {
+        kind: 'scrape',
+        plan: p,
+        usage,
+        extract: { strategy, tokens: ext.meta?.tokens || 0, aiMs: ext.meta?.ai_ms || 0 },
+        result: {
+          ok: true,
+          url: ext.source_url || args.url,
+          title: ext.title || '',
+          mode: args.mode || 'fast',
+          count: rows.length,
+          total: rows.length,
+          columns: ext.columns || names,
+          rows,
+          field_names: ext.columns || names,
+          elapsed_ms: ext.meta?.total_ms || 0,
+          note: ext.verify && ext.verify.ok === false ? '部分单元格未在页面原文中找到，已标注' : '',
+          verify: ext.verify || null,
+        },
+      };
+    }
+    /* 智能抽取失败就退回确定性抓取，不让整条指令白跑 */
+  }
+
+  /* ② 常规抓取 */
+  let cur = {
+    url: args.url,
+    selector: args.selector || '',
+    mode: args.mode || 'fast',
+    pages: args.pages || 1,
+    fields: args.fields || {},
+  };
+  let scraped = await bridgeCall('/local/scrape', {
+    method: 'POST',
+    body: { ...args, limit: 20, adaptive: true, robots: true },
+    timeout: 120000,
+  });
+
+  /* ③ 失败自愈：把错误与页面样本交给模型，按它给的新参数重试一次 */
+  let heal = null;
+  if (scraped && scraped.ok === false && scraped.blocked !== true) {
+    try {
+      heal = await bridgeCall('/local/harvester/heal', {
+        method: 'POST',
+        body: { ...cur, error: scraped.error || '抓取失败' },
+        timeout: 90000,
+      });
+      if (heal?.ok && heal.action === 'retry') {
+        cur = { ...cur, ...heal.plan };
+        scraped = await bridgeCall('/local/scrape', {
+          method: 'POST',
+          body: { ...cur, limit: 20, adaptive: true, robots: true },
+          timeout: 120000,
+        });
+      }
+    } catch {
+      /* 自愈本身失败不改写原始错误：原始错误更有价值 */
+    }
+  }
+
+  /* ④ 数据后处理：确定性清洗（可选 AI 深处理） */
+  const items = scraped?.items || [];
+  let columns = scraped?.fields || [];
+  let rows = items.map((it) => columns.map((c) => (it.fields && it.fields[c]) || ''));
+  let clean = null;
+  if (opts.clean && columns.length && rows.length) {
+    try {
+      clean = await bridgeCall('/local/harvester/clean', {
+        method: 'POST',
+        body: { columns, rows, url: scraped.url || cur.url, deep: Boolean(opts.deep) },
+        timeout: 90000,
+      });
+      if (clean?.ok) {
+        columns = clean.columns || columns;
+        rows = clean.rows || rows;
+      }
+    } catch (err) {
+      clean = { ok: false, error: err.message };
+    }
+  }
+
   return {
     kind: 'scrape',
     plan: p,
-    usage: { tokens: plan.tokens, elapsed_ms: plan.elapsed_ms, cached: plan.cached },
-    result: scraped,
+    usage,
+    heal,
+    clean,
+    result: {
+      ...scraped,
+      columns,
+      rows,
+      field_names: columns,
+      count: rows.length || scraped?.count || 0,
+    },
   };
 }
 
@@ -1152,12 +1373,12 @@ function chatBody(seatId, message) {
  *   error               {message|code}
  */
 export async function chatStream(seatId, message, onEvent) {
-  if (!hasHermesCredentials()) throw new Error('服务端没有配置 Hermes 口令，无法登录 Hermes');
+  if (!hasHermesCredentials()) throw new Error('服务端没有配置 HERMES_API_KEY，无法直连 Hermes 网关');
   const text = String(message || '').trim();
   if (!text) throw new Error('说点什么再发');
 
   const id = await ensureChatSession();
-  const res = await openHermesStream(`/hermes/api/sessions/${encodeURIComponent(id)}/chat/stream`, {
+  const res = await openHermesStream(`/api/sessions/${encodeURIComponent(id)}/chat/stream`, {
     method: 'POST',
     body: chatBody(seatId, text),
   });
@@ -1236,4 +1457,28 @@ export async function chatStream(seatId, message, onEvent) {
     res.on('end', resolve);
     res.on('error', reject);
   });
+}
+
+/* ── 启动预热 ─────────────────────────────────────────────────────────
+ * 首屏四块本机数据（工位 / 待办 / 用量 / 守望摘要）在服务起来时先拉一遍。
+ * 用户第一次点开智能办公时直接命中内存缓存，不用等 SSH 进程冷启动；
+ * 之后靠 hermes-local 的 stale-while-revalidate 保持"先给旧值、后台再刷新"。
+ * 失败不影响服务启动，页面会按自己的降级文案提示。
+ */
+export async function warmOfficeData() {
+  const tasks = {
+    roster: officeRoster,
+    board: officeBoard,
+    usage: officeUsage,
+    guard: officeGuardBrief,
+    /* 尾流配置页签：提前把 /local/watch 取进缓存，首次点开也不用等 SSH */
+    'weiliu-config': () => seatTab('weiliu', 'config'),
+  };
+  const names = Object.keys(tasks);
+  const settled = await Promise.allSettled(names.map((k) => tasks[k]()));
+  return settled.map((r, i) => ({
+    name: names[i],
+    ok: r.status === 'fulfilled',
+    error: r.status === 'rejected' ? (r.reason?.message || String(r.reason)) : '',
+  }));
 }

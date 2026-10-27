@@ -105,8 +105,11 @@ export function usageTip(usage: AiUsage) {
   const head = [
     `今日 ${n(g.today.total)} tokens · ${g.today.api_calls} 次调用`,
     '（Hermes 网关记账，含智能办公室里的员工消耗）',
+    /* 口径写清楚：total 含缓存，billed 不含。两者差一个数量级是常态，
+       不写明白会让人以为「缓存那部分漏算了」或者「账单对不上」。 */
+    `其中计费 ${n(g.today.billed)}：输入 ${n(g.today.input)} + 输出 ${n(g.today.output)}`,
+    `缓存命中 ${n(g.today.cache_read)}（已计入总量，按 1/10 计价）`,
     `预算 ${g.budget_label} · 昨日 ${n(g.yesterday.total)}`,
-    `输入 ${n(g.today.input)} · 输出 ${n(g.today.output)} · 缓存命中 ${n(g.today.cache_read)}`,
     g.models.length ? `模型 ${g.models.join(' / ')}` : null,
     split ? `来源 ${split}` : null,
   ].filter((s): s is string => Boolean(s));

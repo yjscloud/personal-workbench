@@ -417,7 +417,10 @@ export type Guest = {
   vmid: number;
   name: string;
   status: string;
+  /** 全机占比（0–1，PVE 口径就是"占整机所有核"），*100 即百分比 */
   cpu: number;
+  /** 分配给这台机器的核数：同样的 50%，1 核和 8 核不是一回事 */
+  maxcpu?: number;
   maxmem: number;
   mem: number;
   uptime: number;
@@ -613,21 +616,27 @@ export type GrowthReport = {
   samples: number;
   available: boolean;
   usedRatio?: number;
+  /** 剩余可写空间（rootfs.avail），没取到时为 0，由前端退回 total-used */
+  freeBytes?: number;
+  /** 回归样本实际覆盖的天数：不能写死 7 天 */
+  spanDays?: number;
 };
 
 /**
  * 监控页那张 GitHub star 卡片（见 services/github-stars.js）。
  *
  * 字段恒定齐全：没采过时 `stars` 是 null，而不是 0 —— 卡片要能区分
- * "还没采过"和"真的一个 star 都没有"。`history` 是 12 小时一个点的采样，
+ * "还没采过"和"真的一个 star 都没有"。`history` 是 6 小时一个点的采样，
  * 直接拿去画曲线。
  */
 export type GithubStars = {
   repo: string;
   stars: number | null;
   prevStars: number | null;
-  /** 最近一次采集的增量（上一个点到这一个点） */
+  /** 最近一次采集的**正**增量：通知与 pending 只认它，掉星不算 */
   delta: number;
+  /** 带符号的变化量（可为负）：界面用它区分 +N / −N / 持平 */
+  change?: number;
   /** 攒着还没发出去的增量：飞书不通时会累积，下次合并成一条发 */
   pending: number;
   forks: number;
@@ -717,13 +726,8 @@ export type SearchEngine = { id: string; name: string; url: string };
 export type Settings = {
   /** 首页问候语里的称呼；为空则只显示「早上好」 */
   profile: { name: string };
-  /**
-   * 智能办公室。「打开完整办公室」跳去哪 —— 留空表示用服务端 .env 的
-   * HERMES_BASE_URL；同一台机器在内网里可能有多个入口（IP / 主机名 / 反代域名），
-   * 从哪个进由这里定。只影响那个按钮的链接，不影响服务端怎么调它的接口。
-   */
+  /** 智能办公室两侧边栏的面板布局 */
   hermes: {
-    officeUrl: string;
     /**
      * 智能办公室四块面板摆在哪一列、各自什么次序（存 key，不是文案）。
      * 空对象 / 缺项 = 用默认摆法。
@@ -761,6 +765,47 @@ export type Settings = {
    * 配过的话 `hasFeishuSecret` 为 true —— 留空保存即"不修改"。
    */
   stars: { repo: string; feishuUrl: string; feishuSecret: string; hasFeishuSecret?: boolean };
+  /**
+   * 飞书机器人（自定义机器人 webhook）：**全站**的通知出口。
+   *
+   * 面板自己的通知（star、外链任务）和助手机上的脚本（自动封禁、值守报告）
+   * 都读这一份 —— 保存时服务端会把配置推给助手机，脚本读那个文件。
+   * `webhookUrl` 明文回显（要能核对是哪个群，清空即停发）；`secret` 只回掩码，
+   * 留空保存表示不修改。`synced*` 是派生态：脚本那边到底用没用上。
+   */
+  feishuBot: {
+    enabled: boolean;
+    /** 自定义机器人：发得出，但收不到按钮回调 */
+    webhookUrl: string;
+    secret: string;
+    hasSecret?: boolean;
+    /** 应用机器人：能收按钮回调（审批卡的「批准 / 拒绝」只能走这条） */
+    appId: string;
+    appSecret: string;
+    hasAppSecret?: boolean;
+    /** 群会话 id（oc_ 开头）。应用机器人发消息靠它定位到群 */
+    chatId: string;
+    /** 通知范围：自动封禁（秒级，希望你马上知道）/ 值守报告（每 10–120 分钟） */
+    notifyBan: boolean;
+    notifyOps: boolean;
+    syncedAt?: string | null;
+    syncError?: string | null;
+    /** 库里没填、但环境变量里有地址：通知仍在发，只是没走这一栏 */
+    hasEnvFallback?: boolean;
+    /** 两条通道各自配全了没有。由服务端判定，前端据此决定"能不能发测试" */
+    channels?: { hasWebhook: boolean; hasApp: boolean };
+    /**
+     * 应用机器人长连接。@ 机器人不回、卡片按钮没反应，先看这里：
+     * status 为 connected 才说明事件真能进来；failed 时 error 是飞书给的原因。
+     */
+    appStatus?: {
+      status: string;
+      wsState?: string | null;
+      error?: string | null;
+      since?: string | null;
+      appId?: string;
+    };
+  };
   /**
    * 邮件通知（SMTP）。只用于「外链提交的任务完成」这一件事。
    * `pass` 回来的是掩码，`hasPass` 表示库里已经有密码，留空保存即不修改。
@@ -851,8 +896,8 @@ export type BackupSettings = {
 };
 
 /**
- * Hermes Agent Office 的工位状态。
- * 网关自己给的是下划线那套字段名，后端 services/hermes.js 已经归一化过。
+ * Hermes 的工位状态。
+ * 数据桥给的是下划线那套字段名，后端 services/hermes.js 已经归一化过。
  */
 export type HermesSeats = {
   baseUrl: string;
@@ -867,7 +912,7 @@ export type HermesSeats = {
   items: { id: string; name: string; en: string; online: boolean }[];
   /** 网关最近一次探测员工的时间 */
   checkedAt: string | null;
-  /** 服务端有没有配 Hermes 口令（决定登录墙后面那些数据能不能接） */
+  /** 服务端有没有配 HERMES_API_KEY（决定网关的会话/对话能不能接；本机数据走 SSH，不受影响） */
   credentials: boolean;
 };
 
@@ -892,7 +937,7 @@ export type OfficeEmployee = {
   chat: 'agent' | null;
 };
 
-/** 工位状态 + 员工档案。工位那几个数与 /hermes/seats 同一套口径 */
+/** 工位状态 + 员工档案。在线标记由数据桥在本机探活后给出 */
 export type OfficeRoster = Omit<HermesSeats, 'items'> & {
   items: OfficeEmployee[];
   /** 网关回里有、服务端档案没跟上的 id（正常为空；不为空说明对面加了人） */
@@ -947,7 +992,13 @@ export type OfficeBoard = {
   generated_at: string;
 };
 
-/** 一天的 token 用量。数字来自网关的真实记账，不是估算 */
+/**
+ * 一天的 token 用量。
+ *
+ * 数字来自网关 state.db，但**分级**：`measured` 的那几天是每次采样做差得到的
+ * 真实增量；`seeded` 表示当天底数还是旧的分摊估算（首次建立快照基线的那天）。
+ * 两个都不在 = 纯分摊值。
+ */
 export type OfficeUsageDay = {
   day: string;
   input: number;
@@ -955,14 +1006,27 @@ export type OfficeUsageDay = {
   cache_read: number;
   cache_write: number;
   reasoning: number;
+  /** 真实处理量：输入（含缓存命中）+ 输出 + 推理 */
   total: number;
+  /** 计费口径：不含缓存命中 */
+  billed?: number;
   api_calls: number;
   sessions?: number;
   sources?: Record<string, number>;
   top_sessions?: { id: string; title: string; source: string; token: number }[];
+  /** 这一天走的是"快照差分"记账（真实增量） */
+  measured?: boolean;
+  /** 当天底数是分摊估算，之后的增量是真实的 */
+  seeded?: boolean;
+  /** 当天花费（人民币元）：DeepSeek 官方单价 + 采样时段（高峰/空闲） */
+  cost_cny?: number;
+  /** 这一天用 DeepSeek 官方账单校正过（见 server/services/usage-overrides.js） */
+  manual?: boolean;
+  manual_note?: string;
+  manual_token_estimated?: boolean;
 };
 
-/** 今日 / 昨日 / 近 7 日 token 用量与预算 */
+/** 今日 / 昨日 / 近 14 日 token 用量与预算 */
 export type OfficeUsage = {
   today: OfficeUsageDay;
   yesterday: OfficeUsageDay;
@@ -1064,6 +1128,8 @@ export type OfficeGuardHealth = {
 export type OfficeGuardPending = {
   id: number | string;
   ip: string;
+  /** 归属地「国家 城市」；查不到为空串 */
+  geo: string;
   /** 一次性授权码（6 小时有效），批准 / 拒绝都要带它 */
   ticket: string;
   reason: string;
@@ -1075,6 +1141,8 @@ export type OfficeGuardPending = {
 export type OfficeGuardBlock = {
   id: number | string;
   ip: string;
+  /** 归属地「国家 城市」；查不到为空串 */
+  geo: string;
   reason: string;
   status: string;
   statusLabel: string;
@@ -1085,6 +1153,8 @@ export type OfficeGuardBlock = {
 
 export type OfficeGuardIp = {
   ip: string;
+  /** 归属地「国家 城市」；内网/保留段/查询失败时为空串 */
+  geo: string;
   hits: number;
   score: number;
   severity: OfficeGuardSeverity;
@@ -1118,7 +1188,7 @@ export type OfficeTabGuard = {
   degraded: string[];
   blind: string[];
   topIps: OfficeGuardIp[];
-  subnets: { cidr: string; ipCount: number; hits: number; severity: OfficeGuardSeverity; severityLabel: string; members: string[] }[];
+  subnets: { cidr: string; geo: string; ipCount: number; hits: number; severity: OfficeGuardSeverity; severityLabel: string; members: string[] }[];
   /** 暴露面档案：失联 / 未登记的新入口比扫描次数更值得看 */
   assets: { name: string; kind: string; target: string; hits: number; active: boolean; registered: boolean; external: boolean }[];
   /** SSH 字典是主机级的（sshd 只看到 haproxy 的地址，认不出单个来源在试什么） */
@@ -1126,6 +1196,11 @@ export type OfficeTabGuard = {
   dictOverlap: { a: string; b: string; shared: number; cover: number } | null;
   /** 宿主机上真的登录成功过 —— 判「有没有被打穿」最硬的证据 */
   authOk: { user: string; fromIp: string; n: number; weak: boolean; isNew: boolean }[];
+  /**
+   * 境外 IP 自动封禁开关。开着时境外来源的单子直接执行，不等人工；
+   * 归属地查不到（接口抖动、内网地址）仍按待授权处理。
+   */
+  autoBan: { enabled: boolean; updatedAt: string; updatedBy: string };
   pending: OfficeGuardPending[];
   blocks: OfficeGuardBlock[];
   thresholds: { hitsMed: number; hitsHigh: number; hitsCrit: number; subnetIps: number; bytesFail: number; bytesShell: number };
@@ -1214,7 +1289,31 @@ export type OfficeHarvestRun =
   | {
       kind: 'scrape';
       usage?: { tokens?: number; elapsed_ms?: number; cached?: boolean };
-      result: Partial<OfficeHarvestItem> & { columns?: string[]; rows?: string[][]; markdown?: string };
+      /** 结构化抽取（用户点名要哪些列时走这条） */
+      extract?: { strategy: 'selectors' | 'values'; tokens: number; aiMs: number };
+      /** 失败自愈：模型给的重试方案与经验 */
+      heal?: {
+        ok?: boolean;
+        action?: 'retry' | 'giveup';
+        reason?: string;
+        lesson?: string;
+        plan?: { selector?: string; mode?: string; pages?: number; fields?: Record<string, string> };
+      } | null;
+      /** 数据清洗（勾选「清洗」时） */
+      clean?: {
+        ok?: boolean;
+        error?: string;
+        notes?: string[];
+        dropped?: { row: number; reason: string }[];
+        source_rows?: number;
+        ai?: { used?: boolean; tokens?: number; reason?: string };
+      } | null;
+      result: Partial<OfficeHarvestItem> & {
+        columns?: string[];
+        rows?: string[][];
+        markdown?: string;
+        verify?: { ok?: boolean; notes?: string[]; columns?: Record<string, unknown> } | null;
+      };
     };
 
 export type Bootstrap = {
@@ -1284,7 +1383,7 @@ export type AiUsage = {
    *
    * 注意它**已经包含面板自己的调用**（面板走的就是网关的 /v1 接口，在
    * 它的记账里归到 api_server 那一档），所以两个数不能相加，只能用它替代。
-   * null = 还没取到（首次读、或没配口令、或网关不通），此时退回本地记账。
+   * null = 还没取到（首次读、或没配 API Key、或网关不通），此时退回本地记账。
    */
   gateway: AiGatewayUsage | null;
 };
@@ -1292,15 +1391,37 @@ export type AiUsage = {
 /** 网关侧的今日用量摘要 */
 export type AiGatewayUsage = {
   today: {
+    /** 真实处理量：输入（含缓存命中）+ 输出 + 推理 */
     total: number;
+    /** 计费口径：不含缓存命中（缓存按 1/10 计价，不能直接相加） */
+    billed: number;
     input: number;
     output: number;
     cache_read: number;
     api_calls: number;
     /** 按来源的 token 数：cron（员工定时任务）/ api_server（接口调用）… */
     sources: Record<string, number>;
+    /** 今日花费（人民币元）。按官方单价 × 采样时段折算；人工校正过则是账单原文 */
+    cost_cny?: number;
+    /** 这一天含 DeepSeek 官方账单校正（usage-overrides），界面要标出来 */
+    manual?: boolean;
+    manual_note?: string;
+    /** 校正时只给了金额，token 是按比例推算的 */
+    manual_token_estimated?: boolean;
   };
   yesterday: { total: number; api_calls: number };
+  /** 近 14 天（含今日），监控页柱状图用；day 为 YYYY-MM-DD */
+  series: {
+    day: string;
+    total: number;
+    billed: number;
+    input: number;
+    output: number;
+    cache_read: number;
+    api_calls: number;
+    cost_cny?: number;
+    manual?: boolean;
+  }[];
   models: string[];
   budget_tokens: number;
   budget_label: string;
@@ -1839,28 +1960,28 @@ export const api = {
   settings: {
     get: () => req<Settings>('/settings'),
     save: (patch: DeepPartial<Settings>) => req<Settings>('/settings', send('PUT', patch)),
+    /**
+     * 用**已保存**的配置发一张测试卡（地址错了要当场看到飞书那句原因）。
+     * channel 不传 = 自动（有 webhook 走 webhook，否则走应用机器人）。
+     */
+    testFeishuBot: (channel?: 'webhook' | 'app') =>
+      req<{ sent: boolean; channel: string }>('/settings/feishu/test', send('POST', { channel })),
+    /** 重新把配置推给助手机。改了配置但当时桥不通时用它补一次 */
+    syncFeishuBot: () => req<Settings>('/settings/feishu/sync', send('POST', {})),
   },
 
   /**
-   * Hermes 智能工位（局域网那台 Agent Office 网关）。
-   * 只有工位状态是免登录的。
-   */
-  hermes: {
-    seats: () => req<HermesSeats>('/hermes/seats'),
-  },
-
-  /**
-   * 智能工位里"登录墙后面"的那部分。
+   * 智能办公：网关数据（会话 / 对话 / 任务）+ 本机数据（用量 / 待办 / 配置 / 守望）。
    *
-   * 浏览器不直接连那台网关（跨域 + 混合内容 + 不该把会话交给前端），
-   * 全部经服务端自己的会话代理，所以没配口令时这些接口是 503 而不是超时。
+   * 浏览器不直接连那台机器（跨域 + 混合内容 + 不能把 API Key 交给前端），
+   * 全部经服务端：网关走 Bearer，本机文件走只读 SSH 数据桥。
    */
   office: {
-    /** 员工档案 + 工位在线状态（立绘也在登录墙后面，没口令时图片取不到） */
+    /** 员工档案 + 工位在线状态（立绘已随工作台本地化） */
     roster: () => req<OfficeRoster>('/office/roster'),
     /** 全局待办工作表：会话统计 + 定时任务 + 最近执行 + 异常 */
     board: () => req<OfficeBoard>('/office/board'),
-    /** 今日与近 7 日 token 用量 */
+    /** 今日与近 14 日 token 用量 */
     usage: () => req<OfficeUsage>('/office/usage'),
     /** 对话回溯列表 */
     sessions: (limit = 20, offset = 0) =>
@@ -1889,8 +2010,11 @@ export const api = {
     /**
      * 拾贝：下一条抓取指令。**这会真的去抓网页**（模型解析 → 本机采集器执行），
      * 所以是 POST，且只有「即时交互」页签里那个发送按钮会调它。
+     *
+     * clean / deep：抓完是否做数据清洗（deep 会再花一次模型调用做语义去重）。
      */
-    harvest: (text: string) => req<OfficeHarvestRun>('/office/harvest', send('POST', { text })),
+    harvest: (text: string, opts?: { clean?: boolean; deep?: boolean }) =>
+      req<OfficeHarvestRun>('/office/harvest', send('POST', { text, ...(opts || {}) })),
 
     /* ── 尾流 · 边界守望 ── */
     /**
@@ -1910,6 +2034,15 @@ export const api = {
      */
     securityDecide: (code: string, approve: boolean) =>
       req<{ ok?: boolean; output?: string }>('/office/security/decide', send('POST', { code, approve })),
+    /**
+     * 境外 IP 自动封禁总开关。打开后境外来源的封禁单会直接执行，不再等人点按钮；
+     * 归属地查不到的单仍然走人工。只传布尔，服务端不做类型推断。
+     */
+    securityAutoBan: (enabled: boolean) =>
+      req<{ ok?: boolean; enabled?: boolean; output?: string }>(
+        '/office/security/auto-ban',
+        send('POST', { enabled }),
+      ),
   },
 
   search: {

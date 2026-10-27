@@ -1,5 +1,5 @@
 import { db, flush, update } from '../store.js';
-import { notifyFeishu, feishuConfigured } from './feishu.js';
+import { notifyPanelNotice, panelNotifyReady } from './feishu-bot.js';
 
 /* ── GitHub star 卡片 ─────────────────────────────────────────────────
    监控页上唯一一个"外部世界的数"：某个仓库有多少 star、最近涨得怎么样。
@@ -11,27 +11,27 @@ import { notifyFeishu, feishuConfigured } from './feishu.js';
    2. 卡片要回答的是"最近涨了多少"，那就必须有历史点。单看一眼当前值，
       画不出任何趋势，也判断不出"这个数是不是刚变的"。
 
-   采集节奏是 12 小时（见 index.js 的 STAR_CRON）。这不是 GitHub 的限制，
+   采集节奏是 6 小时（见 index.js 的 STAR_CRON）。这不是 GitHub 的限制，
    而是 star 的增长本来就是"天"的量级：采得再勤，也只是把同一批数字重复
    记进历史，曲线不会更准，反而让 JSON 长得更快。
 
    通知口径：每次采集算一次增量，**大于 0 才发飞书**。增量不是"跟昨天比"，
    而是"跟上一次成功采集比" —— 所以服务停了一天再起来，那个增量是累积的，
-   这比"只看最近 12 小时"更接近用户想知道的"我不在的时候涨了几个"。
+   这比"只看最近 6 小时"更接近用户想知道的"我不在的时候涨了几个"。
 
    通知失败不丢：pending 会把没发出去的增量攒着，下次采集合并成一条再发。
-   飞书抽风的那 12 小时里进来的 star，不该就这么没人知道。 */
+   飞书抽风的那 6 小时里进来的 star，不该就这么没人知道。 */
 
 /** 没配仓库时盯这个（也就是这个面板自己的仓库） */
 export const DEFAULT_REPO = 'yjscloud/ProxCenter';
 
 const TIMEOUT_MS = 15000;
 
-/** 12 小时一个点，留 240 个 ≈ 120 天。再多就该上明细表了，JSON 里不合适 */
-const HISTORY_MAX = 240;
+/** 6 小时一个点，留 480 个 ≈ 120 天。再多就该上明细表了，JSON 里不合适 */
+const HISTORY_MAX = 480;
 
 /** 超过这个间隔就该补采一次（启动时用，见 ensureStarsFresh） */
-const STALE_MS = 12 * 60 * 60 * 1000;
+const STALE_MS = 6 * 60 * 60 * 1000;
 
 /**
  * 把用户填的东西收成 `owner/repo`。
@@ -63,9 +63,10 @@ function configOf() {
   return { repo };
 }
 
-/* 卡片上要说明"没配 webhook 所以只记数"，而不是让人以为通知发过了。
-   webhook 的读取与发送统一在 services/feishu.js —— 外部任务提交复用同一条出口 */
-export { feishuConfigured };
+/* 卡片上要说明"没配通知地址所以只记数"，而不是让人以为通知发过了。
+   出口统一在 services/feishu-bot.js（应用机器人优先、webhook 回落）——
+   外部任务提交复用同一条 */
+export { feishuConfigured } from './feishu.js';
 
 /**
  * 当前仓库的采样状态。
@@ -137,7 +138,12 @@ async function fetchRepo(repo) {
  * 一个按钮就能当场确认这条通道通不通。
  */
 export async function sendTestNotification() {
-  await notifyFeishu('【个人工作台】飞书通知已连通。\nstar 有新增时会发到这个群。');
+  await notifyPanelNotice({
+    title: '飞书通知已连通',
+    body: '面板的通知（到期提醒、外链提交、star 增量）都会以这个格式发到这个群。',
+    tone: 'success',
+    source: '个人工作台 · 连通性测试',
+  });
 }
 
 /* ── 采集 ──────────────────────────────────────────────────────────── */
@@ -170,8 +176,11 @@ export async function collectStars() {
   }
 
   const prev = Number.isFinite(before.stars) ? before.stars : null;
-  /* star 也会掉（删号、取消）。负数不是"新增"，按 0 算，别让卡片显示 −1 */
-  const delta = prev == null ? 0 : Math.max(0, repo.stars - prev);
+  /* star 也会掉（删号、取消）。
+     change 保留符号，界面据此显示 "+3 / −1 / 持平"；
+     delta 只留正增量，飞书通知与 pending 只认它 —— 掉星不需要把人叫起来。 */
+  const change = prev == null ? 0 : repo.stars - prev;
+  const delta = Math.max(0, change);
   const pending = Math.max(0, Number(before.pending) || 0) + delta;
   const history = [...(Array.isArray(before.history) ? before.history : []), { t: now, stars: repo.stars }].slice(-HISTORY_MAX);
 
@@ -182,6 +191,8 @@ export async function collectStars() {
       repo: cfg.repo,
       prevStars: prev,
       delta,
+      /* 带符号的变化量：界面用它区分"+3 / −1 / 持平"，delta 只表示"新增了几" */
+      change,
       pending,
       history,
       error: null,
@@ -193,9 +204,14 @@ export async function collectStars() {
   await flush();
 
   if (pending > 0) {
-    const text = `${cfg.repo} 新增 ${pending} 个 star（当前 ${repo.stars}）\nhttps://github.com/${cfg.repo}`;
+    const body = `**${cfg.repo}** 新增 ${pending} 个 star（当前 ${repo.stars}）\nhttps://github.com/${cfg.repo}`;
     try {
-      await notifyFeishu(text);
+      await notifyPanelNotice({
+        title: 'GitHub Star 增量',
+        body,
+        tone: 'info',
+        source: `GitHub · ${cfg.repo}`,
+      });
       update((d) => {
         d.githubStars = { ...d.githubStars, pending: 0, notify: { at: new Date().toISOString(), ok: true, delta: pending, error: null } };
       });
@@ -212,7 +228,7 @@ export async function collectStars() {
 }
 
 /**
- * 启动时补采。停机期间错过的采集要接上 —— 否则卡片的空窗期不是 12 小时，
+ * 启动时补采。停机期间错过的采集要接上 —— 否则卡片的空窗期不是 6 小时，
  * 而是"从上次跑到下次整点"那么长。
  * @returns 补采结果；没到时间则为 null
  */
@@ -236,7 +252,7 @@ export function starsReport() {
     repo: cfg.repo,
     stars: Number.isFinite(s.stars) ? s.stars : null,
     prevStars: Number.isFinite(s.prevStars) ? s.prevStars : null,
-    /* 最近一次采集的增量（12 小时窗口） */
+    /* 最近一次采集的增量（6 小时窗口） */
     delta: Number.isFinite(s.delta) ? s.delta : 0,
     /* 攒着还没发出去的增量。界面不用强调它，但通知失败时要能解释 */
     pending: Number(s.pending) || 0,
@@ -249,6 +265,8 @@ export function starsReport() {
     history: Array.isArray(s.history) ? s.history.slice(-HISTORY_MAX) : [],
     notify: s.notify && typeof s.notify === 'object' ? s.notify : null,
     error: s.error || null,
-    feishuConfigured: feishuConfigured(),
+    /* 卡片上要说明"没配通知地址所以只记数"。这里问的是"通知能不能发"，
+       所以应用机器人配全也算数 —— 只看 webhook 会把那种人误报成没配 */
+    feishuConfigured: panelNotifyReady(),
   };
 }

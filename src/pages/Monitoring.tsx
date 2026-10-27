@@ -167,7 +167,7 @@ export default function Monitoring() {
             crit={0.88}
             tile="cpu"
             icon={<Cpu size={15} />}
-            hint={`${status.cpuinfo?.cores ?? '—'} 核 · ${status.cpuinfo?.model ?? '—'}`}
+            hint={`${status.cpuinfo?.cores ?? '—'} 核${status.cpuinfo?.cpus && status.cpuinfo.cpus !== status.cpuinfo.cores ? ` / ${status.cpuinfo.cpus} 线程` : ''} · ${status.cpuinfo?.model ?? '—'}`}
           />
           <RatioStat
             label="内存使用率"
@@ -177,7 +177,14 @@ export default function Monitoring() {
             crit={0.9}
             tile="mem"
             icon={<MemoryStick size={15} />}
-            hint={`共 ${fmtBytes(status.memory.total)}`}
+            /* used + free 加不出 total：差的那 20 多 GB 是 page cache / buffers，
+               Linux 上既不算已用也不算空闲。不写这一句，"42% 已用、空闲 14 GB、
+               总共 62 GB" 会让人以为数字算错了。 */
+            hint={(() => {
+              const cache = Math.max(0, status.memory.total - status.memory.used - status.memory.free);
+              const base = `共 ${fmtBytes(status.memory.total)}`;
+              return cache > 1024 ** 3 ? `${base} · 其中 ${fmtBytes(cache)} 为缓存/缓冲` : base;
+            })()}
           />
           <RatioStat
             label="根分区使用率"
@@ -191,10 +198,12 @@ export default function Monitoring() {
           />
           <RatioStat
             label="平均负载"
-            // 负载是"排队长度"，除以核数才是可比的满载程度：右上角占比就是这个
-            // 比值，大数值仍然显示原始的 1 分钟负载，不和 5/15 分那条线混淆
+            // 负载是"排队长度"，除以**线程数**才是可比的满载程度：右上角占比就是这个
+            // 比值，大数值仍然显示原始的 1 分钟负载，不和 5/15 分那条线混淆。
+            // 以前除的是 cores（每路核数），6 核 12 线程的机器上占比会虚高一倍，
+            // 0.75/1 的 warn/crit 也跟着提前触发。
             used={Array.isArray(status.loadavg) ? Number(status.loadavg[0]) : 0}
-            total={status.cpuinfo?.cores || 1}
+            total={status.cpuinfo?.cpus || status.cpuinfo?.cores || 1}
             valueText={Array.isArray(status.loadavg) ? status.loadavg[0] : '—'}
             warn={0.75}
             crit={1}
@@ -670,6 +679,9 @@ function useChartData() {
       (overview?.series ?? []).map((p) => ({
         ...p,
         cpuPct: p.cpu * 100,
+        /* iowait 在 RRD 里和 cpu 一样是**分数**（0–1），不乘 100 的话
+           0.4% 的等待会被画成 0.00% —— 和旁边 ×100 的 CPU 曲线不同量纲 */
+        iowaitPct: (p.iowait ?? 0) * 100,
         memPct: p.maxmem ? (p.memused / p.maxmem) * 100 : 0,
         rootPct: p.roottotal ? (p.rootused / p.roottotal) * 100 : 0,
         rootGb: p.rootused / 1024 ** 3,
@@ -790,13 +802,16 @@ function IoChart() {
         title="硬盘 IO"
         hint={ioAvailable ? '读写速率（MB/s）' : '该节点未上报磁盘 IO，改用 iowait 观察等待时间'}
         right={
-          latest ? (
+          /* 没上报 IO 时别报"读 0.0 / 写 0.0"：那是没数据，不是没读写 */
+          latest && ioAvailable ? (
             <div className="flex items-center gap-2 text-2xs">
               <span className="num text-ink">读 {latest.readMb.toFixed(1)}</span>
               <span className="num text-ink">写 {latest.writeMb.toFixed(1)}</span>
               <span className="text-faint">MB/s</span>
             </div>
-          ) : null
+          ) : (
+            <span className="text-2xs text-faint">无 IO 指标</span>
+          )
         }
       />
       {data.length < 2 ? (
@@ -831,7 +846,7 @@ function IoChart() {
             <XAxis dataKey="time" tickFormatter={(t) => timeLabel(t, timeframe)} tick={{ fill: colors.faint, fontSize: 10 }} axisLine={false} tickLine={false} minTickGap={28} />
             <YAxis tick={{ fill: colors.faint, fontSize: 10 }} axisLine={false} tickLine={false} width={44} />
             <Tooltip cursor={{ stroke: colors.faint, strokeDasharray: '3 3' }} content={<ChartTip unit={(v: number) => `${v.toFixed(2)}%`} />} />
-            <Line type="monotone" dataKey="iowait" name="iowait" stroke={colors.warn} strokeWidth={1.8} dot={false} />
+            <Line type="monotone" dataKey="iowaitPct" name="iowait" stroke={colors.warn} strokeWidth={1.8} dot={false} />
           </LineChart>
         </ResponsiveContainer>
       )}
@@ -842,8 +857,8 @@ function IoChart() {
 /* ══════════════════════════════════════════════════════════════════
    ProxCenter 的 GitHub star
 
-   数据是服务端每 12 小时采一次的**采样结果**（services/github-stars.js），
-   前端不轮询：这个数一天只变两次，每 15 秒问一遍纯属浪费。
+   数据是服务端每 6 小时采一次的**采样结果**（services/github-stars.js），
+   前端不轮询：这个数一天只变四次，每 15 秒问一遍纯属浪费。
    唯一会现去请求 GitHub 的动作是右上角那个刷新 —— 它对应一个 POST。
 
    空窗口期（部署后还没到采集点）由服务端的启动补采兜住；万一补采也失败，
@@ -905,6 +920,8 @@ function StarPanel() {
 
   const stars = data?.stars ?? null;
   const delta = data?.delta ?? 0;
+  /* 带符号的变化量：老数据没有 change 字段时退回 delta（以前把负值夹成过 0） */
+  const change = data?.change ?? delta;
 
   /* 一行状态说明。优先级按"用户最需要知道的"排：采集失败 > 通知失败 >
      没配 webhook > 上次通知成功。都正常时不占地方 */
@@ -931,7 +948,7 @@ function StarPanel() {
     <Card>
       <CardHead
         title="GitHub Star"
-        hint={`${data?.repo ?? 'yjscloud/ProxCenter'} · 每 12 小时采集`}
+        hint={`${data?.repo ?? 'yjscloud/ProxCenter'} · 每 6 小时采集`}
         right={
           <Button size="sm" variant="ghost" onClick={() => void refresh()} disabled={busy} aria-label="立即采集 star 数">
             <RefreshCw size={13} className={cls(busy && 'animate-spin')} />
@@ -945,7 +962,7 @@ function StarPanel() {
         <Empty
           icon={<Star size={20} />}
           title="还没有采集到"
-          hint={error || data?.error || '服务每 12 小时采一次；点右上角的刷新可以立刻试一次。'}
+          hint={error || data?.error || '服务每 6 小时采一次；点右上角的刷新可以立刻试一次。'}
           action={
             <Button size="sm" variant="soft" onClick={() => void refresh()} disabled={busy}>
               立即采集
@@ -967,11 +984,17 @@ function StarPanel() {
             <span
               className={cls(
                 'num shrink-0 rounded-full px-2 py-0.5 text-2xs',
-                delta > 0 ? 'bg-ok-soft text-ok' : 'bg-bg-2 text-faint',
+                change > 0 ? 'bg-ok-soft text-ok' : change < 0 ? 'bg-warn-soft text-warn' : 'bg-bg-2 text-faint',
               )}
-              title={delta > 0 ? `比上一次采集多了 ${delta} 个` : '与上一次采集持平'}
+              title={
+                change > 0
+                  ? `比上一次采集多了 ${change} 个`
+                  : change < 0
+                    ? `比上一次采集少了 ${-change} 个（掉星不算新增，不会通知）`
+                    : '与上一次采集持平'
+              }
             >
-              {delta > 0 ? `+${delta}` : '持平'}
+              {change > 0 ? `+${change}` : change < 0 ? `−${-change}` : '持平'}
             </span>
           </div>
 
@@ -1010,7 +1033,7 @@ function StarPanel() {
             </ResponsiveContainer>
           ) : (
             <p className="mt-3 flex h-[92px] items-center justify-center rounded-field bg-bg-2/50 px-3 text-center text-2xs leading-relaxed text-faint">
-              再采几次就能画出趋势了（每 12 小时一个点）
+              再采几次就能画出趋势了（每 6 小时一个点）
             </p>
           )}
 
@@ -1069,8 +1092,18 @@ function GrowthPanel() {
     const last = data[data.length - 1];
     if (server?.available && last) {
       const perDayGb = server.perDayBytes / 1024 ** 3;
-      const freeGb = last.totalGb - last.rootGb;
-      return { perDayGb, totalGb: last.totalGb, freeGb, daysLeft: server.daysLeft, spanDays: 7, source: 'server' as const };
+      /* 剩余空间用服务端给的 avail（可写空间）；total-used 含 ext4 保留块，会偏乐观。
+         跨度也不能写死 7 天：样本可能只覆盖 2 天，标签得说真话 */
+      const freeGb = (server.freeBytes ?? 0) > 0 ? server.freeBytes! / 1024 ** 3 : last.totalGb - last.rootGb;
+      return {
+        perDayGb,
+        totalGb: last.totalGb,
+        freeGb,
+        daysLeft: server.daysLeft,
+        spanDays: server.spanDays || 7,
+        samples: server.samples,
+        source: 'server' as const,
+      };
     }
     if (data.length < 4) return null;
     const first = data[0];
@@ -1078,8 +1111,10 @@ function GrowthPanel() {
     if (days <= 0.01) return null;
     const perDayGb = (last.rootGb - first.rootGb) / days;
     const freeGb = last.totalGb - last.rootGb;
-    const daysLeft = perDayGb > 0.0005 ? freeGb / perDayGb : null;
-    return { perDayGb, totalGb: last.totalGb, freeGb, daysLeft, spanDays: days, source: 'local' as const };
+    /* 窗口太短的首尾差值噪声极大（一小时里写个快照就能算出几十 GB/天），
+       这种时候不给"预计可用天数"，只报当前占用 */
+    const daysLeft = days >= 1 && perDayGb > 0.0005 ? freeGb / perDayGb : null;
+    return { perDayGb, totalGb: last.totalGb, freeGb, daysLeft, spanDays: days, samples: data.length, source: 'local' as const };
   }, [data, overview?.growth]);
 
   return (
@@ -1139,7 +1174,7 @@ function GrowthPanel() {
             hint={
               growth
                 ? growth.source === 'server'
-                  ? '近 7 天线性回归'
+                  ? `近 ${growth.spanDays.toFixed(1)} 天线性回归（${growth.samples} 个样本）`
                   : `基于当前窗口的 ${growth.spanDays.toFixed(1)} 天`
                 : '样本不足'
             }
@@ -1194,12 +1229,22 @@ function TokenPanel() {
   const usage = useAiUsage();
   const colors = useChartColors();
 
-  /* 14 天柱状图。日期由服务端给（见 usageSnapshot 的 series），
-     前端只做展示映射，不自己推日期 */
-  const series = useMemo(
-    () => (usage?.series ?? []).map((d) => ({ label: d.key.slice(5), tokens: usedTokens(d) })),
-    [usage?.series],
-  );
+  /* 14 天柱状图。日期由服务端给，前端只做展示映射，不自己推日期。
+     优先用网关那份 series：本地记账只记得到面板自己调过模型的那几天，
+     其余日子全是零，柱子只剩零星几根，看着就是"半张图是空的"。
+     网关那份是完整账（含办公室里的员工），取不到时才退回本地记账 */
+  const gwSeries = usage?.gateway?.series;
+  const series = useMemo(() => {
+    if (gwSeries && gwSeries.length) {
+      /* 柱子用 billed（不含缓存命中）：
+         1) 和金额对得上 —— ¥ 是按 billed × 单价算的；
+         2) 和本地回退那条分支（prompt+completion，本来就没有缓存概念）同口径，
+            切数据源时柱高不会忽然变个数量级。
+         上面的大数字仍然用 total（含缓存），那是"今天处理了多少"，两码事。 */
+      return gwSeries.map((d) => ({ label: d.day.slice(5), tokens: d.billed ?? d.total }));
+    }
+    return (usage?.series ?? []).map((d) => ({ label: d.key.slice(5), tokens: usedTokens(d) }));
+  }, [gwSeries, usage?.series]);
 
   if (!usage) {
     return (
@@ -1210,21 +1255,39 @@ function TokenPanel() {
     );
   }
 
-  const today = usedTokens(usage.today);
-  const total = usedTokens(usage.total);
-  const yesterday = usedTokens(usage.yesterday);
-  const days = Object.keys(usage.days).sort().slice(-30);
-  const peak = Math.max(today, ...days.map((k) => usedTokens(usage.days[k])));
-  const record = days.length >= 2 && today > 0 && today >= peak;
+  /* 这套数优先取网关记账。面板自己只记得到"我调了几次模型"，而智能办公室里
+     那几位（定时任务、巡检、采集）的消耗全在网关账上 —— 只算本地的话，
+     面板当天没调过模型就是一个 0，看着像坏了，其实全站已经用掉几百万 */
+  const gw = usage.gateway;
+  const today = gw ? gw.today.total : usedTokens(usage.today);
+  const calls = gw ? gw.today.api_calls : usage.today.calls;
+  const outTokens = gw ? gw.today.output : usage.today.completion;
+  const inTokens = gw ? gw.today.input : usage.today.prompt;
+  const yesterday = gw ? gw.yesterday.total : usedTokens(usage.yesterday);
+  /* 今日花费（元）。本地记账那边算不出价格，网关那份才有；取不到就不显示，
+     宁可少一格，也不要摆一个来路不明的 ¥0.00 */
+  const cost = gw && typeof gw.today.cost_cny === 'number' ? gw.today.cost_cny : null;
+
+  /* 峰值只跟同一份账比：网关给 14 天、本地留 30 天，两种口径混着算没有意义 */
+  const localDays = Object.keys(usage.days).sort().slice(-30);
+  const peak = gwSeries?.length
+    ? Math.max(...gwSeries.map((d) => d.total))
+    : Math.max(today, ...localDays.map((k) => usedTokens(usage.days[k])));
+  const windowLabel = gwSeries?.length ? '近 14 天' : '近 30 天';
+  const windowLen = gwSeries?.length ? gwSeries.length : localDays.length;
+  const record = windowLen >= 2 && today > 0 && today >= peak;
   const delta = yesterday > 0 ? ((today - yesterday) / yesterday) * 100 : null;
   /* 输入里绝大部分是 agent 的固定脚手架加上正文，输出只是那一小截答复。
      把两者并排摆出来，比单说"一共花了多少"更能说明钱花在哪儿 */
-  const outShare = usage.today.prompt > 0 ? (usage.today.completion / usage.today.prompt) * 100 : 0;
+  const outShare = inTokens > 0 ? (outTokens / inTokens) * 100 : 0;
+  /* 面板自己的账（网关账的子集）：累计那行留着它 —— "面板自己花了多少"
+     仍是排查时最常问的一句，但它不该冒充全站数字 */
+  const total = usedTokens(usage.total);
   const sources = Object.entries(usage.sources).sort((a, b) => usedTokens(b[1]) - usedTokens(a[1]));
   /* 网关侧按来源拆：cron（员工定时任务）与 api_server（接口调用，含面板自己）分得开，
      一眼能看出"是不是员工那边在花" */
-  const gatewaySplit = usage.gateway
-    ? Object.entries(usage.gateway.today.sources)
+  const gatewaySplit = gw
+    ? Object.entries(gw.today.sources)
         .sort((a, b) => b[1] - a[1])
         .map(([k, v]) => `${gatewaySourceLabel(k)} ${fmtTokens(v)}`)
         .join(' · ')
@@ -1235,8 +1298,12 @@ function TokenPanel() {
     <Card className="flex h-full flex-col">
       <CardHead
         title="Token 消耗"
-        hint="全站大模型调用。数字取自上游返回的 usage，不是估算"
-        right={<Badge tone="neutral">今日 {usage.today.calls} 次调用</Badge>}
+        hint={
+          gw
+            ? '全站模型调用 · 网关记账（含智能办公室的员工）；token 为实测，金额按官方单价折算'
+            : '网关那份还没取到，先看面板自己的调用'
+        }
+        right={<Badge tone="neutral">今日 {calls} 次调用</Badge>}
       />
 
       <div className="grid gap-5 sm:grid-cols-2">
@@ -1244,16 +1311,39 @@ function TokenPanel() {
           <p className="text-2xs text-muted">今日消耗 Token</p>
           <p className="mt-1 flex flex-wrap items-baseline gap-x-1.5">
             <span className="num text-[26px] font-semibold leading-none tracking-display text-ink">{fmtTokens(today)}</span>
-            <span className="num text-2xs text-faint">/ 近 30 天峰值 {fmtTokens(peak)}</span>
+            <span className="num text-2xs text-faint">/ {windowLabel}峰值 {fmtTokens(peak)}</span>
+          </p>
+          {/* 总消耗含缓存命中：不写这一句，4.2M 会看着像"今天读了四百多万字新内容" */}
+          <p className="mt-1.5 text-2xs leading-relaxed text-faint">
+            含缓存命中 {fmtTokens(gw?.today.cache_read ?? 0)} · 未命中 {fmtTokens(inTokens)} · 输出{' '}
+            {outTokens.toLocaleString('zh-CN')}
+            {/* 金额是按 billed 算的，不把 billed 摆出来，¥ 和主数字除一下对不上任何单价 */}
+            {gw ? ` · 计费口径 ${fmtTokens(gw.today.billed)}` : ''}
           </p>
           <Meter ratio={peak > 0 ? today / peak : 0} tone={record ? 'warn' : 'accent'} className="mt-3" />
+          {cost === null ? null : (
+            <p className="mt-2 flex flex-wrap items-baseline gap-x-1.5 text-2xs text-muted">
+              <span>今日消费</span>
+              <span className="num text-sm font-semibold text-ink">¥{cost.toFixed(2)}</span>
+              <span className="text-faint">
+                {gw?.today.manual ? 'DeepSeek 账单校正' : '按官方单价'} · 含员工调用
+              </span>
+            </p>
+          )}
+          {/* 校正过的日子要说清来路：金额是账单原文，token 可能只是等比推算 */}
+          {gw?.today.manual ? (
+            <p className="mt-1 text-2xs leading-relaxed text-faint">
+              这一天按官方账单校正{gw.today.manual_note ? `（${gw.today.manual_note}）` : ''}
+              {gw.today.manual_token_estimated ? '，token 按同一金额比例推算' : ''}
+            </p>
+          ) : null}
         </div>
 
         <div>
           <p className="text-2xs text-muted">其中输出 Token</p>
           <p className="mt-1 flex flex-wrap items-baseline gap-x-1.5">
             <span className="num text-[26px] font-semibold leading-none tracking-display text-ink">
-              {usage.today.completion.toLocaleString('zh-CN')}
+              {outTokens.toLocaleString('zh-CN')}
             </span>
             <span className="num text-2xs text-faint">
               / 占输入 {outShare < 1 ? outShare.toFixed(2) : outShare.toFixed(1)}%
@@ -1263,7 +1353,7 @@ function TokenPanel() {
             {delta === null
               ? '昨天没有调用，无法比较'
               : `较昨日 ${delta >= 0 ? '+' : ''}${Math.abs(delta) < 1 ? '0' : delta.toFixed(0)}%`}
-            {record ? ' · 是近 30 天最高的一天' : ''}
+            {record ? ` · 是${windowLabel}最高的一天` : ''}
           </p>
         </div>
       </div>
@@ -1271,7 +1361,7 @@ function TokenPanel() {
       {/* 柱状图同时干两件事：说清"哪几天在猛用"，以及把这半栏剩下的高度填上 ——
           上一版内容比旁边的容量卡短一截，卡片底部空着一块 */}
       <div className="mt-5 flex min-h-[186px] flex-1 flex-col">
-        <p className="mb-1.5 text-2xs text-faint">近 14 天用量</p>
+        <p className="mb-1.5 text-2xs text-faint">近 14 天计费用量（不含缓存命中，缺的天已补零）</p>
         {/* min-h-0 + absolute 层，理由见上面容量卡的说明：
             ResponsiveContainer 的 svg 高度不能参与父级内容高度的计算，
             否则"实测→撑大→再实测"循环下去，页面开得越久柱状图越高 */}
@@ -1294,37 +1384,34 @@ function TokenPanel() {
               />
               <Tooltip
                 cursor={{ fill: colors.line, fillOpacity: 0.35 }}
-                content={<ChartTip unit={(v: number) => `${v.toLocaleString('zh-CN')} tokens`} />}
+                content={<ChartTip unit={(v: number) => `${v.toLocaleString('zh-CN')} 计费 tokens`} />}
               />
               {/* 实心柱用 colors.bar（冷色主档）而不是琥珀：柱体面积远大于一条曲线，
                   用告警色填满等于让人一直在看一片"警告" */}
-              <Bar dataKey="tokens" name="用量" fill={colors.bar} radius={[3, 3, 0, 0]} maxBarSize={22} />
+              <Bar dataKey="tokens" name="计费用量" fill={colors.bar} radius={[3, 3, 0, 0]} maxBarSize={22} />
             </BarChart>
           </ResponsiveContainer>
           </div>
         </div>
       </div>
 
-      {/* 底部小字按用途拆开。这个端点单次调用的 prompt 里约有一万五是 agent 的
-          固定脚手架，与问题长短无关 —— 所以"谁在花"比"花了多少"更说明问题 */}
+      {/* 底部两行小字：先按来源拆（谁在花），再单独交代面板自己的账。
+          面板的调用在网关账上归到 api_server，两者不能相加 —— 所以分两行写，
+          不并成一个数 */}
       <div className="mt-4 space-y-1.5 border-t border-line pt-3.5">
+        {gw ? (
+          <p className="text-2xs leading-relaxed text-muted">
+            今日按来源 {gatewaySplit || '—'}
+            {gw.budget_label ? ` · 预算 ${gw.budget_label}` : ''}
+            {gw.at ? ` · 网关快照 ${fmtRelative(gw.at)}` : ''}
+          </p>
+        ) : null}
         <p className="text-2xs leading-relaxed text-faint">
-          累计 {fmtTokens(total)} · 共 {usage.total.calls} 次调用
+          面板自身累计 {fmtTokens(total)} · 共 {usage.total.calls} 次调用
           {sources.length
             ? ` · ${sources.map(([k, v]) => `${usage.labels[k] ?? k} ${fmtTokens(usedTokens(v))}`).join(' · ')}`
             : ' · 还没有调用记录'}
         </p>
-        {/* 上面那些都是**面板自己**的调用。办公室里那几位（定时任务、巡检、采集）
-            的消耗全在网关那边，不看这一行就会以为一天的消耗就这么点。
-            它是个超集（面板的调用在网关账上归到 api_server），所以不加进上面的数。 */}
-        {usage.gateway ? (
-          <p className="text-2xs leading-relaxed text-muted">
-            Hermes 网关记账（含智能办公室的员工）今日{' '}
-            <b className="num font-medium text-ink">{fmtTokens(usage.gateway.today.total)}</b>
-            {usage.gateway.budget_label ? ` / 预算 ${usage.gateway.budget_label}` : ''}
-            {gatewaySplit ? ` · ${gatewaySplit}` : ''}
-          </p>
-        ) : null}
       </div>
     </Card>
   );
@@ -1344,18 +1431,33 @@ function ThermalPanel() {
   const boardTemps = temps.filter((t) => t.kind === 'board');
   const diskTemps = temps.filter((t) => t.kind === 'disk');
   const otherTemps = temps.filter((t) => t.kind !== 'cpu' && t.kind !== 'board' && t.kind !== 'disk');
-  const hottest = temps.reduce<{ name: string; value: number } | null>((acc, t) => (!acc || t.value > acc.value ? t : acc), null);
+  /* "最高"只在 CPU / 主板里选，硬盘和其它温度点都不参与：
+     · 一块 49°C 的 NVMe 会把 37°C 的 CPU 顶下去，而盘温阈值（45/55）本来就比
+       CPU（65/80）低一档，混着比既选错对象又选错档位；
+     · 板载网卡、机箱这类 "other" 同理，45°C 的网卡也不该成为整机温度的代言。
+     硬盘温度在「硬盘温度」组里按自己的阈值显示，CPU/主板都没有时才退回 other。 */
+  const primaryTemps = temps.filter((t) => t.kind === 'cpu' || t.kind === 'board');
+  const hotCandidates = primaryTemps.length ? primaryTemps : temps.filter((t) => t.kind !== 'disk');
+  const hottest = hotCandidates.reduce<{ name: string; value: number; kind?: string } | null>(
+    (acc, t) => (!acc || t.value > acc.value ? t : acc),
+    null,
+  );
 
   const tempTone = (v: number) => (v >= 80 ? 'crit' : v >= 65 ? 'warn' : 'ok');
+  /** 徽章按它自己的 kind 分档，别拿 CPU 的 65/80 去判主板 */
+  const hotTone = (t: { value: number; kind?: string }) => {
+    if (t.kind === 'board') return t.value >= 75 ? 'crit' : t.value >= 60 ? 'warn' : 'ok';
+    return tempTone(t.value);
+  };
 
   return (
     <Card>
       <CardHead
         title="温度"
-        hint={`${temps.length} 个温度点${powerSensors.length ? ` · ${powerSensors.length} 个功率读数` : ''}`}
+        hint={`${temps.length} 个温度点${powerSensors.length ? ` · ${powerSensors.length} 个功率读数` : ''} · 最高值取自 CPU / 主板`}
         right={
           hottest ? (
-            <Badge tone={tempTone(hottest.value)}>
+            <Badge tone={hotTone(hottest)}>
               最高 {Math.round(hottest.value)}°C · {hottest.name}
             </Badge>
           ) : null
@@ -1499,13 +1601,16 @@ function NetTrafficCard() {
         title="网卡流量"
         hint={hasHistory ? '节点收发速率（KB/s），随页面上方的时间窗变化' : '该节点暂未上报流量历史'}
         right={
-          latest ? (
+          /* 没有流量历史时报 0.0 是在撒谎：那是"没数据"，不是"没流量" */
+          latest && hasHistory ? (
             <div className="flex items-center gap-2 text-2xs">
               <span className="num text-ink">收 {latest.netinKb.toFixed(1)}</span>
               <span className="num text-ink">发 {latest.netoutKb.toFixed(1)}</span>
               <span className="text-faint">KB/s</span>
             </div>
-          ) : null
+          ) : (
+            <span className="text-2xs text-faint">无历史速率</span>
+          )
         }
       />
       {data.length < 2 ? (
@@ -1872,11 +1977,16 @@ function tempLimitText(t: DiskHealth['temperature']): string {
   return `${t.opLimit ?? '—'}°C / ${t.criticalLimit ?? '—'}°C`;
 }
 
-function tempTone(t: number | null | undefined, limit: number | null | undefined): 'warn' | 'crit' | undefined {
+/**
+ * 硬盘温度的告警档。
+ * 用和「温度」卡里硬盘那一组完全相同的 45/55 —— 同一个读数在两个卡片里
+ * 一个是琥珀一个是正常，只会让人怀疑数据。opLimit（厂家工作上限）不再当
+ * crit 阈值：那是"设计上限"，不是"该报警的线"。
+ */
+function tempTone(t: number | null | undefined, _limit?: number | null): 'warn' | 'crit' | undefined {
   if (t == null) return undefined;
-  if (limit != null && t >= limit) return 'crit';
-  if (t >= 60) return 'crit';
-  if (t >= 50) return 'warn';
+  if (t >= 55) return 'crit';
+  if (t >= 45) return 'warn';
   return undefined;
 }
 
@@ -1926,9 +2036,20 @@ function GuestTable() {
                     {g.name}
                     <span className="ml-1.5 text-2xs text-faint">{g.kind}</span>
                   </td>
-                  <td className="num px-1 py-2 text-right">{g.status === 'running' ? `${(g.cpu * 100).toFixed(1)}%` : '—'}</td>
-                  <td className="num px-1 py-2 text-right">
-                    {g.status === 'running' ? `${fmtBytes(g.mem)} / ${fmtBytes(g.maxmem)}` : '—'}
+                  {/* PVE 的 cpu 是"占整机所有核"的比例，所以只在 title 里补分配核数：
+                      同样是 12%，1 核的机器可能已经跑满，12 核的还在摸鱼 */}
+                  <td
+                    className="num px-1 py-2 text-right"
+                    title={g.maxcpu ? `占整机 · 分配 ${g.maxcpu} 核` : '占整机'}
+                  >
+                    {g.status === 'running' ? `${(g.cpu * 100).toFixed(1)}%` : '—'}
+                  </td>
+                  <td
+                    className="num px-1 py-2 text-right"
+                    title={g.maxmem > 0 ? `占分配内存 ${((g.mem / g.maxmem) * 100).toFixed(0)}%` : undefined}
+                  >
+                    {/* maxmem 读不到时显示 —，别摆一个 "0 B / 0 B" 冒充读数 */}
+                    {g.status === 'running' && g.maxmem > 0 ? `${fmtBytes(g.mem)} / ${fmtBytes(g.maxmem)}` : '—'}
                   </td>
                   <td className="px-1 py-2 text-right">
                     <Badge tone={g.status === 'running' ? 'ok' : 'neutral'} dot>

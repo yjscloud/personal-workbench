@@ -14,7 +14,7 @@ import { Badge, Card, CardHead, Empty, Led, Meter, Skeleton, useCountUp } from '
  *   · **两侧边栏**：左栏本月之星（钉在最上面）+ 对话明细，右栏今日消耗 Token
  *     + 全局待办工作表。这是"事"。
  * 两边数据来自同一个网关的不同接口，各自会失败，所以三块各自报自己的错 ——
- * 一块读不到不该把整页拖黑（工位状态是免登录的，口令没配时它照样是好的）。
+ * 一块读不到不该把整页拖黑（工位状态走 SSH 数据桥，没配网关 Key 时它照样是好的）。
  *
  * 点开工位后那个带页签的详情弹窗在 components/seat-detail.tsx ——
  * 它自带一整页页签内容，跟这里的版面零件不是一回事，分开放更好找。
@@ -636,6 +636,15 @@ export function TokenPanel({
 }) {
   const today = usage?.today;
   const shown = useCountUp(today?.total ?? 0);
+  /* 口径：measured = 桥按采样差分记出来的真实增量；seeded = 当天底数还是旧的分摊估算。
+     标出来是因为这事儿必须说清楚 —— 分摊值会明显偏小（长上下文会话按轮次摊不动） */
+  const basis = !today
+    ? ''
+    : today.measured
+      ? today.seeded
+        ? '按调用记账（当日底数为估算）'
+        : '按调用记账'
+      : '跨天会话分摊（估算）';
   /* 按来源拆开：cron 是员工那边（定时任务/巡检），api_server 是接口调用（含面板自己）。
      一眼能看出"今天的消耗是员工在花，还是我在花" */
   const split = today?.sources
@@ -653,7 +662,7 @@ export function TokenPanel({
            读屏按标题跳读时会整级漏掉 */
         level={2}
         title="今日消耗 Token"
-        hint={usage ? `网关记账，含员工消耗 · ${fmtRelative(usage.generated_at)}` : '今日与近 7 日的模型用量'}
+        hint={usage ? `${basis}，含员工消耗 · ${fmtRelative(usage.generated_at)}` : '今日与近 14 日的模型用量'}
         right={<Activity size={15} className="text-accent" />}
       />
       {/* 错误只是一行提示压在数据上面，而不是把数据换成错误：
@@ -667,22 +676,43 @@ export function TokenPanel({
             <span className="num text-2xl font-semibold text-ink">{wan(shown)}</span>
             <span className="num text-xs text-faint">/ {usage.budget_label}</span>
           </p>
+          {/* 进度条按**计费口径**算，不是按上面的总数：缓存按 1/10 计价，
+              拿含缓存的总量去比预算会把进度条顶到 80% 以上，看着像要超支了 */}
           <Meter
             className="mt-2.5"
-            ratio={usage.budget_tokens ? today.total / usage.budget_tokens : 0}
+            ratio={usage.budget_tokens ? (today.billed ?? today.total) / usage.budget_tokens : 0}
             tone="accent"
             height={5}
           />
           <dl className="mt-3.5 grid grid-cols-2 gap-x-4 gap-y-1.5 text-2xs">
-            <TokenRow label="输入" value={wan(today.input)} />
+            <TokenRow label="输入（未命中）" value={wan(today.input)} />
             <TokenRow label="输出" value={wan(today.output)} />
-            <TokenRow label="缓存命中" value={wan(today.cache_read)} />
+            <TokenRow label="输入（命中缓存）" value={wan(today.cache_read)} />
             <TokenRow label="API 调用" value={`${today.api_calls} 次`} />
           </dl>
+          {/* 金额：官方单价（缓存命中/未命中/输出三档）× 采样时段，桥那边算好给过来 */}
+          {typeof today.cost_cny === 'number' ? (
+            <p className="mt-2 flex flex-wrap items-baseline gap-x-1.5 text-2xs text-muted">
+              <span>今日消费</span>
+              <span className="num text-sm font-semibold text-ink">¥{today.cost_cny.toFixed(2)}</span>
+              <span className="text-faint">{today.manual ? 'DeepSeek 账单校正' : '按官方单价折算'}</span>
+            </p>
+          ) : null}
+          <p className="mt-1.5 text-2xs text-faint">
+            总计 {wan(today.total)} = 未命中 {wan(today.input)} + 命中缓存 {wan(today.cache_read)} + 输出{' '}
+            {wan(today.output)}
+            {today.reasoning ? ` + 推理 ${wan(today.reasoning)}` : ''}；进度条按计费口径{' '}
+            {wan(today.billed ?? today.input + today.output)}
+          </p>
           {split ? <p className="mt-2.5 border-t border-line pt-2.5 text-2xs text-muted">来源 {split}</p> : null}
           <p className="mt-2 text-2xs text-faint">
-            昨日 {wan(usage.yesterday.total)} · 近 7 日共 {wan(usage.series.reduce((s, d) => s + (d.total || 0), 0))}
+            昨日 {wan(usage.yesterday.total)} · 近 14 日共 {wan(usage.series.reduce((s, d) => s + (d.total || 0), 0))}
             {usage.models?.length ? ` · 模型 ${usage.models.join(' / ')}` : ''}
+          </p>
+          <p className="mt-1 text-2xs text-faint">
+            {today.measured
+              ? '新增用量每 15 分钟入账一次，和 DeepSeek 官网的差距不超过一个采样间隔。'
+              : '还没有采样基线：今天的数按轮次分摊，会偏小；明天起为真实值。'}
           </p>
         </>
       )}
@@ -927,7 +957,7 @@ export function SessionsPanel({
 }
 
 /* ── 共用的错误行 ────────────────────────────────────────────────────
- * 三块各自会失败（口令没配、网关不通、这一路接口 500），所以错误要落在
+ * 三块各自会失败（网关 Key 没配、网关不通、这一路接口 500），所以错误要落在
  * 那一块里面：把整页画成错误页会连带藏掉那些其实读到了的数据。
  */
 export function PanelError({ text }: { text: string }) {

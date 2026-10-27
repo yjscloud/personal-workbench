@@ -17,6 +17,12 @@ server/data/.settings-key
 # 上传的背景图（个人照片），要入库的话把这一行删掉
 server/data/background/
 
+# 官方账单校正基线：每天的花费/用量是运行时数据，不是代码
+server/data/usage-overrides.json
+
+# IP 归属地查询缓存
+server/data/.ip-geo-cache.json
+
 # 浏览器自动化留下的无障碍树快照，里面是真实工单内容
 trash.yaml
 # playwright-cli 的会话目录：快照同样含真实数据，且每次跑都是新的
