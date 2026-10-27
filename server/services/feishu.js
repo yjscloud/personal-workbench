@@ -12,12 +12,27 @@ import { db } from '../store.js';
 
 const TIMEOUT_MS = 15000;
 
-/** 当前生效的 webhook：设置页优先，.env 兜底 */
+/**
+ * 当前生效的 webhook。
+ *
+ * 优先级：设置页「飞书机器人」→ 老的「GitHub Star 监控」里的地址 → .env。
+ * 中间那档留着是为了不把已经配好的人卡住 —— 那段配置还在，只是收敛到新的
+ * 那一栏之后就没必要再填第二遍。总开关关掉时**不**回落到后面两档：
+ * "关掉"就该是真的不发，而不是悄悄换成另一个地址继续发。
+ */
 export function feishuConfig() {
-  const s = db()?.settings?.stars || {};
+  const s = db()?.settings || {};
+  const bot = s.feishuBot;
+  if (bot) {
+    /* 总开关是"真的停"：关掉时连回落也不走，否则"关了还在发"没人能解释 */
+    if (bot.enabled === false) return { url: '', secret: '' };
+    const url = String(bot.webhookUrl || '').trim();
+    if (url) return { url, secret: String(bot.secret || '').trim() };
+  }
+  const stars = s.stars || {};
   return {
-    url: String(s.feishuUrl || '').trim() || String(process.env.FEISHU_WEBHOOK_URL || '').trim(),
-    secret: String(s.feishuSecret || '').trim() || String(process.env.FEISHU_WEBHOOK_SECRET || '').trim(),
+    url: String(stars.feishuUrl || '').trim() || String(process.env.FEISHU_WEBHOOK_URL || '').trim(),
+    secret: String(stars.feishuSecret || '').trim() || String(process.env.FEISHU_WEBHOOK_SECRET || '').trim(),
   };
 }
 

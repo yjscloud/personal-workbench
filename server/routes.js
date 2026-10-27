@@ -7,7 +7,8 @@ import { db, persist, replaceAll, resetToSeed, exportAll, update, uid, flush, db
 import { getOverview, getGrowth, listNodes, pveConfig, isConfigured } from './services/pve.js';
 import { accumulate, estimateWatts, powerReport, applyEco, recordMeter } from './services/power.js';
 import { haReadings, haConfig, isHaConfigured, listEntityOptions, normalizeSockets } from './services/ha.js';
-import { hermesSeats, testHermes, isHermesConfigured, hasHermesCredentials } from './services/hermes.js';
+import { hasHermesCredentials } from './services/hermes.js';
+import { isLocalConfigured } from './services/hermes-config.js';
 import {
   officeRoster,
   officeBoard,
@@ -25,6 +26,7 @@ import {
   officeGuardBrief,
   securityProfile,
   securityDecide,
+  securityAutoBan,
 } from './services/office.js';
 import { readGovernor, GOVERNORS } from './services/cpu.js';
 import { backgroundStatus, saveBackground, clearBackground } from './services/background.js';
@@ -37,6 +39,14 @@ import { askAboutNews, cachedBody, unreadableHosts } from './services/reader.js'
 import { usageSnapshot } from './services/ai-usage.js';
 import { balanceReport, deepseekConfigured } from './services/deepseek.js';
 import { collectStars, DEFAULT_REPO, normalizeRepo, sendTestNotification, starsReport } from './services/github-stars.js';
+import {
+  feishuBotChannels,
+  feishuBotConfig,
+  hasEnvWebhook,
+  syncFeishuBot,
+  testFeishuBot,
+} from './services/feishu-bot.js';
+import { feishuAppStatus, restartFeishuApp } from './services/feishu-app.js';
 import { notifyTicketDone, sendTestMail } from './services/mail.js';
 import { runDueReminders } from './services/reminders.js';
 import { probeSiteColor } from './services/sitecolor.js';
@@ -233,6 +243,24 @@ function maskSettings(settings) {
       feishuSecret: settings.stars?.feishuSecret ? MASK : '',
       hasFeishuSecret: Boolean(settings.stars?.feishuSecret),
     },
+    /* 飞书机器人是**全站**的通知出口（面板自己的通知 + 助手机上的封禁/值守脚本）。
+       webhook 地址明文回显：它要能核对，清空就是停止通知；签名密钥只回掩码，
+       改它必须重新敲一遍（与 tokenSecret 同一口径）。 */
+    feishuBot: {
+      ...feishuBotConfig(settings),
+      secret: settings.feishuBot?.secret ? MASK : '',
+      hasSecret: Boolean(settings.feishuBot?.secret),
+      appSecret: settings.feishuBot?.appSecret ? MASK : '',
+      hasAppSecret: Boolean(settings.feishuBot?.appSecret),
+      /* 两条通道各自配全了没有。按钮能不能点由它决定，前端不必自己再推一遍 */
+      channels: feishuBotChannels(feishuBotConfig(settings)),
+      /* 长连接状态：@ 机器人有没有反应，看的就是这一条链通没通。
+         原因（权限没发布 / 后台没开长连接 / App Secret 错）原样带回去 */
+      appStatus: feishuAppStatus(),
+      /* 库里空着但环境变量里有地址：通知其实在发。页面得说清楚，
+         否则显示「未配置」会让人以为已经停了 */
+      hasEnvFallback: !settings.feishuBot?.webhookUrl && hasEnvWebhook(),
+    },
     /* SMTP 密码同理：只回掩码 + 布尔，改它必须重新敲一遍 */
     mail: {
       ...settings.mail,
@@ -339,8 +367,6 @@ router.get(
       db: { ...dbInfo(), reachable: probe.ok, error: probe.ok ? null : probe.error, tables: probe.tables },
       pveConfigured: isConfigured(db().settings),
       haConfigured: isHaConfigured(db().settings),
-      hermesConfigured: isHermesConfigured(),
-      hermesCredentials: hasHermesCredentials(),
       /* 桌宠头顶那颗余额标有没有数据源。放在这里是为了让"Key 到底读到没有"
          有一个不用看日志就能问的地方 —— 自查时最先怀疑的总是它 */
       deepseekConfigured: deepseekConfigured(),
@@ -2227,16 +2253,51 @@ router.put(
         notifyTo,
       };
     }
-    const prevRepo = normalizeRepo(db().settings.stars?.repo) || DEFAULT_REPO;
-
-    /* 智能办公室那个"打开完整办公室"的链接。
-       同样先校验再落库：地址会被塞进 href，不是 http(s) 的一律拒掉
-       （javascript: 之类在这里没有正当用途）。空字符串是合法的 ——
-       它的意思是"用服务端 .env 里那份"。 */
-    const nextOfficeUrl = incoming.hermes ? String(incoming.hermes.officeUrl ?? '').trim().slice(0, 500) : null;
-    if (nextOfficeUrl && !/^https?:\/\//i.test(nextOfficeUrl)) {
-      return fail(res, 400, '办公室地址要以 http:// 或 https:// 开头（留空则用服务端配置的地址）');
+    /* 飞书机器人（全站通知出口）。地址和签名密钥都先校验再落库：
+       地址填错的表现是"通知静默消失"，比当场报错难查得多。 */
+    let nextFeishuBot = null;
+    if (incoming.feishuBot) {
+      const raw = incoming.feishuBot;
+      const prev = feishuBotConfig(db().settings);
+      const url = raw.webhookUrl === undefined
+        ? prev.webhookUrl
+        : String(raw.webhookUrl ?? '').trim().slice(0, 500);
+      if (url && !/^https?:\/\//i.test(url)) {
+        return fail(res, 400, 'webhook 地址要以 https:// 开头（留空 = 不发通知）');
+      }
+      /* 空串或掩码 = 没改过，沿用旧值。清空密钥没有入口 —— 换机器人就换地址 */
+      const sentSecret = raw.secret;
+      const keepSecret = sentSecret === undefined || sentSecret === '' || sentSecret === MASK;
+      /* 应用机器人：审批卡的按钮回调只走这条，所以这三个字段要能核对、能改 */
+      const appId = raw.appId === undefined ? prev.appId : String(raw.appId ?? '').trim().slice(0, 100);
+      const chatId = raw.chatId === undefined ? prev.chatId : String(raw.chatId ?? '').trim().slice(0, 120);
+      /* 群 id 是 oc_ 开头的一串；填错了飞书只会回 "receive_id invalid"，
+         不如在这里说清楚哪个字段不对 */
+      if (chatId && !/^oc_[A-Za-z0-9_-]+$/.test(chatId)) {
+        return fail(res, 400, '群 chat_id 要以 oc_ 开头（群里 @机器人 发一条消息，用接口查回来的那个 id）');
+      }
+      if (appId && !/^cli_[A-Za-z0-9]+$/.test(appId)) {
+        return fail(res, 400, 'App ID 要以 cli_ 开头');
+      }
+      const sentAppSecret = raw.appSecret;
+      const keepAppSecret = sentAppSecret === undefined || sentAppSecret === '' || sentAppSecret === MASK;
+      nextFeishuBot = {
+        ...prev,
+        enabled: raw.enabled === undefined ? prev.enabled !== false : Boolean(raw.enabled),
+        notifyBan: raw.notifyBan === undefined ? prev.notifyBan !== false : Boolean(raw.notifyBan),
+        notifyOps: raw.notifyOps === undefined ? prev.notifyOps !== false : Boolean(raw.notifyOps),
+        webhookUrl: url,
+        secret: keepSecret ? prev.secret : String(sentSecret).slice(0, 200),
+        appId,
+        appSecret: keepAppSecret ? prev.appSecret : String(sentAppSecret).slice(0, 200),
+        chatId,
+        /* 配置一动，上一次的同步结果就作废了 —— 免得页面还顶着"已同步" */
+        syncedAt: null,
+        syncError: null,
+      };
     }
+
+    const prevRepo = normalizeRepo(db().settings.stars?.repo) || DEFAULT_REPO;
 
     /* 智能办公室两侧边栏里那三块面板的摆放顺序（工位墙钉在中间那列，不在这儿）。
        这里只做"收窄"，不做"凑齐"：对面加减面板时，前端要把旧的顺序补全
@@ -2278,11 +2339,10 @@ router.put(
         // 前后带空格会把问候语的排版撑开，过长的名字也会把标题挤换行。
         s.profile = { ...s.profile, name: String(incoming.profile.name ?? '').trim().slice(0, 24) };
       }
-      if (nextOfficeUrl !== null || nextOfficeLayout !== null) {
-        // 逐层合并：这两格是各自的覆盖位，不是整段配置的替换
+      if (nextOfficeLayout !== null) {
+        // 逐层合并：布局是一个覆盖位，不是整段配置的替换
         s.hermes = { ...(s.hermes || {}) };
-        if (nextOfficeUrl !== null) s.hermes.officeUrl = nextOfficeUrl;
-        if (nextOfficeLayout !== null) s.hermes.officeLayout = nextOfficeLayout;
+        s.hermes.officeLayout = nextOfficeLayout;
       }
       if (incoming.background) {
         const b = incoming.background;
@@ -2345,6 +2405,7 @@ router.put(
         }
       }
       if (nextStars) s.stars = nextStars;
+      if (nextFeishuBot) s.feishuBot = nextFeishuBot;
       if (nextMail) s.mail = nextMail;
       if (incoming.reminders) s.reminders = { enabled: incoming.reminders.enabled !== false };
       s.updatedAt = new Date().toISOString();
@@ -2355,13 +2416,27 @@ router.put(
     if (nextBackup) applyBackupSchedule();
 
     /* 换了仓库就立刻采一次。不采的话，卡片会顶着一个"还没采集到"的空状态
-       一直等到下一个整点（最多 12 小时），用户会以为配错了。
+       一直等到下一个整点（最多 6 小时），用户会以为配错了。
        旧仓库的历史由 services 侧按 repo 判定并作废（见 stateOf），不必在这里清。 */
     if (nextStars && nextStars.repo !== prevRepo) {
       collectStars()
         .then(() => flush())
         .catch((err) => console.warn('[stars] 换仓库后立即采集失败：', err.message));
     }
+
+    /* 保存即推送：助手机上的脚本读的就是推过去的那一份。推送失败不回滚本地
+       保存（面板自己的通知仍然有效），只把原因写回去让页面显示 ——
+       否则用户会以为脚本那边也跟着换好了。 */
+    if (nextFeishuBot) {
+      const synced = await syncFeishuBot(db().settings.feishuBot);
+      update((d) => {
+        d.settings.feishuBot = { ...d.settings.feishuBot, ...synced };
+      });
+      /* 凭据/开关可能刚换过：长连接得用新的一份重建，否则改完 App ID 还是
+         旧进程里那条连接在收事件（表现就是"改了没生效"） */
+      restartFeishuApp(db().settings);
+    }
+
     ok(res, maskSettings(db().settings));
   }),
 );
@@ -2657,7 +2732,7 @@ router.get(
 );
 
 /* ── GitHub star（监控页那张卡片）─────────────────────────────────────
- * GET 返回的是**采集结果**，不会现去请求 GitHub：卡片 12 小时才变一次，
+ * GET 返回的是**采集结果**，不会现去请求 GitHub：卡片 6 小时才变一次，
  * 没必要每开一次页面就浪费一次未认证额度（60 次/小时，按出口 IP 算）。
  * 想立刻看最新的，点卡片右上角的刷新 —— 那是唯一会真打 GitHub 的入口。
  * ──────────────────────────────────────────────────────────────────── */
@@ -2683,6 +2758,36 @@ router.post(
   wrap(async (_req, res) => {
     await sendTestNotification();
     ok(res, { sent: true });
+  }),
+);
+
+/* 飞书机器人：发一张测试卡 / 把当前配置重新推给助手机。
+   测试用的是**已保存**的配置 —— 页面会先保存再调这里，测的必须是以后真会
+   用的那一份；拿草稿去测，通过了也不代表保存之后能发出去。 */
+router.post(
+  '/settings/feishu/test',
+  wrap(async (req, res) => {
+    /* 走哪条通道由页面选（两条可能指向同一个群，各测各的才说得清）。
+       不传就按"有 webhook 先 webhook"的老行为来 */
+    const channel = String(req.body?.channel || '').trim();
+    if (channel && channel !== 'webhook' && channel !== 'app') {
+      return fail(res, 400, 'channel 只能是 webhook 或 app');
+    }
+    const sent = await testFeishuBot(feishuBotConfig(db().settings), channel || undefined);
+    ok(res, { sent: true, channel: sent });
+  }),
+);
+
+router.post(
+  '/settings/feishu/sync',
+  wrap(async (_req, res) => {
+    const cfg = feishuBotConfig(db().settings);
+    const synced = await syncFeishuBot(cfg);
+    if (synced.syncError) return fail(res, 502, synced.syncError);
+    update((d) => {
+      d.settings.feishuBot = { ...cfg, ...synced };
+    });
+    ok(res, maskSettings(db().settings));
   }),
 );
 
@@ -2794,57 +2899,31 @@ router.post(
   }),
 );
 
-/* ── Hermes Agent Office（局域网智能工位网关）──────────────────────── */
+/* ── 智能办公 · 数据接口的两种前置 ──────────────────────────────────── */
 
 /**
- * 工位/员工在线状态。走 Hermes 的公开接口，不需要凭证；
- * 连不上就 502，由前端决定是显示兜底文案还是整块隐藏。
- */
-router.get(
-  '/hermes/seats',
-  wrap(async (_req, res) => {
-    /* credentials 告诉页面"要不要提示去配 Hermes 口令"：
-       工位状态是免登录的，而待办 / 对话回溯 / 记忆 / 技能都在登录墙后面。
-       把这件事跟着同一个响应带回去，页面就不必再单独问一次。 */
-    ok(res, { ...(await hermesSeats()), credentials: hasHermesCredentials() });
-  }),
-);
-
-/** 测试连接：分「公开接口」与「登录凭证」两层报结果 */
-router.post(
-  '/hermes/test',
-  wrap(async (_req, res) => {
-    const result = await testHermes();
-    if (!result.public.ok) return fail(res, 502, result.public.error, { baseUrl: result.baseUrl });
-    if (result.auth.attempted && !result.auth.ok) {
-      return fail(res, 401, result.auth.error, { baseUrl: result.baseUrl, public: result.public });
-    }
-    ok(res, result);
-  }),
-);
-
-/* ── 智能工位 · 登录墙后面那半 ─────────────────────────────────────── */
-
-/**
- * 需要口令的那几个接口共用的前置。
+ * 网关类接口（会话 / 明细 / 对话）的前置：只认 HERMES_API_KEY。
  *
- * 单独拎出来是因为这几种失败长得完全不一样，页面要分开说：
- * 没配口令是"服务端还没准备好"（503，去改 .env），配错了是"登录失败"
- * （401，口令不对 / 账号被锁），网络不通是 502。糊成一句"读取失败"，
- * 用户只能猜。没配就**当场回**，别等一次注定超时的网络往返。
+ * 没配就当场 503，别等一次注定超时的网络往返；网络不通由服务层给 502 文案。
  */
 function needsHermes(res) {
   if (hasHermesCredentials()) return true;
-  fail(res, 503, '服务端没有配置 Hermes 口令（.env 里的 HERMES_USER / HERMES_PASSWORD），登录墙后面的数据读不到');
+  fail(res, 503, '服务端没有配置 HERMES_API_KEY（.env），读不到 Hermes 网关数据');
+  return false;
+}
+
+/** 本机数据（用量 / 待办 / 配置 / 守望 / 拾贝）只依赖 SSH 数据桥，与网关 Key 无关 */
+function needsLocal(res) {
+  if (isLocalConfigured()) return true;
+  fail(res, 503, '服务端没有配置 HERMES_LOCAL_HOST（.env），读不到 Hermes 本机数据');
   return false;
 }
 
 /**
  * 员工档案 + 工位在线状态。
  *
- * 与 /hermes/seats 的区别：这里把"岗位职责 / 工位号 / 立绘"也带上，
- * 并把立绘换成本服务代理出来的地址。在线与否仍然是那个免登录接口给的，
- * 所以**没配口令也能画出工位**（只是立绘取不到）。
+ * 岗位职责 / 工位号 / 立绘是工作台自己的常量，在线与否由数据桥在本机探活给出；
+ * 立绘已随仓库本地化，不再走登录墙。
  */
 router.get(
   '/office/roster',
@@ -2857,7 +2936,7 @@ router.get(
 router.get(
   '/office/board',
   wrap(async (_req, res) => {
-    if (!needsHermes(res)) return;
+    if (!needsLocal(res)) return;
     ok(res, await officeBoard());
   }),
 );
@@ -2866,7 +2945,7 @@ router.get(
 router.get(
   '/office/usage',
   wrap(async (_req, res) => {
-    if (!needsHermes(res)) return;
+    if (!needsLocal(res)) return;
     ok(res, await officeUsage());
   }),
 );
@@ -2911,7 +2990,7 @@ router.get(
 router.get(
   '/office/seat/:id',
   wrap(async (req, res) => {
-    if (!needsHermes(res)) return;
+    if (!needsLocal(res)) return;
     ok(res, await seatDetail(req.params.id));
   }),
 );
@@ -2920,7 +2999,7 @@ router.get(
 router.get(
   '/office/seat/:id/tab/:tab',
   wrap(async (req, res) => {
-    if (!needsHermes(res)) return;
+    if (!needsLocal(res)) return;
     ok(res, await seatTab(req.params.id, req.params.tab));
   }),
 );
@@ -2929,7 +3008,7 @@ router.get(
 router.get(
   '/office/harvest/history',
   wrap(async (req, res) => {
-    if (!needsHermes(res)) return;
+    if (!needsLocal(res)) return;
     ok(res, await harvestHistory(req.query.limit));
   }),
 );
@@ -2944,8 +3023,9 @@ router.get(
 router.post(
   '/office/harvest',
   wrap(async (req, res) => {
-    if (!needsHermes(res)) return;
-    ok(res, await harvestRun(req.body?.text));
+    if (!needsLocal(res)) return;
+    const { text, clean, deep } = req.body || {};
+    ok(res, await harvestRun(text, { clean: Boolean(clean), deep: Boolean(deep) }));
   }),
 );
 
@@ -2961,7 +3041,7 @@ router.post(
 router.get(
   '/office/security/brief',
   wrap(async (_req, res) => {
-    if (!needsHermes(res)) return;
+    if (!needsLocal(res)) return;
     ok(res, await officeGuardBrief());
   }),
 );
@@ -2973,7 +3053,7 @@ router.get(
 router.get(
   '/office/security/profile',
   wrap(async (req, res) => {
-    if (!needsHermes(res)) return;
+    if (!needsLocal(res)) return;
     ok(res, await securityProfile(req.query.ip));
   }),
 );
@@ -2988,8 +3068,25 @@ router.get(
 router.post(
   '/office/security/decide',
   wrap(async (req, res) => {
-    if (!needsHermes(res)) return;
+    if (!needsLocal(res)) return;
     ok(res, await securityDecide(req.body?.code, req.body?.approve === true));
+  }),
+);
+
+/**
+ * 境外 IP 自动封禁总开关。
+ *
+ * 打开后，值守 agent 开出的封禁单只要目标 IP 归属地在境外（CN/HK/MO/TW 之外）
+ * 就直接执行，不再等人点按钮。归属地查不到的单仍然走人工 —— 宁可多问一句。
+ *
+ * 这是能把「封禁」从人工决策变成自动执行的动作，所以只认显式布尔：
+ * 传缺省 / 字符串 / 其它值一律按「关闭」处理，不做猜测。
+ */
+router.post(
+  '/office/security/auto-ban',
+  wrap(async (req, res) => {
+    if (!needsLocal(res)) return;
+    ok(res, await securityAutoBan(req.body?.enabled === true));
   }),
 );
 
@@ -3025,7 +3122,7 @@ router.get(
  * 由白饭代答 —— 消息里会带上"问的是谁"（见 services/office.js 的 chatBody），
  * 界面上也会标明，不装作在与那个子系统对话。
  *
- * 口令没配时先回一个普通 JSON 错误，**不**开流：一旦发出 200 + text/event-stream，
+ * 没配 HERMES_API_KEY 时先回一个普通 JSON 错误，**不**开流：一旦发出 200 + text/event-stream，
  * 前端就只能看到"流断了"，看不到原因。
  */
 router.post(
@@ -3037,7 +3134,7 @@ router.post(
     try {
       await chatStream(seat, message, (event) => sse.send(event));
     } catch (err) {
-      /* 流已经开着，错误只能从流里出去（登录失败、建会话失败都走这里） */
+      /* 流已经开着，错误只能从流里出去（鉴权失败、建会话失败都走这里） */
       sse.send({ type: 'error', message: err.message });
     } finally {
       sse.close();

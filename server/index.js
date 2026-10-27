@@ -9,12 +9,16 @@ import cron from 'node-cron';
 import { router } from './routes.js';
 import { publicRouter } from './routes-public.js';
 import { authEnabled, currentUser } from './services/auth.js';
-import { initStore, closeStore, db, dbInfo, dbStats, flush } from './store.js';
+import { initStore, closeStore, db, dbInfo, dbStats, flush, persist, update } from './store.js';
+import { migrateFeishuBotFromStars, syncFeishuBot } from './services/feishu-bot.js';
+import { startFeishuApp } from './services/feishu-app.js';
 import { DB_LABEL } from './db/config.js';
 import { refreshNews, newsStale } from './services/news.js';
 import { collectStars, ensureStarsFresh } from './services/github-stars.js';
 import { runDueReminders } from './services/reminders.js';
 import { startSampler, stopSampler } from './services/sampler.js';
+import { warmOfficeData } from './services/office.js';
+import { bridgeCall } from './services/hermes-local.js';
 import { purgeOldKnowledge, purgeOldMonitoringData, purgeOldNews } from './services/retention.js';
 import { applyBackupSchedule } from './services/backup.js';
 import { refreshBackground } from './services/background.js';
@@ -172,14 +176,14 @@ function applyNewsSchedule() {
   console.log(`[news] 已启用自动更新，计划：${expr}`);
 }
 
-/* ── 定时任务：GitHub star，每 12 小时一次 ───────────────────────────
-   12 小时不是拍脑袋的：star 的增长是"天"的量级，采得再勤也只是把同一批
-   数字重复记进历史，画出来的曲线不会更准。定在 0 点与 12 点，和新闻抓取
-   （2 小时一轮）、清理（4:20）都错开。
+/* ── 定时任务：GitHub star，每 6 小时一次 ────────────────────────────
+   定在 0 / 6 / 12 / 18 点。star 的增长是"天"的量级，采得再勤也只是把同一批
+   数字重复记进历史；6 小时是"一天看得见四次"和"别把同一批数记四遍"之间的
+   折中，也和新闻抓取（2 小时一轮）、清理（4:20）都错开。
 
    为什么不放进设置页：这个数是给监控卡片用的固定节奏，不是"用户偏好"。
    做成可配置项反而多一个能被改坏的地方。 */
-const STAR_CRON = '0 */12 * * *';
+const STAR_CRON = '0 */6 * * *';
 let starJob = null;
 
 function applyStarSchedule() {
@@ -190,6 +194,30 @@ function applyStarSchedule() {
       .catch((err) => console.error('[stars] 采集失败：', err.message));
   });
   console.log(`[stars] 已启用定时采集，计划：${STAR_CRON}`);
+}
+
+/* ── 定时任务：AI 用量按天记账 ───────────────────────────────────────
+   桥（server/remote/hwb-bridge.cjs 的 measureUsage）在每次 /local/usage 时
+   对比上次快照，把新增的 token 记到当天 —— Hermes 的 state.db 只有累计值，
+   没有按天的账本，"今日消耗"只能这样采出来。
+
+   所以**必须有人定期调它**：只靠监控页轮询的话，没人看页面那天就不记账，
+   增量会整段攒到下次打开才落账，跨午夜就分不清是哪天的了。
+   15 分钟一次：一次 SSH 往返，成本可以忽略；跨午夜最多偏一个间隔。 */
+const USAGE_SAMPLE_MS = 15 * 60 * 1000;
+let usageSampleTimer = null;
+
+function startUsageSampler() {
+  if (usageSampleTimer) return;
+  const tick = () => {
+    bridgeCall('/local/usage', { cacheTtl: 0, timeout: 20000 }).catch((err) =>
+      console.warn('[usage] 采样失败：', err.message),
+    );
+  };
+  tick(); /* 启动先采一次：建立 / 刷新快照基线 */
+  usageSampleTimer = setInterval(tick, USAGE_SAMPLE_MS);
+  usageSampleTimer.unref?.();
+  console.log(`[usage] 已启用按天记账采样，间隔 ${USAGE_SAMPLE_MS / 60000} 分钟`);
 }
 
 /* ── 定时任务：清理过期数据 ─────────────────────────────────────────
@@ -257,6 +285,34 @@ function applyRetentionSchedule() {
 /* ── 启动 ─────────────────────────────────────────────────────────── */
 async function bootstrap() {
   const { seeded, source } = await initStore();
+  /* 老库里 webhook 停在「GitHub Star 监控」那一栏，新的「飞书机器人」还是空的：
+     启动时搬一次，避免同一串地址要人抄两遍 */
+  if (migrateFeishuBotFromStars(db().settings)) {
+    persist();
+    console.log('  飞书机器人 已接管「GitHub Star 监控」里的原有配置');
+  }
+  /* 应用机器人的长连接：@ 机器人有反应、卡片按钮能点，靠的都是它。
+     配置不齐就什么都不做；连不上只记状态（设置页能看到原因），不挡启动 */
+  startFeishuApp(db().settings);
+
+  /* 助手机上的配置以面板为唯一真源，启动时推一次 ——
+     否则"面板里改了、忘了点重新同步"就会让助手机一直拿着旧地址。
+     推不动不挡启动：本地这份仍然有效，只是助手机那边还拿着旧的 */
+  if (db().settings.feishuBot) {
+    syncFeishuBot(db().settings.feishuBot)
+      .then((synced) => {
+        if (synced.syncError) {
+          console.warn('[feishu-bot] 启动同步到助手机失败：', synced.syncError);
+          return;
+        }
+        update((d) => {
+          d.settings.feishuBot = { ...d.settings.feishuBot, ...synced };
+        });
+        persist();
+        console.log('  飞书机器人 已把配置同步到助手机');
+      })
+      .catch((err) => console.warn('[feishu-bot] 启动同步失败：', err.message));
+  }
   // 背景图状态存在磁盘上、缓存在内存里，必须先灌一次，
   // 否则第一个 /api/settings 会误报「没上传过图」
   await refreshBackground();
@@ -291,7 +347,7 @@ async function bootstrap() {
     applyReminderSchedule();
 
     /* 停机期间错过的 star 采集，起来就补一次。不补的话卡片的空窗期不是
-       12 小时，而是"从上次跑到下一个整点" —— 部署当天可能一整天都是空的 */
+       6 小时，而是"从上次跑到下一个整点" —— 部署当天可能一整天都是空的 */
     ensureStarsFresh()
       .then((s) => {
         if (s) console.log(`[stars] 启动补采完成：${s.stars} 个 star（本次 +${s.delta || 0}）`);
@@ -299,6 +355,25 @@ async function bootstrap() {
       .catch((err) => console.warn('[stars] 启动补采失败：', err.message));
     // 用电量由实测功率积分而来，必须常驻采样：只靠前端轮询，页面一关就断档
     startSampler();
+    // AI 用量同理：桥要靠"被调用"才会把增量记到当天
+    startUsageSampler();
+
+    /* 智能办公首屏预热：工位 / 待办 / 用量 / 守望摘要先拉进内存缓存，
+       用户第一次点开就不用为 SSH 冷启动买单。失败只记日志，不影响启动 */
+    const officeWarmAt = Date.now();
+    const warmOnce = () => warmOfficeData().then((rs) => {
+      const failed = rs.filter((r) => !r.ok);
+      if (!failed.length) {
+        console.log(`[office] 首屏预热完成 ${Date.now() - officeWarmAt}ms`);
+        return true;
+      }
+      console.warn('[office] 预热部分失败：', failed.map((r) => `${r.name}: ${r.error}`).join(' / '));
+      return false;
+    });
+    warmOnce()
+      /* 启动瞬间网关/数据桥偶发抖动很常见，5 秒后补一次，避免首屏一直冷着 */
+      .then((allOk) => { if (!allOk) setTimeout(() => warmOnce().catch(() => {}), 5000); })
+      .catch((err) => console.warn('[office] 预热失败：', err.message));
 
     // 启动时先清一次：服务停了很久再起来、或者跨了月，
     // 过期的明细不用等到凌晨才被收走

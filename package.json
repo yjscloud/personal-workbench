@@ -48,9 +48,11 @@
     "db:init": "mysql -uroot -p < server/db/bootstrap.sql",
     "db:migrate": "node server/db/migrate.js",
     "hermes:probe": "node server/tools/hermes-probe.js",
-    "auth:reset": "node server/tools/auth-reset.js"
+    "auth:reset": "node server/tools/auth-reset.js",
+    "bridge:deploy": "bash scripts/deploy-bridge.sh"
   },
   "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.76.0",
     "@mixmark-io/domino": "^2.2.0",
     "cors": "^2.8.5",
     "d3-force": "^3.0.0",

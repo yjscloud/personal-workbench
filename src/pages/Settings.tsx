@@ -69,6 +69,12 @@ export default function Settings() {
   const [newSecretKey, setNewSecretKey] = useState('');
   const [newFeishuSecret, setNewFeishuSecret] = useState('');
   const [starsTest, setStarsTest] = useState<{ ok: boolean; text: string } | null>(null);
+  /* 飞书机器人的签名密钥同样单独一个状态：草稿里那位是服务端回的掩码，
+     绑到输入框上保存就会把掩码当成新密钥写回去 */
+  const [newBotSecret, setNewBotSecret] = useState('');
+  /* 应用机器人的 App Secret 同样不绑草稿：草稿里那位是掩码 */
+  const [newBotAppSecret, setNewBotAppSecret] = useState('');
+  const [botTest, setBotTest] = useState<{ ok: boolean; text: string } | null>(null);
   const [backupBusy, setBackupBusy] = useState<'run' | 'test' | 'list' | 'restore' | null>(null);
   const [backupResult, setBackupResult] = useState<{ ok: boolean; text: string } | null>(null);
   /* 云上那份清单。不自动拉：打开这一页多数时候只是看看状态，
@@ -128,6 +134,8 @@ export default function Settings() {
   const patchPve = (next: Partial<SettingsShape['pve']>) => setDraft((prev) => (prev ? { ...prev, pve: { ...prev.pve, ...next } } : prev));
   const patchStars = (next: Partial<SettingsShape['stars']>) =>
     setDraft((prev) => (prev ? { ...prev, stars: { ...prev.stars, ...next } } : prev));
+  const patchBot = (next: Partial<SettingsShape['feishuBot']>) =>
+    setDraft((prev) => (prev ? { ...prev, feishuBot: { ...(prev.feishuBot ?? ({} as SettingsShape['feishuBot'])), ...next } } : prev));
   const patchHa = (next: Partial<SettingsShape['ha']>) => setDraft((prev) => (prev ? { ...prev, ha: { ...prev.ha, ...next } } : prev));
   const patchAihot = (next: Partial<SettingsShape['news']['aihot']>) =>
     setDraft((prev) => (prev ? { ...prev, news: { ...prev.news, aihot: { ...prev.news.aihot, ...next } } } : prev));
@@ -332,6 +340,108 @@ export default function Settings() {
       setStarsTest({ ok: true, text: '测试通知已发出，去飞书群里看一眼' });
     } catch (err) {
       setStarsTest({ ok: false, text: err instanceof Error ? err.message : '发送失败' });
+    }
+  }
+
+  /* ── 飞书机器人（全站通知出口）──────────────────────────────────────
+     地址明文编辑：要能核对是哪个群，清空就是停发。签名密钥单独一个状态，
+     空 = 不改动 —— 与 PVE 令牌同一套理由（草稿里那位是掩码）。
+     保存时服务端会把配置推给助手机，脚本读的是推过去的那份，所以这一栏
+     存下去就等于"助手机那边也换了"；推不动会在 syncedAt/syncError 里体现。 */
+  const botCfg = current.feishuBot ?? {
+    enabled: true,
+    webhookUrl: '',
+    secret: '',
+    appId: '',
+    appSecret: '',
+    chatId: '',
+    notifyBan: true,
+    notifyOps: true,
+    syncedAt: null,
+    syncError: null,
+  };
+  /* 通道是否齐全以服务端为准（它知道库里到底存了什么）；草稿上没有这个字段时
+     按当前表单内容退一步算，至少按钮不会一直灰着 */
+  const botChannels = botCfg.channels ?? {
+    hasWebhook: Boolean(botCfg.webhookUrl?.trim()),
+    hasApp: Boolean(botCfg.appId?.trim() && botCfg.chatId?.trim() && (botCfg.hasAppSecret || botCfg.appSecret)),
+  };
+  const botDirty = dirtyOf('feishuBot') || Boolean(newBotSecret) || Boolean(newBotAppSecret);
+  /* 测试按钮能不能点看"表单里凑齐了没有"（点了会先保存再发），
+     服务端仍会再校验一遍 —— 这里的判断只为了别让人对着灰按钮猜 */
+  const webhookReady = Boolean(botCfg.webhookUrl?.trim()) || Boolean(botCfg.hasEnvFallback);
+  const appReady = Boolean(
+    botCfg.appId?.trim() && botCfg.chatId?.trim() && (newBotAppSecret || botCfg.hasAppSecret),
+  );
+  /* 长连接的实话：@ 机器人没反应时先看这一行，别反复重填 App ID */
+  const appLink = botCfg.appStatus;
+  const appLinkTone =
+    appLink?.status === 'connected' ? 'ok' : appLink?.status === 'failed' ? 'crit' : 'warn';
+  const appLinkText = (() => {
+    switch (appLink?.status) {
+      case 'connected':
+        return '长连接已建立，@ 机器人能收到并回复';
+      case 'connecting':
+        return '正在建立长连接…';
+      case 'reconnecting':
+        return '长连接断开，正在重连…';
+      case 'failed':
+        return `长连接失败：${appLink.error || '未知原因'}`;
+      case 'unconfigured':
+        return '还没有 App ID / App Secret，收不到 @ 消息';
+      case 'disabled':
+        return '机器人总开关已关，长连接未启动';
+      default:
+        return '长连接未启动';
+    }
+  })();
+
+  async function saveBot() {
+    const body: Partial<SettingsShape['feishuBot']> = {
+      enabled: botCfg.enabled,
+      webhookUrl: botCfg.webhookUrl,
+      notifyBan: botCfg.notifyBan,
+      notifyOps: botCfg.notifyOps,
+      appId: botCfg.appId,
+      chatId: botCfg.chatId,
+    };
+    if (newBotSecret) body.secret = newBotSecret;
+    if (newBotAppSecret) body.appSecret = newBotAppSecret;
+    /* hasSecret / hasAppSecret / channels / syncedAt / syncError 是服务端推导的派生态，不回传 */
+    const next = await saveSection('feishuBot', { feishuBot: body } as Partial<SettingsShape>);
+    if (!next) return null;
+    setNewBotSecret('');
+    setNewBotAppSecret('');
+    /* 掩码、hasSecret、同步结果都跟着服务端走，否则脏检测永远停在「未保存」 */
+    setDraft((prev) => (prev ? { ...prev, feishuBot: next.feishuBot } : prev));
+    return next;
+  }
+
+  async function testBot(channel: 'webhook' | 'app') {
+    const label = channel === 'app' ? '应用机器人' : '自定义机器人';
+    setBotTest({ ok: true, text: `正通过${label}发送…` });
+    /* 先存再测：测的必须是保存之后真正会用的那份配置 */
+    const saved = await saveBot();
+    if (!saved) {
+      setBotTest({ ok: false, text: '保存失败，没有测试' });
+      return;
+    }
+    try {
+      await api.settings.testFeishuBot(channel);
+      setBotTest({ ok: true, text: `测试卡已由${label}发出，去群里看一眼` });
+    } catch (err) {
+      setBotTest({ ok: false, text: err instanceof Error ? err.message : '发送失败' });
+    }
+  }
+
+  async function resyncBot() {
+    setBotTest({ ok: true, text: '正在推送到助手机…' });
+    try {
+      const next = await api.settings.syncFeishuBot();
+      setDraft((prev) => (prev ? { ...prev, feishuBot: next.feishuBot } : prev));
+      setBotTest({ ok: true, text: '已同步到助手机' });
+    } catch (err) {
+      setBotTest({ ok: false, text: err instanceof Error ? err.message : '同步失败' });
     }
   }
 
@@ -1105,7 +1215,7 @@ export default function Settings() {
         <CardHead
           level={2}
           title="GitHub Star 监控"
-          hint="监控页那张卡片的数据源：每 12 小时采一次 star 数，有新增时发一条飞书通知"
+          hint="监控页那张卡片的数据源：每 6 小时采一次 star 数，有新增时发一条飞书通知"
           right={
             starsCfg.feishuUrl ? (
               <Badge tone="ok" dot>
@@ -1165,9 +1275,187 @@ export default function Settings() {
               {starsTest.text}
             </span>
           ) : (
-            <span className="text-2xs text-faint">换仓库保存后会立刻采一次，之后每 12 小时一次</span>
+            <span className="text-2xs text-faint">换仓库保存后会立刻采一次，之后每 6 小时一次</span>
           )}
           <SaveAction className="ml-auto" dirty={starsDirty} busy={savingSection === 'stars'} onSave={() => void saveStars()} />
+        </div>
+      </Card>
+
+      {/* 飞书机器人：全站通知出口 */}
+      <Card>
+        <CardHead
+          level={2}
+          title="飞书机器人"
+          hint="全站通知出口。面板自己的提醒、助手机上的自动封禁与值守报告，都从这一个机器人发出"
+          right={
+            !botChannels.hasWebhook && !botChannels.hasApp ? (
+              botCfg.hasEnvFallback ? (
+                <Badge tone="neutral" dot>
+                  沿用 .env
+                </Badge>
+              ) : (
+                <Badge tone="warn" dot>
+                  未配置
+                </Badge>
+              )
+            ) : botCfg.enabled ? (
+              <Badge tone="ok" dot>
+                已启用
+              </Badge>
+            ) : (
+              <Badge tone="neutral" dot>
+                已暂停
+              </Badge>
+            )
+          }
+        />
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field
+            label="Webhook 地址"
+            hint={
+              botCfg.webhookUrl
+                ? '清空并保存即停止所有通知'
+                : botCfg.hasEnvFallback
+                  ? '现在沿用环境变量里的地址；填到这里即可接管'
+                  : '飞书群 → 设置 → 群机器人 → 自定义机器人'
+            }
+          >
+            <Input
+              value={botCfg.webhookUrl}
+              onChange={(e) => patchBot({ webhookUrl: e.target.value })}
+              placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </Field>
+          <Field
+            label="签名密钥（可选）"
+            hint={botCfg.hasSecret ? '已保存，留空表示不修改' : '机器人开了「签名校验」时才需要'}
+          >
+            <Input
+              type="password"
+              value={newBotSecret}
+              onChange={(e) => setNewBotSecret(e.target.value)}
+              placeholder={botCfg.hasSecret ? '••••••••' : '留空即可'}
+              autoComplete="off"
+            />
+          </Field>
+        </div>
+
+        <div className="mt-4 border-t border-line pt-3.5">
+          <div className="mb-2 flex flex-wrap items-baseline gap-x-2 gap-y-1">
+            <h3 className="text-xs font-semibold text-ink">应用机器人（审批卡回调）</h3>
+            <span className="text-2xs text-faint">
+              审批卡的「批准 / 拒绝」按钮只有这条通道收得到回调；要发得出去，下面三项必须齐全
+            </span>
+          </div>
+          {/* 收消息靠长连接，不是 webhook。这一行直接回答"@ 了为什么没反应" */}
+          <p className="mb-2 flex items-center gap-1.5 text-2xs text-muted">
+            <Led tone={appLinkTone} pulse={appLink?.status === 'connecting'} />
+            {appLinkText}
+          </p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field label="App ID" hint="飞书开放平台 → 凭证与基础信息，cli_ 开头">
+              <Input
+                value={botCfg.appId}
+                onChange={(e) => patchBot({ appId: e.target.value })}
+                placeholder="cli_xxxxxxxxxxxx"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </Field>
+            <Field label="群 chat_id" hint="oc_ 开头。群里 @机器人 发一条消息，用接口查回来的那个 id">
+              <Input
+                value={botCfg.chatId}
+                onChange={(e) => patchBot({ chatId: e.target.value })}
+                placeholder="oc_xxxxxxxxxxxx"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </Field>
+          </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <Field
+              label="App Secret"
+              hint={botCfg.hasAppSecret ? '已保存，留空表示不修改' : '只在服务端换 tenant_access_token 时用'}
+            >
+              <Input
+                type="password"
+                value={newBotAppSecret}
+                onChange={(e) => setNewBotAppSecret(e.target.value)}
+                placeholder={botCfg.hasAppSecret ? '••••••••' : '留空即可'}
+                autoComplete="off"
+              />
+            </Field>
+            <div className="flex items-end pb-1.5">
+              <p className="text-2xs leading-relaxed text-faint">
+                两条通道可以同时填、也可以只填一条：自定义机器人只出不进，审批卡必须走应用机器人。
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {/* Toggle 只把 label 用在 aria-label 上，不画文字 —— 裸着排三个开关，
+            界面上就是三颗没有说明的胶囊。这里各配一行可见文案，
+            与 PVE / HA 那两处"开关 + 文字"的写法保持一致 */}
+        <div className="mt-3 flex flex-wrap items-center gap-x-6 gap-y-2.5">
+          <label className="flex items-center gap-2.5 text-xs text-muted">
+            <Toggle checked={botCfg.enabled} onChange={(v) => patchBot({ enabled: v })} label="启用机器人" />
+            启用机器人
+          </label>
+          <label className="flex items-center gap-2.5 text-xs text-muted">
+            <Toggle checked={botCfg.notifyBan} onChange={(v) => patchBot({ notifyBan: v })} label="自动封禁通知" />
+            自动封禁通知
+          </label>
+          <label className="flex items-center gap-2.5 text-xs text-muted">
+            <Toggle checked={botCfg.notifyOps} onChange={(v) => patchBot({ notifyOps: v })} label="值守报告" />
+            值守报告
+          </label>
+        </div>
+
+        <p className="mt-2 text-2xs leading-relaxed text-faint">
+          保存时会把配置推给助手机，脚本读的就是推过去的那份 —— 所以不必再去改
+          <code className="mx-1 rounded bg-panel-2 px-1 py-0.5">.env</code>
+          。两个开关分开是因为「有人正在爆破」和「例行巡检报告」的紧急程度不一样。
+        </p>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-line pt-3.5">
+          <Button
+            size="sm"
+            variant="soft"
+            onClick={() => void testBot('webhook')}
+            disabled={savingSection === 'feishuBot' || !webhookReady}
+          >
+            <Send size={13} aria-hidden />
+            测自定义机器人
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => void testBot('app')}
+            disabled={savingSection === 'feishuBot' || !appReady}
+          >
+            <Send size={13} aria-hidden />
+            测应用机器人
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => void resyncBot()} disabled={savingSection === 'feishuBot'}>
+            <RefreshCcw size={13} aria-hidden />
+            重新同步到助手机
+          </Button>
+          {botTest ? (
+            <span className={cls('flex items-center gap-1.5 text-2xs', botTest.ok ? 'text-ok' : 'text-crit')}>
+              <Led tone={botTest.ok ? 'ok' : 'crit'} />
+              {botTest.text}
+            </span>
+          ) : botCfg.syncError ? (
+            <span className="text-2xs text-crit">同步失败：{botCfg.syncError}</span>
+          ) : botCfg.syncedAt ? (
+            <span className="text-2xs text-faint">上次同步 {fmtRelative(botCfg.syncedAt)}</span>
+          ) : (
+            <span className="text-2xs text-faint">测试用的是保存后的配置</span>
+          )}
+          <SaveAction className="ml-auto" dirty={botDirty} busy={savingSection === 'feishuBot'} onSave={() => void saveBot()} />
         </div>
       </Card>
 
