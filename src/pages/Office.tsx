@@ -4,10 +4,8 @@ import {
   ArrowLeft,
   ArrowRight,
   Bot,
-  ExternalLink,
   GripVertical,
   LayoutGrid,
-  Link2,
   RefreshCw,
   RotateCcw,
   Users,
@@ -23,7 +21,7 @@ import {
 } from '@/lib/api';
 import { useStore } from '@/lib/store';
 import { cls } from '@/lib/format';
-import { Button, buttonClass, Card, Empty, Input, Led, PageHead, Skeleton, Spinner } from '@/components/ui';
+import { Button, Card, Empty, Led, PageHead, Skeleton, Spinner } from '@/components/ui';
 import { Stat } from '@/components/bits';
 import { BoardPanel, EmployeeDesk, FacilitiesPanel, SessionsPanel, StarPanel, TokenPanel, VacantDesk } from '@/components/office';
 import { SeatModal, SessionModal } from '@/components/seat-detail';
@@ -141,10 +139,10 @@ const sameLayout = (a: PanelLayout, b: PanelLayout) =>
  * 空出一大片。改成滚到哪儿都钉在右上 —— 往下读工位墙与明细时，用量与待办
  * 一直在视野里，那块空白也就不再是"缺了一块"，而是有用的常驻。
  *
- * 数据来源分两类：工位状态（含在线标记）走免登录接口，立绘与其余三块都在
- * 登录墙后面（服务端用自己的会话代取，见 services/office.js）。所以它们
- * **分开加载、各自报错**：口令没配时工位照样画得出来，只是立绘与那几块会
- * 说明原因 —— 而不是整页变黑，让人以为连工位都挂了。
+ * 数据来源分两类：工位状态（含在线标记）与立绘走本机数据；其余三块走网关
+ * 与数据桥（见 services/office.js）。所以它们**分开加载、各自报错**：
+ * 没配网关 Key 时工位照样画得出来，只是另外几块会说明原因 ——
+ * 而不是整页变黑，让人以为连工位都挂了。
  *
  * ── 刷新 ──────────────────────────────────────────────────────────────
  * 工位状态是网关周期性探测的结果（`checkedAt` 就是它那一刻），跟着全站的
@@ -170,12 +168,6 @@ export default function Office() {
   /** 点开的是哪位员工的详情（弹窗里带页签：配置文档 / 技能 / 进化档案 / 记录 / 即时交互） */
   const [detailWith, setDetailWith] = useState<OfficeEmployee | null>(null);
   const [viewSession, setViewSession] = useState<OfficeSession | null>(null);
-
-  /** 「打开完整办公室」跳去哪。留空 = 用服务端 .env 那份 */
-  const savedOfficeUrl = settings?.hermes?.officeUrl?.trim() || '';
-  const officeUrl = savedOfficeUrl || roster?.baseUrl || '';
-  const [editingUrl, setEditingUrl] = useState(false);
-  const [urlDraft, setUrlDraft] = useState('');
 
   /* ── 面板摆放（可拖拽换位置、可跨栏） ──────────────────────────────── */
   /**
@@ -215,15 +207,19 @@ export default function Office() {
 
   async function refresh(manual = false) {
     if (manual) setBusy(true);
-    /* allSettled 而不是 all：四路互相独立，一路失败不该让另外三路的结果丢掉 */
-    const [rosterRes, boardRes, usageRes, sessionsRes, guardRes] = await Promise.allSettled([
+    /* allSettled 而不是 all：四路互相独立，一路失败不该让另外三路的结果丢掉。
+       守望摘要单独发：它要给 Python 采集库做聚合，比另外四路慢一个量级，
+       不该把整页的首屏压在它身上（到了再补画卡片上的两个数）。 */
+    const [rosterRes, boardRes, usageRes, sessionsRes] = await Promise.allSettled([
       api.office.roster(),
       api.office.board(),
       api.office.usage(),
       api.office.sessions(20),
-      /* 边界守望摘要：只给工位卡片上那两个数，读不到就当没有（不单独报错） */
-      api.office.guardBrief(),
     ]);
+    api.office
+      .guardBrief()
+      .then((g) => setGuard(g))
+      .catch(() => { /* 守望摘要读不到就当没有，不单独报错 */ });
 
     if (rosterRes.status === 'fulfilled') {
       setRoster(rosterRes.value);
@@ -234,7 +230,6 @@ export default function Office() {
     if (boardRes.status === 'fulfilled') setBoard(boardRes.value);
     if (usageRes.status === 'fulfilled') setUsage(usageRes.value);
     if (sessionsRes.status === 'fulfilled') setSessions(sessionsRes.value.data);
-    if (guardRes.status === 'fulfilled') setGuard(guardRes.value);
     setBoardError(reason(boardRes, '读取待办工作表失败'));
     setUsageError(reason(usageRes, '读取用量失败'));
     setSessionsError(reason(sessionsRes, '读取对话明细失败'));
@@ -347,17 +342,6 @@ export default function Office() {
   const emptySeats = Math.max(0, vacant ?? (seats != null && staffed != null ? seats - staffed : 0));
   const onlineRatio = staffed ? (online ?? 0) / staffed : 0;
 
-  const openOffice = () => {
-    if (officeUrl) window.open(officeUrl, '_blank', 'noopener,noreferrer');
-  };
-
-  /* 存完就收起：存失败时 saveSettings 会自己弹错误并返回 null，这里不关，
-     让用户能接着改（地址校验是服务端做的，前端不重复一遍规则） */
-  async function saveOfficeUrl(next: string) {
-    const saved = await saveSettings({ hermes: { officeUrl: next.trim() } });
-    if (saved) setEditingUrl(false);
-  }
-
   /** 换完摆放：先动界面，再落库。落库失败 saveSettings 自己会弹错误，界面退回原样 */
   async function persistLayout(next: PanelLayout) {
     setOptimistic(next);
@@ -439,8 +423,8 @@ export default function Office() {
 
         {!roster?.credentials ? (
           <p className="mt-3 text-2xs leading-relaxed text-faint">
-            服务端还没配 Hermes 口令（.env 里的 HERMES_USER / HERMES_PASSWORD），所以立绘取不到、
-            明细、待办与用量也读不了 —— 工位状态是免登录的，不受影响。
+            服务端还没配 HERMES_API_KEY（.env），网关的会话、对话与任务读不到；
+            用量、待办、配置等本机数据走 SSH 数据桥，需要 HERMES_LOCAL_HOST 可达。
           </p>
         ) : null}
       </Card>
@@ -621,69 +605,9 @@ export default function Office() {
               {busy ? <Spinner /> : <RefreshCw size={13} />}
               {busy ? '刷新中…' : '刷新'}
             </Button>
-            {officeUrl ? (
-              <>
-                {/* 这一格的地址可以自己改见下面的编辑条：同一台机器在内网里
-                    常有多个入口（IP / 主机名 / 反代域名），默认那个未必顺手 */}
-                <Button
-                  variant="soft"
-                  size="sm"
-                  onClick={() => {
-                    setUrlDraft(savedOfficeUrl);
-                    setEditingUrl((v) => !v);
-                  }}
-                  title={savedOfficeUrl ? `自定义地址：${savedOfficeUrl}` : '自定义「打开完整办公室」的地址'}
-                  aria-expanded={editingUrl}
-                >
-                  <Link2 size={13} aria-hidden />
-                  链接
-                </Button>
-                <a href={officeUrl} target="_blank" rel="noreferrer noopener" className={buttonClass('primary', 'sm')}>
-                  <ExternalLink size={13} aria-hidden />
-                  打开完整办公室
-                </a>
-              </>
-            ) : null}
           </>
         }
       />
-
-      {/* 自定义地址条。收起时不占版面；展开时把当前值填进去，
-          占位符就是服务端那份默认地址，空着保存即"回到默认" */}
-      {editingUrl ? (
-        <div className="flex flex-wrap items-center gap-2 rounded-xl2 border border-line bg-panel px-3 py-2.5">
-          <label htmlFor="office-url" className="text-2xs text-muted">
-            完整办公室地址
-          </label>
-          <Input
-            id="office-url"
-            value={urlDraft}
-            onChange={(e) => setUrlDraft(e.target.value)}
-            placeholder={roster?.baseUrl || 'http://…'}
-            spellCheck={false}
-            className="min-w-[14rem] flex-1"
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') void saveOfficeUrl(urlDraft);
-              if (e.key === 'Escape') setEditingUrl(false);
-            }}
-          />
-          <Button size="sm" onClick={() => void saveOfficeUrl(urlDraft)}>
-            保存
-          </Button>
-          <Button
-            variant="soft"
-            size="sm"
-            disabled={!savedOfficeUrl}
-            title="改回服务端 .env 里配置的地址"
-            onClick={() => void saveOfficeUrl('')}
-          >
-            恢复默认
-          </Button>
-          <Button variant="ghost" size="sm" onClick={() => setEditingUrl(false)}>
-            取消
-          </Button>
-        </div>
-      ) : null}
 
       {/* 编辑提示。移动结果也报在这里：键盘挪完没有"落点高亮"这个视觉回执 */}
       {editingLayout ? (
@@ -703,7 +627,7 @@ export default function Office() {
         <Card>
           <Empty
             title="连不上 Hermes 网关"
-            hint={`${error}。地址在服务端 .env 的 HERMES_BASE_URL 里；那台机器关机、或地址变了都会走到这里。`}
+            hint={`${error}。网关地址在 .env 的 HERMES_API_BASE_URL，本机数据在 HERMES_LOCAL_HOST；那台机器关机或地址变了都会走到这里。`}
             action={
               <Button size="sm" onClick={() => void refresh(true)}>
                 重试
@@ -787,7 +711,7 @@ export default function Office() {
       )}
 
       {/* 弹窗放在最后一层：它们自己是 fixed 定位，与上面的布局无关 */}
-      <SeatModal employee={detailWith} onClose={() => setDetailWith(null)} onOpenOffice={openOffice} />
+      <SeatModal employee={detailWith} onClose={() => setDetailWith(null)} />
       <SessionModal session={viewSession} onClose={() => setViewSession(null)} />
     </div>
   );

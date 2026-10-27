@@ -1,46 +1,22 @@
 import 'dotenv/config';
-import { hermesSeats, authedRequest, hermesConfig } from '../services/hermes.js';
+import { hermesApi, hermesConfig } from '../services/hermes.js';
+import { testLocalBridge, bridgeCall } from '../services/hermes-local.js';
+import { localConfig } from '../services/hermes-config.js';
 
 /* ────────────────────────────────────────────────────────────────────────
- * Hermes 接口清单探测器
+ * Hermes 连接探测器
  *
- *   填好 .env 里的 HERMES_USER / HERMES_PASSWORD 后执行：
- *     npm run hermes:probe
- *   也可以指定路径（会覆盖内置的候选列表）：
- *     npm run hermes:probe -- /api/foo /api/bar
+ *   npm run hermes:probe            探两条通道 + 内置接口清单
+ *   npm run hermes:probe -- /api/xxx  额外探指定的网关 GET 路径
  *
- * 作用：Hermes 在未登录状态下对所有路径统一返回 401，探测不到任何接口；
- * 登录后用一组候选路径去试，把返回 200 的路径与字段列出来，
- * 这就是把 Hermes 接进 AI 助手的「接口清单」。
- *
- * 只发 GET，不改动任何数据。
+ * 只发 GET / 只读数据桥，不改动任何数据。
  * ──────────────────────────────────────────────────────────────────────── */
 
 const CANDIDATES = [
-  '/auth/session',
-  '/api/agents',
-  '/api/seats',
-  '/api/office',
-  '/api/overview',
-  '/api/status',
-  '/api/gateway',
-  '/api/gateway/status',
-  '/api/tasks',
-  '/api/events',
-  '/api/logs',
-  '/api/conversations',
-  '/api/messages',
-  '/api/tools',
-  '/api/mcp',
-  '/api/mcp/servers',
-  '/api/skills',
-  '/api/models',
-  '/api/config',
-  '/api/settings',
-  '/api/user',
-  '/api/version',
   '/v1/models',
-  '/openapi.json',
+  '/v1/toolsets',
+  '/api/sessions?limit=1',
+  '/api/jobs',
 ];
 
 const flat = (s) => String(s).replace(/\s+/g, ' ').trim();
@@ -56,7 +32,6 @@ const toJson = (s) => {
   }
 };
 
-/** 只看字段结构，不把整份业务数据刷出来 */
 function shape(text) {
   const d = toJson(text);
   if (Array.isArray(d)) {
@@ -70,51 +45,53 @@ function shape(text) {
 
 async function main() {
   const cfg = hermesConfig();
+  const local = localConfig();
   const extra = process.argv.slice(2);
-  const targets = extra.length ? extra : CANDIDATES;
 
-  console.log(`目标 ${cfg.baseUrl}｜凭证 ${cfg.user ? `已配置 ${cfg.user}` : '未配置'}`);
+  console.log(`网关 ${cfg.baseUrl}｜API Key ${cfg.apiKey ? '已配置' : '未配置'}`);
+  console.log(`数据桥 ${local.host || '(未配置)'}｜${local.bridgePath}｜缓存 ${local.cacheTtl}ms\n`);
 
+  let gatewayOk = false;
   try {
-    const seats = await hermesSeats();
-    console.log(`公开接口 /public/agents：通，网关 v${seats.gatewayVersion || '?'}，${seats.seats} 工位 / ${seats.staffed} 在编 / ${seats.online} 在线`);
+    const models = await hermesApi('/v1/models', { timeout: 8000 });
+    const ids = (models?.data || []).map((m) => m.id).filter(Boolean);
+    console.log(`网关：通，模型 ${ids.join('、') || '(无)'}`);
+    gatewayOk = true;
   } catch (err) {
-    console.log(`公开接口 /public/agents：失败 — ${err.message}`);
-    return;
+    console.log(`网关：失败 — ${err.message}`);
   }
 
-  if (!cfg.user || !cfg.password) {
-    console.log('\n没有 HERMES_USER / HERMES_PASSWORD，登录后的接口无法枚举。\n把它填进 .env（重启服务不是必需的，本脚本自己读 .env）再跑一次。');
-    return;
-  }
-
-  let res;
-  try {
-    res = await authedRequest('/auth/session', { timeout: 8000 });
-  } catch (err) {
-    console.log(`\n登录失败：${err.message}\n注意 Hermes 会限制连续失败次数，确认口令正确后再试。`);
-    return;
-  }
-  const data = toJson(res.text);
-  if (!data?.ok) {
-    console.log(`\n登录没成（HTTP ${res.status}）：${sample(res.text)}`);
-    return;
-  }
-  console.log(`\n已登录 user=${data.user || cfg.user}，开始枚举候选路径：\n`);
-
-  for (const path of targets) {
-    let r;
-    try {
-      r = await authedRequest(path, { timeout: 6000 });
-    } catch (err) {
-      console.log(`  ERR  GET ${path} — ${err.message}`);
-      continue;
+  if (gatewayOk) {
+    const targets = [...new Set([...CANDIDATES, ...extra])];
+    for (const path of targets) {
+      try {
+        const r = await hermesApi(path, { timeout: 12000 });
+        console.log(`  200  GET ${path}  ${shape(JSON.stringify(r))}`);
+      } catch (err) {
+        console.log(`  ERR  GET ${path}  ${err.message}`);
+      }
     }
-    console.log(r.status === 200 ? `  ${String(r.status).padEnd(4)}GET ${path}  ${shape(r.text)}` : `  ${String(r.status).padEnd(4)}GET ${path}`);
   }
 
-  console.log('\n把返回 200 的路径和字段贴出来，就可以据此把它们接进 assistant.js 了。');
-  console.log('没列到的路径也可以追加，例如：npm run hermes:probe -- /api/xxx /api/yyy');
+  const ping = await testLocalBridge();
+  if (!ping.ok) {
+    console.log(`\n数据桥：失败 — ${ping.error}`);
+    return;
+  }
+  console.log(`\n数据桥：通（Node ${ping.node}，${ping.elapsedMs}ms）`);
+  console.log(`  Hermes 安装 ${ping.install_dir}`);
+  console.log(`  HERMES_HOME ${ping.hermes_home}`);
+  console.log(`  数据目录 ${ping.data_dir}`);
+  console.log(`  网关凭证 ${ping.key_configured ? `已读取（${ping.key_source}）` : '未找到'}`);
+  console.log(`  抓取脚本 ${ping.scrape_script ? '在位' : '缺失'}`);
+
+  try {
+    const agents = await bridgeCall('/public/agents', { timeout: 20000, cacheTtl: 0 });
+    console.log(`  工位 ${agents.seats} / 在编 ${agents.staffed} / 在线 ${agents.online}`);
+    for (const a of agents.items || []) console.log(`    ${a.online ? '●' : '○'} ${a.name}（${a.id}）`);
+  } catch (err) {
+    console.log(`  工位状态：失败 — ${err.message}`);
+  }
 }
 
 main().catch((err) => {

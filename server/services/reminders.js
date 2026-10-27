@@ -1,6 +1,6 @@
 import { db } from '../store.js';
 import { markReminder } from '../db/reminders.js';
-import { feishuConfigured, notifyFeishu } from './feishu.js';
+import { notifyPanelNotice, panelNotifyReady } from './feishu-bot.js';
 import { isEmail, mailConfigured, sendMail } from './mail.js';
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -119,14 +119,21 @@ export async function runDueReminders({ now = new Date(), force = false } = {}) 
 
   /* 飞书：一条汇总，而不是一条任务一条消息 —— 群里刷屏比不提醒更烦 */
   let feishu = false;
-  if (feishuConfigured()) {
+  if (panelNotifyReady()) {
     const lines = due
       .slice(0, 12)
       .map((d) => `${d.label}｜${d.ticket.id} ${d.ticket.title}${d.ticket.project ? `（${d.ticket.project}）` : ''}`);
     if (due.length > lines.length) lines.push(`…另有 ${due.length - lines.length} 条`);
-    const text = [`【任务到期提醒】${due.length} 条未完成`, ...lines, `检查时间 ${now.toLocaleString('zh-CN')}`].join('\n');
+    /* 统一卡片格式：标题、正文、来源时间各归各位。
+       逾期未处理的用红，其余橙 —— 群里一眼能分出轻重 */
+    const body = [...lines, `检查时间 ${now.toLocaleString('zh-CN')}`].join('\n');
     try {
-      await notifyFeishu(text);
+      await notifyPanelNotice({
+        title: `任务到期提醒 · ${due.length} 条未完成`,
+        body,
+        tone: due.some((d) => Number(d.overdueDays) > 0) ? 'error' : 'warning',
+        source: '个人工作台 · 到期检查',
+      });
       feishu = true;
     } catch (err) {
       console.warn('[reminders] 飞书提醒发送失败：', err.message);

@@ -25,7 +25,7 @@ A self-hosted, single-user console for homelab operators — tasks, Proxmox VE m
 | **AI 热点** | 每日自动抓取的 AI 资讯流，带模型打分与推荐理由 |
 | **工具箱** | 工具网站按用途分类，支持搜索与增删改、自定义上传图标，分类可拖动排序或按名称自动排列，与首页共用一份数据 |
 | **知识库** | SOP + Runbook，按类型与标签区分 |
-| **智能办公** | Hermes「Agent Office」工位墙：工位详情（配置文档 / 技能 / 进化档案 / **边界守望** / 工作记录 / 即时交互）、全局待办工作表、token 用量 |
+| **智能办公** | 直连 Hermes：工位墙与工位详情（配置文档 / 技能 / 进化档案 / **边界守望** / 工作记录 / 即时交互）、全局待办工作表、精确 token 用量、拾贝网页采集（语义抽取 / 清洗 / 失败自愈） |
 | **桌宠** | 右下角常驻的鲸娘：盯 DeepSeek 余额、摸头 / 投喂 / 签到 / 闲聊，可拖动、可收起 |
 | **设置** | 主题与强调色、PVE 连接、功耗电价模型、搜索源、数据备份 |
 
@@ -184,7 +184,9 @@ add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" alway
 | `PVE_CA_FILE` | 可选。PVE 私有 CA 的路径（默认 `server/data/pve-ca.pem`），有它才能开着证书校验连自签的 PVE |
 | `HA_URL` `HA_TOKEN` | Home Assistant，读取智能插座的真实功耗（可选，见[依赖说明](#依赖说明home-assistant可选)） |
 | `AI_BASE_URL` `AI_API_KEY` `AI_MODEL` | 任意 OpenAI 兼容端点（官方 API / Ollama / vLLM 均可） |
-| `HERMES_BASE_URL` | 局域网 Hermes Agent Office 网关（可选） |
+| `HERMES_API_BASE_URL` `HERMES_API_KEY` | 局域网 Hermes 网关（可选）。Key 取自 Hermes 主机的 `~/.hermes/.env` 里的 `API_SERVER_KEY` |
+| `HERMES_LOCAL_HOST` `HERMES_LOCAL_USER` `HERMES_LOCAL_KEY` | Hermes 主机的 SSH 只读通道，用于用量 / 待办 / 配置 / 守望等本机数据 |
+| `HERMES_BRIDGE_PATH` | 远端数据桥脚本路径（默认 `/data/personal-workbench-bridge/hwb-bridge.cjs`，用 `npm run bridge:deploy` 部署） |
 | `DEEPSEEK_API_KEY` `DEEPSEEK_BASE_URL` | DeepSeek 余额（桌宠用），留空则桌宠不显示余额，见[桌宠](#桌宠右下角的鲸娘) |
 
 ## 依赖说明：Home Assistant（可选）

@@ -43,6 +43,13 @@ export const SECRET_PATHS = [
   ['mail', 'pass'],
   ['stars', 'feishuUrl'],
   ['stars', 'feishuSecret'],
+  /* 全站飞书出口：地址本身就是写入凭据（拿到它就能往群里发消息），
+     和 stars.feishuUrl 一样按密文落库 */
+  ['feishuBot', 'webhookUrl'],
+  ['feishuBot', 'secret'],
+  /* 应用机器人的 App Secret 是换 tenant_access_token 的凭据，
+     拿到它就能以这个应用的身份往群里发消息 —— 与 webhook 地址同一级别 */
+  ['feishuBot', 'appSecret'],
 ];
 
 let cachedKey = null;

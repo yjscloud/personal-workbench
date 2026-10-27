@@ -1,7 +1,7 @@
 import { db, update, uid } from '../store.js';
 import { getOverview } from './pve.js';
 import { accumulate, estimateWatts, powerReport, applyEco } from './power.js';
-import { hermesSeats, hasHermesCredentials, hermesSessionStatus } from './hermes.js';
+import { hermesSeats, hasHermesCredentials } from './hermes.js';
 import { aiConfigured, llmReply, llmStream } from './llm.js';
 
 /* ── 小工具 ─────────────────────────────────────────────────────────── */
@@ -98,8 +98,8 @@ export async function buildContext() {
 }
 
 /**
- * 工位状态问答。走 Hermes 的公开接口，免凭证，所以不配口令也能回答；
- * 口令只是决定「能不能再往下调登录后的业务接口」，这里如实提示即可。
+ * 工位状态问答。走 SSH 数据桥，不依赖网关 Key，所以没配 Key 也能回答；
+ * Key 只决定「会话与对话能不能用」，这里如实提示即可。
  */
 async function hermesReply() {
   let seats;
@@ -110,7 +110,7 @@ async function hermesReply() {
   }
 
   const lines = [
-    `Hermes Agent Office ${seats.gatewayVersion ? `v${seats.gatewayVersion}` : ''}（${seats.baseUrl}）`,
+    `Hermes ${seats.gatewayVersion ? `v${seats.gatewayVersion}` : ''}（${seats.baseUrl}）`,
     `· ${seats.seats ?? '—'} 个工位，${seats.staffed ?? '—'} 名员工在编，${seats.vacant ?? '—'} 个空缺，在线 ${seats.online ?? '—'} 人`,
   ];
   if (seats.items.length) {
@@ -119,11 +119,9 @@ async function hermesReply() {
     lines.push('· 还没有任何员工在编');
   }
 
-  // 凭证状态单独说清楚：决定下一步能不能做「管」，而不是只报在线数
+  // 连接状态单独说清楚：决定下一步能不能做「管」，而不是只报在线数
   if (!hasHermesCredentials()) {
-    lines.push('', '未配置 HERMES_USER / HERMES_PASSWORD，目前只能看免登录的公开状态。');
-  } else if (!hermesSessionStatus().loggedIn) {
-    lines.push('', '凭证已配置，但还没有建立会话；调用业务接口时会自动登录一次。');
+    lines.push('', '未配置 HERMES_API_KEY，网关的会话与对话用不了；工位状态走 SSH 数据桥，不受影响。');
   }
   return { reply: lines.join('\n'), actions: [] };
 }

@@ -41,7 +41,7 @@ import {
 } from '@/lib/api';
 import { cls, fmtDateTime, fmtDuration, fmtRelative } from '@/lib/format';
 import { useStore } from '@/lib/store';
-import { Badge, Button, Led, Skeleton, Spinner, buttonClass } from '@/components/ui';
+import { Badge, Button, Led, Skeleton, Spinner, Toggle } from '@/components/ui';
 import { Markdown } from '@/components/Markdown';
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -170,7 +170,10 @@ function useSeatTab(seat: string, tab: OfficeSeatTabKey, enabled: boolean) {
     load();
   }, [load]);
 
-  return { data, error, loading, reload: () => load(true) };
+  /* reload 得是稳定引用：GuardPane 靠它在「有待授权单」时开定时器，
+     每次渲染都换一个新函数会把那个定时器反复重建 */
+  const reload = useCallback(() => load(true), [load]);
+  return { data, error, loading, reload };
 }
 
 /* ── 抬头 ───────────────────────────────────────────────────────────── */
@@ -531,7 +534,7 @@ const healthCls = (level: OfficeGuardHealth['level']) =>
 
 function GuardBlock({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
   return (
-    <section className="rounded-field border border-line bg-panel px-3 py-2.5">
+    <section className="break-inside-avoid rounded-field border border-line bg-panel px-3 py-2.5">
       <h4 className="mb-2 flex flex-wrap items-baseline gap-x-1.5 text-xs font-semibold text-ink">
         {title}
         {hint ? <span className="text-2xs font-normal text-faint">{hint}</span> : null}
@@ -649,6 +652,17 @@ function GuardPane({ seat }: { seat: string }) {
   const [busy, setBusy] = useState('');
   const [profile, setProfile] = useState<ProfileState | null>(null);
 
+  /* 有待授权单时自己对一次。
+     两个理由：① 开单到执行常常是同一秒的事（自动封禁），快照恰好在中间取的
+     话会留一张已经失效的「待你授权」；② 别人在飞书里点了批准，这边也不会知道。
+     清空即停 —— 没有待办时不该白轮询。 */
+  const pendingCount = guard?.pending.length ?? 0;
+  useEffect(() => {
+    if (!pendingCount) return;
+    const t = window.setInterval(reload, 12000);
+    return () => window.clearInterval(t);
+  }, [pendingCount, reload]);
+
   async function decide(p: OfficeGuardPending, approve: boolean) {
     const tip = approve
       ? `批准封禁 ${p.ip}？\n\n批准后会立刻在 frps 上执行 ipset add，记录到期 ${p.expiresAt || '—'}。\n理由：${p.reason || '（未填）'}`
@@ -661,6 +675,29 @@ function GuardPane({ seat }: { seat: string }) {
       reload();
     } catch (e) {
       notify?.(e instanceof Error ? e.message : '操作失败', 'crit');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  /**
+   * 境外自动封禁开关。
+   *
+   * 这是唯一一个「不需要授权码就会改变封禁行为」的控件，所以必须二次确认，
+   * 且确认文案要把「跳过人工」这件事说透 —— 否则点一下就等于把审批权交出去。
+   */
+  async function toggleAutoBan(next: boolean) {
+    const tip = next
+      ? '开启「境外 IP 自动封禁」？\n\n开启后，值守开出的封禁单只要目标 IP 归属地在境外（不含港澳台），会直接执行 ipset add，不再等你批准。\n\n归属地查不到的单仍然走人工。'
+      : '关闭「境外 IP 自动封禁」？关闭后所有封禁申请都要人工批准。';
+    if (!window.confirm(tip)) return;
+    setBusy('auto-ban');
+    try {
+      await api.office.securityAutoBan(next);
+      notify?.(next ? '已开启：境外来源将自动封禁' : '已关闭：恢复人工审批');
+      reload();
+    } catch (e) {
+      notify?.(e instanceof Error ? e.message : '开关设置失败', 'crit');
     } finally {
       setBusy('');
     }
@@ -688,6 +725,30 @@ function GuardPane({ seat }: { seat: string }) {
 
       {guard ? (
         <>
+          {/* 唯一一个能绕过人工审批的开关，所以放在最上面、说清楚它做了什么 */}
+          <div className="flex items-start gap-3 rounded-field bg-bg-2 px-3 py-2.5">
+            <div className="min-w-0 flex-1">
+              <p className="flex items-center gap-1.5 text-xs font-medium text-ink">
+                <Shield size={12} aria-hidden />
+                境外 IP 自动封禁
+              </p>
+              <p className="mt-1 text-2xs leading-relaxed text-faint">
+                {guard.autoBan.enabled
+                  ? '已开启：归属地在境外（不含港澳台）的来源，开单后直接封禁，不等审批。'
+                  : '关闭中：所有封禁申请都需要人工批准。'}
+                {guard.autoBan.enabled && guard.autoBan.updatedAt
+                  ? ` ${guard.autoBan.updatedAt.slice(0, 16)} 由 ${guard.autoBan.updatedBy || '—'} 开启。`
+                  : ''}
+              </p>
+            </div>
+            <Toggle
+              checked={guard.autoBan.enabled}
+              disabled={busy === 'auto-ban'}
+              label="境外 IP 自动封禁"
+              onChange={toggleAutoBan}
+            />
+          </div>
+
           {!guard.ok && guard.error ? (
             <p className="flex items-start gap-2 rounded-field bg-crit-soft px-3 py-2 text-2xs leading-relaxed text-crit">
               <AlertTriangle size={13} aria-hidden className="mt-0.5 shrink-0" />
@@ -736,6 +797,7 @@ function GuardPane({ seat }: { seat: string }) {
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                       <ShieldAlert size={13} aria-hidden className="text-warn" />
                       <span className="num text-sm font-semibold tracking-wide text-ink">{p.ip}</span>
+                      {p.geo ? <span className="text-2xs text-faint">{p.geo}</span> : null}
                       <Badge tone="warn">申请 #{p.id}</Badge>
                       <code className="rounded bg-panel px-1.5 py-0.5 text-2xs tracking-[0.15em] text-ink">{p.ticket}</code>
                     </div>
@@ -759,7 +821,11 @@ function GuardPane({ seat }: { seat: string }) {
             </GuardBlock>
           ) : null}
 
-          <div className="grid gap-3 lg:grid-cols-2">
+          {/* 这些块按内容自然流进两列，不再按行配对塞进 grid：
+              grid 会把同一行的两张卡拉成等高，旁边一张六行的列表就能把
+              「近 24 小时」那张撑出底下一大块空白。columns 只要求卡片不被
+              从中间断开，剩下的交给浏览器按列高均衡分配。 */}
+          <div className="gap-3 lg:columns-2 [&>*]:mb-3">
             <GuardBlock title="当前窗口来源" hint={high.length ? `其中高危 ${high.length} 个` : '窗口内没有高危'}>
               {shown.length && !high.length ? (
                 <p className="mb-1.5 text-2xs leading-relaxed text-faint">
@@ -772,6 +838,7 @@ function GuardPane({ seat }: { seat: string }) {
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                       <Badge tone={SEV_TONE[r.severity]}>{r.severityLabel}</Badge>
                       <span className="num text-xs font-medium text-ink">{r.ip}</span>
+                      {r.geo ? <span className="text-2xs text-faint">{r.geo}</span> : null}
                       <span className="text-2xs text-muted">{num(r.hits)} 次</span>
                       {r.dual ? <span className="text-2xs text-accent">双源确认</span> : null}
                       {r.shell ? <Badge tone="crit">交互流量 {num(r.maxBytes)}B</Badge> : r.maxBytes ? (
@@ -823,9 +890,7 @@ function GuardPane({ seat }: { seat: string }) {
                 </ul>
               ) : null}
             </GuardBlock>
-          </div>
 
-          <div className="grid gap-3 lg:grid-cols-2">
             <GuardBlock
               title="同段协同"
               hint={
@@ -839,6 +904,7 @@ function GuardPane({ seat }: { seat: string }) {
                   <li key={s.cidr} className="flex flex-wrap items-baseline gap-x-2 text-2xs">
                     <Badge tone={SEV_TONE[s.severity]}>{s.severityLabel}</Badge>
                     <span className="num text-ink">{s.cidr}</span>
+                    {s.geo ? <span className="text-faint">{s.geo}</span> : null}
                     <span className="text-muted">
                       {s.ipCount} IP / {num(s.hits)} 次
                     </span>
@@ -866,9 +932,7 @@ function GuardPane({ seat }: { seat: string }) {
                 {!guard.dict.length ? <li className="text-2xs text-faint">还没有采到用户名。</li> : null}
               </ul>
             </GuardBlock>
-          </div>
 
-          <div className="grid gap-3 lg:grid-cols-2">
             <GuardBlock title="暴露面" hint="失联 / 未登记比扫描次数更值得看">
               <ul className="space-y-1">
                 {guard.assets.slice(0, 8).map((a) => (
@@ -911,6 +975,7 @@ function GuardPane({ seat }: { seat: string }) {
                 <li key={b.id} className="flex flex-wrap items-baseline gap-x-2 text-2xs">
                   <span className="num shrink-0 text-faint">{(b.requestedAt || '').slice(5, 16) || '—'}</span>
                   <span className="num text-ink">{b.ip}</span>
+                  {b.geo ? <span className="text-faint">{b.geo}</span> : null}
                   <span
                     className={cls(
                       'font-medium',
@@ -1165,7 +1230,37 @@ function HarvestCard({ item }: { item: Partial<OfficeHarvestItem> & { columns?: 
       {item.blocked ? <p className="mt-1 text-2xs text-warn">反爬提示：{item.blocked}</p> : null}
       {item.title ? <p className="mt-1.5 text-xs font-medium text-ink">{item.title}</p> : null}
       {item.error ? <p className="mt-1 text-2xs text-crit">{item.error}</p> : null}
-      {rows.length ? (
+      {item.columns?.length && item.rows?.length ? (
+        /* 结构化结果（智能抽取 / 清洗后）：按列画，比一行行拼接更好读 */
+        <div className="mt-2 overflow-x-auto rounded-field border border-line">
+          <table className="w-full border-collapse text-2xs">
+            <thead>
+              <tr className="bg-bg-2 text-left text-faint">
+                {item.columns.map((c) => (
+                  <th key={c} className="whitespace-nowrap px-2 py-1 font-medium">
+                    {c}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {item.rows.slice(0, 8).map((r, i) => (
+                <tr key={i} className="border-t border-line/60">
+                  {item.columns!.map((c, ci) => (
+                    <td key={c} className="max-w-[220px] truncate px-2 py-1 text-muted" title={r[ci] || ''}>
+                      {r[ci] || '—'}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="border-t border-line px-2 py-1 text-2xs text-faint">
+            共 {item.rows.length} 行 · {item.columns.length} 列
+            {item.rows.length > 8 ? `（只显示前 8 行）` : ''}
+          </p>
+        </div>
+      ) : rows.length ? (
         <ol className="mt-1.5 space-y-1">
           {rows.slice(0, 6).map((r, i) => (
             <li key={i} className="line-clamp-2 text-2xs leading-relaxed text-muted">
@@ -1197,11 +1292,13 @@ const HARVEST_TIPS = [
  * 下指令会**真的去抓网页**（模型解析成计划 → 本机采集器执行），所以这里是
  * 一个明确的动作按钮，不是打字即发。
  */
-function HarvestPane({ seat }: { seat: string }) {
+function HarvestPane() {
   const [items, setItems] = useState<OfficeHarvestItem[] | null>(null);
   const [err, setErr] = useState('');
   const [text, setText] = useState('');
   const [busy, setBusy] = useState(false);
+  const [clean, setClean] = useState(false);
+  const [deep, setDeep] = useState(false);
   const [live, setLive] = useState<{ ask: string; result: OfficeHarvestRun }[]>([]);
   const bodyRef = useRef<HTMLDivElement>(null);
 
@@ -1228,7 +1325,7 @@ function HarvestPane({ seat }: { seat: string }) {
     setText('');
     setBusy(true);
     try {
-      const result = await api.office.harvest(ask);
+      const result = await api.office.harvest(ask, { clean, deep });
       setLive((cur) => [...cur, { ask, result }]);
       /* 新指令会落在服务端的记录里，抓完顺手对一次，历史那条就出现了 */
       load();
@@ -1281,7 +1378,32 @@ function HarvestPane({ seat }: { seat: string }) {
               <span className="max-w-[80%] break-all rounded-field bg-accent px-3 py-1.5 text-2xs text-white">{l.ask}</span>
             </div>
             {l.result.kind === 'scrape' ? (
-              <HarvestCard item={l.result.result} />
+              <>
+                <HarvestCard item={l.result.result} />
+                {l.result.extract ? (
+                  <p className="text-2xs text-faint">
+                    结构化抽取 · {l.result.extract.strategy === 'values' ? '语义读值' : '生成选择器'}
+                    {l.result.extract.tokens ? ` · 用掉 ${wan(l.result.extract.tokens)} token` : ''}
+                  </p>
+                ) : null}
+                {l.result.heal ? (
+                  <p className="text-2xs text-warn">
+                    {l.result.heal.action === 'retry'
+                      ? `自愈重试：${l.result.heal.reason || '已按模型建议调整参数重抓'}`
+                      : `自愈结论：${l.result.heal.reason || '不建议继续重试'}`}
+                    {l.result.heal.lesson ? ` · 已记入站点经验` : ''}
+                  </p>
+                ) : null}
+                {l.result.clean ? (
+                  <p className="text-2xs text-faint">
+                    {l.result.clean.ok
+                      ? `清洗：${(l.result.clean.source_rows ?? 0) - (l.result.result.rows?.length ?? 0)} 行被去掉${
+                          l.result.clean.ai?.used ? '（含 AI 语义去重）' : ''
+                        }`
+                      : `清洗未生效：${l.result.clean.error || '服务无响应'}`}
+                  </p>
+                ) : null}
+              </>
             ) : (
               <div className="flex flex-col items-start gap-1">
                 <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-field bg-bg-2 px-3 py-2 text-xs text-ink">
@@ -1310,6 +1432,32 @@ function HarvestPane({ seat }: { seat: string }) {
               {t}
             </button>
           ))}
+        </div>
+        <div className="mb-2 flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            aria-pressed={clean}
+            onClick={() => setClean((v) => !v)}
+            className={cls(
+              'rounded-full border px-2.5 py-1 text-2xs transition-colors',
+              clean ? 'border-accent bg-accent/10 text-accent' : 'border-line text-muted hover:border-accent hover:text-accent',
+            )}
+          >
+            清洗数据
+          </button>
+          <button
+            type="button"
+            aria-pressed={deep}
+            disabled={!clean}
+            onClick={() => setDeep((v) => !v)}
+            className={cls(
+              'rounded-full border px-2.5 py-1 text-2xs transition-colors disabled:opacity-40',
+              deep ? 'border-accent bg-accent/10 text-accent' : 'border-line text-muted hover:border-accent hover:text-accent',
+            )}
+          >
+            AI 深处理
+          </button>
+          <span className="text-2xs text-faint">清洗 = 去重 / 空值整理；AI 深处理会再花一次模型调用</span>
         </div>
         <div className="flex items-end gap-2">
           <textarea
@@ -1344,11 +1492,9 @@ function HarvestPane({ seat }: { seat: string }) {
 export function SeatModal({
   employee,
   onClose,
-  onOpenOffice,
 }: {
   employee: OfficeEmployee | null;
   onClose: () => void;
-  onOpenOffice: () => void;
 }) {
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof api.office.seat>> | null>(null);
   const [detailErr, setDetailErr] = useState('');
@@ -1404,7 +1550,7 @@ export function SeatModal({
           <TabBar tabs={tabs} value={tab} onChange={setTab} />
           {isChat ? (
             employee.id === 'shabei' ? (
-              <HarvestPane seat={employee.id} />
+              <HarvestPane />
             ) : (
               <AgentChatPane seat={employee.id} />
             )
@@ -1418,10 +1564,7 @@ export function SeatModal({
             </div>
           )}
           <div className="flex shrink-0 items-center justify-end gap-2 border-t border-line px-4 py-2.5">
-            <span className="mr-auto text-2xs text-faint">要改配置、看更细的日志，去完整办公室操作</span>
-            <a href="#" onClick={(e) => { e.preventDefault(); onOpenOffice(); }} className={buttonClass('soft', 'sm')}>
-              完整办公室
-            </a>
+            <span className="mr-auto text-2xs text-faint">配置、技能、日志与值守都在上面的页签里；连不上的原因会在对应页签里说明</span>
           </div>
         </>
       ) : null}

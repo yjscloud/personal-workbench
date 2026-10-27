@@ -1,7 +1,7 @@
 import { getLinkByToken, consumeQuota } from '../db/public-links.js';
 import { addAttachment } from '../db/attachments.js';
 import { createTicket } from './tickets.js';
-import { notifyFeishu, notifyFeishuCard, feishuConfigured } from './feishu.js';
+import { notifyPanelCard, notifyPanelText, panelNotifyReady } from './feishu-bot.js';
 import { isEmail, mailConfigured, ownerAddress, sendMail } from './mail.js';
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -203,7 +203,8 @@ function submitCard({ link, input, ticket, due, attachmentCount, at }) {
     });
   }
 
-  elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: `${at} · ${ticket.id} · 来自外部提交链接` }] });
+  /* 尾注统一成「来源 · 时间」：全站卡片都长这样，一眼能认出是谁发的 */
+  elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: `个人工作台 · 外链提交 · ${at} · ${ticket.id}` }] });
 
   return {
     config: { wide_screen_mode: true },
@@ -338,10 +339,10 @@ export async function submitToLink(link, body, { ip = '' } = {}) {
       /* 邮件和飞书各走各的：没配 webhook 也不该连邮件一起不发 */
       notifyOwnerByMail({ link, input, ticket, due: dueRaw, attachmentCount: attachments.length, at });
 
-      if (feishuConfigured()) {
+      if (panelNotifyReady()) {
         const card = submitCard({ link, input, ticket, due: dueRaw, attachmentCount: attachments.length, at });
         /* 卡片 schema 被飞书拒了不能连通知一起丢：降级成原来的纯文本再发一次 */
-        notifyFeishuCard(card)
+        notifyPanelCard(card)
           .then(() => console.log(`[public-links] 已推送飞书卡片 ${ticket.id}`))
           .catch((err) => {
             console.warn('[public-links] 卡片发送失败，降级为文本：', err.message);
@@ -357,7 +358,7 @@ export async function submitToLink(link, body, { ip = '' } = {}) {
             ]
               .filter(Boolean)
               .join('\n');
-            notifyFeishu(text).catch((e2) => console.warn('[public-links] 飞书通知失败：', e2.message));
+            notifyPanelText(text).catch((e2) => console.warn('[public-links] 飞书通知失败：', e2.message));
           });
       }
     } else {

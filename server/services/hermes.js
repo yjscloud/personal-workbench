@@ -1,68 +1,36 @@
 import http from 'node:http';
 import https from 'node:https';
+import { hermesConfig, hasHermesCredentials } from './hermes-config.js';
+import { bridgeCall } from './hermes-local.js';
 
 /* ────────────────────────────────────────────────────────────────────────
- * Hermes Agent Office 对接
+ * Hermes 网关客户端（直连 8642，Bearer）
  * ────────────────────────────────────────────────────────────────────────
- * 局域网里的「智能工位」网关（nginx 反代 + 内部 agent-office 服务）。
- * 实测它只开了一个免登录口子，其余全部要 Cookie 会话：
+ * 合并 agent_office 之后这里不再有登录、Cookie 会话、锁号冷却：
  *
- *   GET  /public/agents   免登录。工位总数 / 在编 / 在线 + 每个 agent 的在线标记
- *   POST /auth/login      {user, password, remember} → 200 {ok, redirect} + Set-Cookie
- *   GET  /auth/session    → {ok, user}
- *   其余所有路径           未登录时统一返回 {"error":"未登录","login":"/login.html"}
+ *   GET  /api/sessions?limit=&offset=        会话列表（用量、模型、来源都在里面）
+ *   GET  /api/sessions/:id/messages          会话明细
+ *   POST /api/sessions/:id/chat/stream       对话（SSE）
+ *   GET  /api/jobs                           定时任务
+ *   GET  /v1/models  /v1/toolsets            模型 / 工具集
  *
- * 所以这块的做法是：公开状态直接读；需要登录的接口拿一个进程内的 Cookie 会话去调，
- * 会话失效（401）自动重登一次。
+ * 用量、待办、配置、技能、记忆、进化、MCP、值守、边界守望走 SSH 数据桥
+ * （services/hermes-local.js），不再经过任何中间网页服务。
  *
- * 凭证只从环境变量读（HERMES_USER / HERMES_PASSWORD），不落库、不进备份、不回显。
- *
- * ⚠️ 登录失败是会计数的：Hermes 会返回「用户名或密码错误（剩余尝试 N 次）」，
- * 试满就锁账号。所以这里失败后进入冷却期，不会拿着错口令反复撞。
+ * 凭证只从环境变量读（HERMES_API_KEY），不落库、不回显、不进备份。
  * ──────────────────────────────────────────────────────────────────────── */
 
-/* 占位默认值：仓库公开，这里不能写真实内网地址。
-   实际地址请用环境变量 HERMES_BASE_URL 配置（Hermes 没有设置页，只能走环境变量）。 */
-const DEFAULT_BASE = 'http://hermes.home.local';
+export { hermesConfig, hasHermesCredentials };
 
-export function hermesConfig() {
-  return {
-    baseUrl: String(process.env.HERMES_BASE_URL || DEFAULT_BASE)
-      .trim()
-      .replace(/\/+$/, ''),
-    user: String(process.env.HERMES_USER || '').trim(),
-    password: String(process.env.HERMES_PASSWORD || ''),
-    verifyTls: process.env.HERMES_VERIFY_TLS === 'true',
-  };
-}
-
-/** 有地址就算配置过：工位状态是公开接口，不需要口令 */
-export function isHermesConfigured() {
-  return Boolean(hermesConfig().baseUrl);
-}
-
-/** 能调「登录后」的接口才需要口令 */
-export function hasHermesCredentials() {
-  const c = hermesConfig();
-  return Boolean(c.user && c.password);
-}
-
-/* ── 极简 HTTP 客户端（与 ha.js 同款，但要把状态码和 Set-Cookie 交回调用方）── */
+/* ── 极简 HTTP 客户端 ─────────────────────────────────────────────── */
 
 /**
- * 发出请求但**不读正文**，把响应流原样交出去。
- *
- * 拆出这一步是因为原来那个"一把读完"的写法做不到两件现在需要的事：
- *
- * · **字节**：员工立绘是 1MB 级的 PNG。按 utf8 解码会把非法字节改写，拿到的
- *   "图片"直接是坏的（浏览器只会显示碎图），所以正文读取要能切到 Buffer 模式。
- * · **流式**：对话是 SSE，网关边想边推、几十秒才完。缓冲式要等整段结束才返回，
- *   用它接对话等于把流式体验抹掉 —— 界面会一直空着，直到全部生成完。
- *
- * 正文怎么读交给 readBody，这里只管把响应头拿回来（状态码是重登重放的依据）。
+ * 发出请求但不读正文，把响应流原样交出去。
+ * 对话是 SSE，缓冲式读取会把流式体验抹掉；错误分支要拿状态码，所以这里只发不收。
  */
-function openRaw(cfg, apiPath, { method = 'GET', body = null, cookie = '', timeout = 6000, accept = 'application/json' } = {}) {
+function openRaw(apiPath, { method = 'GET', body = null, timeout = 12000, accept = 'application/json', headers = {} } = {}) {
   return new Promise((resolve, reject) => {
+    const cfg = hermesConfig();
     let target;
     try {
       target = new URL(`${cfg.baseUrl}${apiPath}`);
@@ -70,80 +38,69 @@ function openRaw(cfg, apiPath, { method = 'GET', body = null, cookie = '', timeo
       reject(new Error(`Hermes 地址不合法：${cfg.baseUrl}`));
       return;
     }
-    const payload = body === null ? null : Buffer.from(JSON.stringify(body));
-    const headers = { Accept: accept };
-    if (payload) {
-      headers['Content-Type'] = 'application/json';
-      headers['Content-Length'] = payload.length;
-    }
-    if (cookie) headers.Cookie = cookie;
 
-    const mod = target.protocol === 'https:' ? https : http;
+    const isTls = target.protocol === 'https:';
+    const mod = isTls ? https : http;
+    const payload = body === null ? null : Buffer.from(JSON.stringify(body));
+
     const req = mod.request(
       {
+        protocol: target.protocol,
         hostname: target.hostname,
-        port: target.port || (target.protocol === 'https:' ? 443 : 80),
+        port: target.port || (isTls ? 443 : 80),
         path: target.pathname + target.search,
         method,
-        rejectUnauthorized: cfg.verifyTls,
-        headers,
-        timeout,
+        headers: {
+          accept,
+          /* 网关把「带 Origin 的请求」当浏览器跨域并 403，服务端调用不带 Origin */
+          'accept-encoding': 'identity',
+          'user-agent': 'personal-workbench',
+          ...(cfg.apiKey ? { authorization: `Bearer ${cfg.apiKey}` } : {}),
+          ...(payload ? { 'content-type': 'application/json', 'content-length': payload.length } : {}),
+          ...headers,
+        },
+        ...(isTls && !cfg.verifyTls ? { rejectUnauthorized: false } : {}),
       },
-      (res) => resolve(res),
+      (res) => {
+        res.statusCode = res.statusCode || 0;
+        resolve(res);
+      },
     );
-    req.on('timeout', () => req.destroy(new Error('请求超时')));
-    req.on('error', reject);
+
+    if (timeout > 0) {
+      req.setTimeout(timeout, () => req.destroy(new Error(`Hermes 请求超时（${timeout}ms）`)));
+    }
+    req.on('error', (err) => reject(new Error(friendlyError(err, cfg))));
     if (payload) req.write(payload);
     req.end();
   });
 }
 
-/**
- * 读正文。binary=true 交回 Buffer（图片这类），否则按 utf8 交回文本。
- *
- * 超限时**主动断开**而不是只记个标记：不掐断的话，那个几 MB 的响应还在一路推，
- * 而调用方已经在报错了 —— 连接白占着，还会把内存吃掉。
- */
-function readBody(res, { binary = false, maxBytes = 512 * 1024 } = {}) {
+function readText(stream, { maxBytes = 2 * 1024 * 1024 } = {}) {
   return new Promise((resolve, reject) => {
-    let settled = false;
-    const done = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      fn(value);
-    };
-
-    if (binary) {
-      const chunks = [];
-      let size = 0;
-      res.on('data', (chunk) => {
-        size += chunk.length;
-        if (size > maxBytes) {
-          res.destroy();
-          done(reject, new Error('响应过大'));
-          return;
-        }
-        chunks.push(chunk);
-      });
-      res.on('end', () => done(resolve, { status: res.statusCode, headers: res.headers, buffer: Buffer.concat(chunks) }));
-    } else {
-      let raw = '';
-      res.setEncoding('utf8');
-      res.on('data', (chunk) => {
-        raw += chunk;
-        if (raw.length > maxBytes) {
-          res.destroy();
-          done(reject, new Error('响应过大'));
-        }
-      });
-      res.on('end', () => done(resolve, { status: res.statusCode, headers: res.headers, text: raw }));
-    }
-    res.on('error', (err) => done(reject, err));
+    let size = 0;
+    const chunks = [];
+    stream.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) {
+        stream.destroy(new Error(`Hermes 响应超过 ${Math.round(maxBytes / 1024)}KB`));
+        return;
+      }
+      chunks.push(c);
+    });
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    stream.on('error', reject);
   });
 }
 
-function request(cfg, apiPath, opts = {}) {
-  return openRaw(cfg, apiPath, opts).then((res) => readBody(res, opts));
+function friendlyError(err, cfg) {
+  const code = err && err.code;
+  const where = cfg ? cfg.baseUrl : 'Hermes';
+  if (code === 'ECONNREFUSED') return `连不上 Hermes 网关（${where}）：端口未监听或被防火墙拦截`;
+  if (code === 'EHOSTUNREACH' || code === 'ENETUNREACH') return `Hermes 网关不可达（${where}）`;
+  if (code === 'ETIMEDOUT' || /超时/.test(String(err && err.message))) return `Hermes 网关响应超时（${where}）`;
+  if (/certificate|self-signed/i.test(String(err && err.message))) return `Hermes 证书校验失败（${where}）`;
+  return String((err && err.message) || err);
 }
 
 function parseJson(text) {
@@ -154,186 +111,60 @@ function parseJson(text) {
   }
 }
 
-/** 网络层报错同样容易把人带偏，这里换成能直接照着修的说法 */
-function friendlyError(err, cfg) {
-  const text = String(err?.message || err || '').trim();
-  if (/ECONNREFUSED/i.test(text)) return `Hermes 拒绝了连接（${cfg.baseUrl}），确认服务在跑、端口没写错`;
-  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(text)) return `解析不了 Hermes 的主机名（${text}）`;
-  if (/EHOSTUNREACH|ENETUNREACH/i.test(text)) return `路由不通（${text}），确认本机与 ${cfg.baseUrl} 在同一网段`;
-  if (/ECONNRESET/i.test(text)) return `连接被重置（${text}），可能被防火墙或反代拦了`;
-  if (/ETIMEDOUT|timeout/i.test(text)) return '访问 Hermes 超时，检查地址是否可达';
-  return text || '未知错误';
-}
-
-function cookieFrom(headers) {
-  const raw = headers['set-cookie'];
-  if (!Array.isArray(raw)) return '';
-  // 只取 name=value 部分，后面的 Path / HttpOnly / Expires 回传时不需要
-  return raw
-    .map((c) => String(c).split(';')[0].trim())
-    .filter(Boolean)
-    .join('; ');
-}
-
-function describeFailure(res, cfg) {
-  const data = parseJson(res.text);
-  // Hermes 自己的中文报错最有用（比如登录失败时那句「剩余尝试 N 次」），原样透出
-  if (data?.error) return String(data.error);
-  if (res.status === 401) return `Hermes 返回 401：这个路径需要登录（${cfg.baseUrl}）`;
-  if (res.status === 404) return `Hermes 上没有这个接口（HTTP 404）：${cfg.baseUrl}`;
-  return `Hermes 返回 HTTP ${res.status}`;
-}
-
-/* ── 会话：进程内一份 Cookie，失效自动重登 ─────────────────────────── */
-const session = { cookie: '', user: null, at: 0, lastError: null, cooldownUntil: 0 };
-/** 会话寿命：Hermes 没给过期时间，保守取 20 分钟主动重登一次 */
-const SESSION_TTL = 20 * 60 * 1000;
-/** 登录失败后的冷却期，避免把账号试到锁定 */
-const LOGIN_COOLDOWN = 5 * 60 * 1000;
-
-export function hermesSessionStatus() {
-  return {
-    loggedIn: Boolean(session.cookie),
-    user: session.user,
-    at: session.at ? new Date(session.at).toISOString() : null,
-    lastError: session.lastError,
-    cooldownUntil: session.cooldownUntil ? new Date(session.cooldownUntil).toISOString() : null,
-  };
-}
-
-async function login(cfg) {
-  if (!cfg.user || !cfg.password) {
-    throw new Error('服务端没有配置 HERMES_USER / HERMES_PASSWORD，请在 .env 里补上并重启服务');
-  }
-  if (Date.now() < session.cooldownUntil) {
-    const wait = Math.max(1, Math.ceil((session.cooldownUntil - Date.now()) / 60000));
-    throw new Error(`上次登录失败，已暂停重试 ${wait} 分钟（Hermes 会锁账号）；核对凭证后重启服务即可立刻重试`);
-  }
-
-  let res;
-  try {
-    res = await request(cfg, '/auth/login', {
-      method: 'POST',
-      body: { user: cfg.user, password: cfg.password, remember: true },
-      timeout: 8000,
-    });
-  } catch (err) {
-    throw new Error(friendlyError(err, cfg));
-  }
-
-  const data = parseJson(res.text) || {};
-  if (res.status !== 200 || !data.ok) {
-    const msg = describeFailure(res, cfg);
-    session.cookie = '';
-    session.user = null;
-    session.at = 0;
-    session.lastError = msg;
-    session.cooldownUntil = Date.now() + LOGIN_COOLDOWN;
-    throw new Error(msg);
-  }
-
-  const cookie = cookieFrom(res.headers);
-  if (!cookie) throw new Error('Hermes 登录返回成功，但没拿到会话 Cookie，认证方式可能变了');
-
-  session.cookie = cookie;
-  session.user = data.user || cfg.user;
-  session.at = Date.now();
-  session.lastError = null;
-  session.cooldownUntil = 0;
-  return { user: session.user, redirect: data.redirect || '/' };
+function describeFailure(status, text, cfg) {
+  if (status === 401 || status === 403) return 'Hermes 拒绝了请求：API Key 未配置或不正确（.env 里的 HERMES_API_KEY）';
+  if (status === 404) return `Hermes 没有这个接口（HTTP 404）：${cfg.baseUrl}`;
+  const j = parseJson(text);
+  const detail = j?.error?.message || j?.error || j?.detail;
+  if (detail) return String(detail);
+  return `Hermes 返回 HTTP ${status}`;
 }
 
 /**
- * 调用「需要登录」的 Hermes 接口，返回原始响应 {status, headers, text}。
- * 探测脚本要靠状态码判断接口在不在，所以这一步不做 >=400 抛错。
+ * 与服务端其它 HTTP 调用同款：返回 { status, text }，不抛 HTTP 错误
+ * （401/500 由调用方决定怎么处理）。网络层错误仍然抛。
  */
-export async function authedRequest(apiPath, { method = 'GET', body = null, timeout = 8000, binary = false, maxBytes } = {}) {
+export async function authedRequest(apiPath, { method = 'GET', body = null, timeout = 12000, accept } = {}) {
   const cfg = hermesConfig();
-  if (session.cookie && Date.now() - session.at > SESSION_TTL) {
-    session.cookie = '';
-    session.at = 0;
-  }
-  if (!session.cookie) await login(cfg);
-
-  try {
-    const opts = { method, body, cookie: session.cookie, timeout, binary, maxBytes };
-    let res = await request(cfg, apiPath, opts);
-    if (res.status === 401) {
-      // 会话被顶掉或过期：重登一次再试，只有一次，避免把错误口令反复往外送
-      session.cookie = '';
-      session.at = 0;
-      await login(cfg);
-      res = await request(cfg, apiPath, { ...opts, cookie: session.cookie });
-    }
-    return res;
-  } catch (err) {
-    throw new Error(friendlyError(err, cfg));
-  }
+  const res = await openRaw(apiPath, { method, body, timeout, accept });
+  const text = await readText(res);
+  return { status: res.statusCode || 0, text, headers: res.headers };
 }
 
-/**
- * 打开一条**流式**响应（SSE），把响应流原样交给调用方，由它边收边转发。
- *
- * 与 authedRequest 的区别只在"什么时候判定失败"：会话过期必须在**响应头到达时**
- * 就补救 —— 那一刻还没开始推正文，重登一次重放是干净的；一旦流起来就没法回头，
- * 重放会得到两份正文（用户会看到回答被写两遍）。所以这里撞到 401 就丢掉这一份
- * （res.resume 把响应体排空，连接才不会被挂住）、重登、再放一次，与 authedRequest 同款。
- *
- * timeout 默认 0（不限）：对话一次可能想几十秒，套 8 秒超时会让长回答必被掐断。
- */
-export async function openHermesStream(apiPath, { method = 'POST', body = null, timeout = 0, accept = 'text/event-stream' } = {}) {
-  const cfg = hermesConfig();
-  if (session.cookie && Date.now() - session.at > SESSION_TTL) {
-    session.cookie = '';
-    session.at = 0;
-  }
-  if (!session.cookie) await login(cfg);
-
-  const attempt = () => openRaw(cfg, apiPath, { method, body, cookie: session.cookie, timeout, accept });
-  try {
-    let res = await attempt();
-    if (res.statusCode === 401) {
-      res.resume();
-      session.cookie = '';
-      session.at = 0;
-      await login(cfg);
-      res = await attempt();
-    }
-    return res;
-  } catch (err) {
-    throw new Error(friendlyError(err, cfg));
-  }
-}
-
-/**
- * 同 authedRequest，但把响应解析成 JSON 并在失败时抛可读错误。
- * 正常业务调用用这个，路径照着 Hermes 的接口填，例如 hermesApi('/api/xxx')。
- */
+/** 同 authedRequest，但把响应解析成 JSON 并在失败时抛可读错误 */
 export async function hermesApi(apiPath, opts = {}) {
   const cfg = hermesConfig();
-  const res = await authedRequest(apiPath, opts);
-  if (res.status >= 400) throw new Error(describeFailure(res, cfg));
+  const res = await authedRequest(apiPath, { timeout: cfg.timeout, ...opts });
+  if (res.status >= 400) throw new Error(describeFailure(res.status, res.text, cfg));
   const data = parseJson(res.text);
   if (data === null) throw new Error('Hermes 返回的不是合法 JSON');
   return data;
 }
 
-/* ── 公开接口：工位 / 员工在线状态 ─────────────────────────────────── */
+/**
+ * 流式接口（SSE）。返回未消费的 IncomingMessage：
+ *   · 200 时由调用方按帧解析（见 office.js 的 chatStream）；
+ *   · 非 200 时上游给的是普通 JSON，调用方读完再抛错。
+ */
+export async function openHermesStream(apiPath, { method = 'POST', body = null, timeout = 0, accept = 'text/event-stream' } = {}) {
+  return openRaw(apiPath, { method, body, timeout, accept });
+}
+
+/* ── 工位 / 员工在线状态 ───────────────────────────────────────────── */
 
 /**
- * 读工位状态。免登录，所以哪怕没配凭证也能用。
- * 注意这里是「连不上就抛异常」，由调用方决定是整页报错还是静默降级。
+ * 数据桥在 Hermes 本机做真实探活：网关健康、MCP stdio 握手、
+ * scrapling 可导入、值守任务存在，再合并成 6 工位 / 4 在编 / 在线数。
  */
-export async function hermesSeats({ timeout = 6000 } = {}) {
+export async function hermesSeats({ timeout = 15000 } = {}) {
   const cfg = hermesConfig();
-  let res;
+  let data;
   try {
-    res = await request(cfg, '/public/agents', { timeout });
+    data = await bridgeCall('/public/agents', { timeout });
   } catch (err) {
-    throw new Error(friendlyError(err, cfg));
+    throw new Error(err.message);
   }
-  const data = parseJson(res.text);
-  if (res.status >= 400 || !data) throw new Error(describeFailure(res, cfg));
+  if (!data) throw new Error('数据桥没有返回工位状态');
 
   return {
     baseUrl: cfg.baseUrl,
@@ -347,56 +178,4 @@ export async function hermesSeats({ timeout = 6000 } = {}) {
       : [],
     checkedAt: data.checked_at || null,
   };
-}
-
-/**
- * 「测试连接」：先探公开状态，再（配了口令的话）试着登录一次。
- * 两层结果分开给，界面才能分辨「地址不对」和「凭证不对」。
- */
-export async function testHermes() {
-  const cfg = hermesConfig();
-  const result = {
-    ok: false,
-    baseUrl: cfg.baseUrl,
-    error: null,
-    public: { ok: false, error: null, gatewayVersion: null, seats: null, staffed: null, online: null, items: [] },
-    auth: { configured: Boolean(cfg.user && cfg.password), attempted: false, ok: false, user: cfg.user || null, error: null },
-    session: hermesSessionStatus(),
-  };
-
-  try {
-    const seats = await hermesSeats();
-    result.public = {
-      ok: true,
-      error: null,
-      gatewayVersion: seats.gatewayVersion,
-      seats: seats.seats,
-      staffed: seats.staffed,
-      online: seats.online,
-      items: seats.items,
-    };
-    result.ok = true;
-  } catch (err) {
-    result.public.error = err.message;
-    result.error = err.message;
-    return result;
-  }
-
-  if (!result.auth.configured) {
-    result.auth.error = '未配置 HERMES_USER / HERMES_PASSWORD：公开工位状态可用，登录后的业务接口不可用';
-    return result;
-  }
-
-  result.auth.attempted = true;
-  try {
-    const r = await login(cfg);
-    result.auth.ok = true;
-    result.auth.user = r.user;
-  } catch (err) {
-    result.auth.error = err.message;
-    result.error = err.message;
-    result.ok = false;
-  }
-  result.session = hermesSessionStatus();
-  return result;
 }

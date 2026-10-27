@@ -191,15 +191,11 @@ export function defaultData() {
     settings: {
       // 首页问候语里的称呼。留空则只显示「早上好」，不带名字。
       profile: { name: '' },
-      /* 智能办公室右上角「打开完整办公室」跳去哪。
-         默认（空）用服务端 .env 的 HERMES_BASE_URL —— 但同一台机器在内网里
-         往往有多个入口（IP、主机名、反代域名），想从哪个进是用户自己的事，
-         所以这里留一个覆盖位。只影响那个按钮的链接，不影响服务端怎么调接口。 */
       /* officeLayout：智能办公室两侧边栏里那三块面板（对话明细 / 今日消耗 Token /
          全局待办工作表）摆在哪一栏、各自什么次序；工位墙钉在中间那列，不参与。
          （存的是 key，不是文案 —— 对面加了/改了面板时旧值要还能用，
          所以由前端补齐缺的、丢掉不认识的）。空 = 用默认摆法。 */
-      hermes: { officeUrl: '', officeLayout: { left: [], right: [] } },
+      hermes: { officeLayout: { left: [], right: [] } },
       /* 首页那个搜索框。engines 是一串搜索引擎，url 里的 %s 是查询词的占位符
          （提交时用 encodeURIComponent 填进去）。在「设置 → 搜索」里增删改，
          所以这里只是初始的四个，不是白名单。 */
@@ -239,6 +235,22 @@ export function defaultData() {
          （.env 里的 FEISHU_WEBHOOK_URL 作为兜底，老部署不必改）。
          签名密钥是机器人开了「签名校验」才用的，同样可以留空。 */
       stars: { repo: 'yjscloud/ProxCenter', feishuUrl: '', feishuSecret: '' },
+      /* 全站飞书通知出口。默认关闭 webhook（没填 = 不发），开关与通知范围先给全开：
+         填完地址就能直接用，不必再回来点一遍 */
+      feishuBot: {
+        enabled: true,
+        /* 自定义机器人：只出不进，填 webhook 就能发 */
+        webhookUrl: '',
+        secret: '',
+        /* 应用机器人：审批卡的按钮回调只有它能接，三项齐全才发得出去 */
+        appId: '',
+        appSecret: '',
+        chatId: '',
+        notifyBan: true,
+        notifyOps: true,
+        syncedAt: null,
+        syncError: null,
+      },
       /* 邮件通知：外链提交的任务被标记完成时，给提交者发一封信。
          留空 = 不发；.env 里的 SMTP_* 作为兜底（老部署不必改设置）。 */
       mail: { host: '', port: 465, secure: true, user: '', pass: '', from: '', notifyTo: '' },
