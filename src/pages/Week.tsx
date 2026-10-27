@@ -55,6 +55,8 @@ const NO_PROJECT = '__none__';
 /** 项目下拉里的「新建」哨兵值：选到它就切到输入态 */
 const NEW_PROJECT = '__new__';
 const NO_DUE = '9999';
+/** 全展开：搜索时用，否则搜出来的已完成任务会藏在折叠里 */
+const EXPAND_ALL: Record<TicketStatus, boolean> = { todo: false, doing: false, review: false, done: false };
 
 type Scope = 'week' | 'all';
 type View = 'list' | 'board';
@@ -287,7 +289,11 @@ export default function Week() {
   const [tagFilter, setTagFilter] = useState<string>('all');
   const [sort, setSort] = useState<SortKey>('smart');
   const [query, setQuery] = useState('');
-  const [collapsed, setCollapsed] = useState<Record<TicketStatus, boolean>>({ todo: false, doing: false, review: false, done: false });
+  /**
+   * 分组折叠状态。「已完成」默认收起 —— 任务一旦完成就从列表里退场，
+   * 剩下三个分组才是每天要盯的；想回看就点开，点开后在本次停留期间不再自动收起。
+   */
+  const [collapsed, setCollapsed] = useState<Record<TicketStatus, boolean>>({ todo: false, doing: false, review: false, done: true });
   const [openId, setOpenId] = useState<string | null>(null);
   /**
    * ?open=<id> 是一次性入口：进来后立刻把它从地址栏摘掉。
@@ -644,6 +650,9 @@ export default function Week() {
           <ListView
             grouped={grouped}
             collapsed={collapsed}
+            /* 搜索时全展开（见 ListView 内部的 searchCollapsed）：
+               人在找东西，结果不该藏在折叠里 */
+            searching={Boolean(query.trim())}
             onToggleGroup={(status) => setCollapsed((prev) => ({ ...prev, [status]: !prev[status] }))}
             onToggleDone={toggleDone}
             onOpen={setOpenId}
@@ -1354,6 +1363,7 @@ function BatchBar({
 function ListView({
   grouped,
   collapsed,
+  searching,
   onToggleGroup,
   onToggleDone,
   onOpen,
@@ -1369,6 +1379,7 @@ function ListView({
 }: {
   grouped: { status: TicketStatus; items: Ticket[] }[];
   collapsed: Record<TicketStatus, boolean>;
+  searching: boolean;
   onToggleGroup: (s: TicketStatus) => void;
   onToggleDone: (t: Ticket) => void;
   onOpen: (id: string) => void;
@@ -1389,6 +1400,17 @@ function ListView({
   const selectable = true;
   /** 哪个空分组点了「＋」：空分组平时只占一行，展开后才露出输入框 */
   const [addingIn, setAddingIn] = useState<TicketStatus | null>(null);
+  /* 搜索期间单独一套折叠状态：默认全展开（搜出来的已完成任务不该藏在折叠里），
+     点箭头照样能收。直接拿 EXPAND_ALL 覆盖 collapsed 的话，点击会看起来没反应。 */
+  const [searchCollapsed, setSearchCollapsed] = useState<Record<TicketStatus, boolean>>(EXPAND_ALL);
+  useEffect(() => {
+    setSearchCollapsed(EXPAND_ALL);
+  }, [searching]);
+  const isCollapsedOf = (s: TicketStatus) => (searching ? searchCollapsed[s] : collapsed[s]);
+  const toggleGroup = (s: TicketStatus) => {
+    if (searching) setSearchCollapsed((prev) => ({ ...prev, [s]: !prev[s] }));
+    else onToggleGroup(s);
+  };
 
   return (
     <div className="flex flex-col gap-2.5">
@@ -1409,7 +1431,7 @@ function ListView({
       </div>
 
       {grouped.map(({ status, items }) => {
-        const isCollapsed = collapsed[status];
+        const isCollapsed = isCollapsedOf(status);
         const isEmpty = items.length === 0;
         const adding = addingIn === status;
         return (
@@ -1417,7 +1439,7 @@ function ListView({
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => onToggleGroup(status)}
+                onClick={() => toggleGroup(status)}
                 aria-expanded={!isCollapsed}
                 className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2.5 text-left transition-colors hover:bg-panel-2/60 sm:px-4"
               >
