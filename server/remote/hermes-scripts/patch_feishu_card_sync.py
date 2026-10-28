@@ -16,6 +16,11 @@
 
 用法（在助手机上）：
     python3 patch_feishu_card_sync.py
+
+已归档（2026-10-28）：这三件事都并进了 feishu_ban_card.py 本体
+（fetch_block 带 message_id/geo、发卡后 remember_message、update 支持 --by
+与按授权码找卡），App 凭据则统一由 feishu_notify.load_env 以面板为准。
+本脚本的锚点因此已经对不上，保留只为追溯这段历史 —— 不要再运行它。
 """
 
 from __future__ import annotations
