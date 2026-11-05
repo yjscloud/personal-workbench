@@ -27,6 +27,7 @@ import {
   securityProfile,
   securityDecide,
   securityAutoBan,
+  securityAutoBanExempt,
   securityUnblock,
   securityAllowList,
   securityAllowSave,
@@ -82,6 +83,7 @@ import {
   withinLoginRate,
 } from './services/auth.js';
 import { ask, askStream } from './services/assistant.js';
+import { petChat } from './services/pet-chat.js';
 import { listMessages, addMessage, clearMessages, countMessages } from './db/messages.js';
 import { logOperation, listOperations } from './db/audit.js';
 import { listComments, addComment, removeComment, clearTicketComments, countComments } from './db/comments.js';
@@ -408,6 +410,31 @@ router.get(
 router.get(
   '/pet/balance',
   wrap(async (_req, res) => ok(res, await balanceReport())),
+);
+
+/**
+ * 思儿的闲聊。
+ *
+ * 和 `/assistant` 是两条链路：这条不接工作台上下文、不执行本地写操作，
+ * 问到工作台的事会拒绝并指回工作台。历史由前端从 `pet:state.chat` 带上来，
+ * 只用于让她记得刚才聊了什么，不落库。
+ */
+router.post(
+  '/pet/chat',
+  wrap(async (req, res) => {
+    const message = req.body?.message;
+    if (!message) return fail(res, 400, '消息不能为空');
+    const history = Array.isArray(req.body?.history) ? req.body.history : [];
+    ok(
+      res,
+      await petChat(message, {
+        history,
+        nickname: req.body?.nickname,
+        stage: req.body?.stage,
+        mood: req.body?.mood,
+      }),
+    );
+  }),
 );
 
 /* ── 登录 ─────────────────────────────────────────────────────────── */
@@ -3289,23 +3316,54 @@ router.post(
 );
 
 /**
- * 境外 IP 自动封禁总开关。
+ * 自动封禁总开关（境外 / 国内两个方向）。
  *
- * 打开后，值守 agent 开出的封禁单只要目标 IP 归属地在境外（CN/HK/MO/TW 之外）
- * 就直接执行，不再等人点按钮。归属地查不到的单仍然走人工 —— 宁可多问一句。
+ * 打开后，值守 agent 开出的封禁单只要目标 IP 归属地在对应方向
+ * （境外 = CN/HK/MO/TW 之外；国内 = 含港澳台），就直接执行，不再等人点按钮。
+ * 归属地查不到的单仍然走人工 —— 宁可多问一句。
  *
- * 这是能把「封禁」从人工决策变成自动执行的动作，所以只认显式布尔：
- * 传缺省 / 字符串 / 其它值一律按「关闭」处理，不做猜测。
+ * 两个方向是两个独立的键，所以请求必须带 scope；scope 只认 'domestic'，
+ * 其余（含缺省）一律按境外处理。这样"少传一个字段"最多是没改到，
+ * 不会打开另一把刀。
+ *
+ * 只认显式布尔：传缺省 / 字符串 / 其它值一律按「关闭」处理，不做猜测。
  */
 router.post(
   '/office/security/auto-ban',
   wrap(async (req, res) => {
     if (!needsLocal(res)) return;
     const on = req.body?.enabled === true;
-    const r = await securityAutoBan(on);
-    /* 这是整套防护里唯一「无需授权码就能改变封禁行为」的开关，必须留痕 */
-    await auditOp(req, 'security.auto-ban', on ? 'on' : 'off',
-      on ? '开启：境外来源自动封禁（跳过人工审批）' : '关闭：恢复人工审批');
+    const domestic = req.body?.scope === 'domestic';
+    const scope = domestic ? 'domestic' : 'foreign';
+    const who = domestic ? '国内（含港澳台）' : '境外';
+    const r = await securityAutoBan(on, scope);
+    /* 这是整套防护里唯一「无需授权码就能改变封禁行为」的开关，必须留痕。
+       两个方向分开记 action：事后要能回答"是把哪一边打开了"。 */
+    await auditOp(req, domestic ? 'security.auto-ban.domestic' : 'security.auto-ban',
+      on ? 'on' : 'off',
+      on ? `开启：${who}来源自动封禁（跳过人工审批）` : `关闭：${who}来源恢复人工审批`);
+    ok(res, r);
+  }),
+);
+
+/**
+ * 国内自动封禁的**区域豁免**：名单里的省市不自动封，仍开单等人工。
+ *
+ * 为什么不是开关接口的一个字段：那是"少传一个参数就全清"的形状，
+ * 而豁免范围直接决定会不会封到自己人，不该被一次无关的保存动作静默改掉。
+ *
+ * 只收字符串数组（每项限长、总量 20 条）；区域名怎么匹配归属地由
+ * frp_guard.py 决定 —— 面板这边不维护第二套匹配规则。
+ */
+router.post(
+  '/office/security/auto-ban-exempt',
+  wrap(async (req, res) => {
+    if (!needsLocal(res)) return;
+    const regions = Array.isArray(req.body?.regions) ? req.body.regions : null;
+    if (!regions) return fail(res, 400, 'regions 必须是数组');
+    const r = await securityAutoBanExempt(regions);
+    await auditOp(req, 'security.auto-ban.exempt', (r?.regions || []).join(',') || '（清空）',
+      `国内自动封禁豁免区域：${(r?.regions || []).join('、') || '已清空'}`);
     ok(res, r);
   }),
 );

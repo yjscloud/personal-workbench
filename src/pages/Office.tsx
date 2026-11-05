@@ -568,7 +568,11 @@ export default function Office() {
         title="智能办公"
         hint={
           roster
-            ? `Hermes 智能员工办公室（${roster.baseUrl}${roster.gatewayVersion ? ` · 网关 ${roster.gatewayVersion}` : ''}）。工位 ${interval} 秒对一次；点员工可以直接说话。`
+            ? `Hermes 智能员工办公室（${roster.baseUrl}${roster.gatewayVersion ? ` · 网关 ${roster.gatewayVersion}` : ''}${
+                /* 版本一律读盘上的安装记录（见数据桥的 installedGatewayVersion），
+                   所以升级完成后这里会自己变；进程还没重启时补一句，免得以为没升级成功 */
+                roster.gatewayRestartPending ? `，进程仍是 ${roster.gatewayRunningVersion}，重启网关后生效` : ''
+              }）。工位 ${interval} 秒对一次；点员工可以直接说话。`
             : 'Hermes 智能员工办公室：工位、待办与用量。'
         }
         actions={

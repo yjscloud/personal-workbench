@@ -38,11 +38,20 @@ scp -q -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$KEY" \
   server/remote/hermes-scripts/feishu_ban_card.py \
   server/remote/hermes-scripts/feishu_ops_card.py \
   "$USER@$HOST:$HERMES_SCRIPTS/"
+# 定时任务的脚本也一样：它是 cron 里「Hermes版本监控」跑的那条，
+# 以前只存在于助手机本地（改超时得 ssh 上去手改），收进仓库后才不会与代码漂移
+echo "→ 定时任务脚本 → $HERMES_SCRIPTS"
+scp -q -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i "$KEY" \
+  server/remote/hermes-scripts/check-hermes-update.sh \
+  "$USER@$HOST:$HERMES_SCRIPTS/"
 # 源码换了就让旧字节码失效，免得跑起来还是上一版（cron 用的 python 版本不固定）
-"${SSH[@]}" "chmod 755 '$HERMES_SCRIPTS'/feishu_*.py; rm -f '$HERMES_SCRIPTS'/__pycache__/feishu_*.pyc"
+"${SSH[@]}" "chmod 755 '$HERMES_SCRIPTS'/feishu_*.py '$HERMES_SCRIPTS'/check-hermes-update.sh; rm -f '$HERMES_SCRIPTS'/__pycache__/feishu_*.pyc"
 
 echo "→ 自检"
 echo '{"path":"/__ping"}' | "${SSH[@]}" "node '$BRIDGE_PATH'"
 "${SSH[@]}" "cd '$HERMES_SCRIPTS' && python3 -c 'import feishu_notify, feishu_ban_card, feishu_ops_card; print(\"feishu 脚本可导入：\", feishu_notify.__name__, feishu_ban_card.__name__, feishu_ops_card.__name__)'"
+# 版本检查脚本只做语法校验：它真跑一趟要去 GitHub 比对（几秒到十几秒），
+# 部署时没必要为它等一次网络
+"${SSH[@]}" "bash -n '$HERMES_SCRIPTS/check-hermes-update.sh' && echo '版本检查脚本语法正常'"
 echo
 echo "完成。"

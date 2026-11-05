@@ -20,7 +20,10 @@ import { localConfig } from './hermes-config.js';
 
 const cache = new Map(); /* key → { at, value, ttl } */
 let cacheEpoch = 0;      /* invalidate 时 +1，阻止在途的旧刷新把数据写回来 */
-const refreshing = new Set();
+/* key → 在途的 Promise：同一个读路径同时被两处要（工位卡片的守望摘要 + 边界守望页签、
+   两个标签页同时打开…）时只开一个 ssh 进程，另一路等它的结果。
+   以前这里是 refreshing:Set，只挡住"后台刷新"重复启动，前台 miss 照样各开一个。 */
+const inflight = new Map();
 let active = 0;
 const waiters = [];
 const MAX_CONCURRENCY = Number(process.env.HERMES_LOCAL_CONCURRENCY || 3);
@@ -65,6 +68,47 @@ export function invalidateLocal(prefix = '') {
   for (const key of [...cache.keys()]) {
     if (!prefix || key.startsWith(prefix)) cache.delete(key);
   }
+  /* 在途的读也要一起放掉：它是在失效**之前**发的，答案必然比刚发生的
+     写操作旧。不摘掉的话紧接着的请求会 join 到它，页面就会在批准之后
+     继续显示"待授权"。（那个旧读自己回来时也不会写缓存 —— 见 epoch 判断。） */
+  for (const key of [...inflight.keys()]) {
+    if (!prefix || key.startsWith(prefix)) inflight.delete(key);
+  }
+}
+
+/** 一次只读的 ssh 往返（带并发闸）；读失败不写缓存 */
+async function sshRead(pathname, opts) {
+  await acquire();
+  try {
+    return await sshRun(
+      {
+        path: pathname,
+        method: 'GET',
+        body: null,
+        query: opts.query ?? null,
+      },
+      opts.timeout ?? localConfig().timeout,
+    );
+  } finally {
+    release();
+  }
+}
+
+/**
+ * 同一个 key 的并发读合并。
+ * 第二个调用方拿到的是第一个的 Promise，而不是"再开一个 ssh 去抢同一个答案"
+ * ——守卫快照一次要现采两端日志，两路并发就是两倍的等待与两倍的远端负担。
+ */
+function dedupe(key, run) {
+  const running = inflight.get(key);
+  if (running) return running;
+  const p = run();
+  const done = () => {
+    if (inflight.get(key) === p) inflight.delete(key);
+  };
+  inflight.set(key, p);
+  p.then(done, done);
+  return p;
 }
 
 /**
@@ -72,31 +116,18 @@ export function invalidateLocal(prefix = '') {
  * 缓存过期但还在 stale 窗口内时：先把旧值给页面，同时异步取一次新值。
  * 这样第二次打开页面是 0 延迟，数据最多晚一个刷新周期。
  */
-async function revalidate(key, pathname, opts, ttl) {
-  if (refreshing.has(key)) return;
-  refreshing.add(key);
+function revalidate(key, pathname, opts, ttl) {
   const epoch = cacheEpoch;
-  try {
-    await acquire();
+  return dedupe(key, async () => {
     try {
-      const value = await sshRun(
-        {
-          path: pathname,
-          method: 'GET',
-          body: null,
-          query: opts.query ?? null,
-        },
-        opts.timeout ?? localConfig().timeout,
-      );
+      const value = await sshRead(pathname, opts);
       if (epoch === cacheEpoch) cacheSet(key, value, ttl);
-    } finally {
-      release();
+      return value;
+    } catch {
+      /* 刷新失败就保留旧值，下一次请求再试 */
+      throw new Error('revalidate failed');
     }
-  } catch {
-    /* 刷新失败就保留旧值，下一次请求再试 */
-  } finally {
-    refreshing.delete(key);
-  }
+  }).catch(() => {});
 }
 
 function sshRun(payload, timeout) {
@@ -201,6 +232,15 @@ export async function bridgeCall(pathname, opts = {}) {
       void revalidate(key, pathname, opts, hit.ttl);
       return hit.value;
     }
+    /* 冷启动：多个调用方同时要同一份数据时只跑一遍 */
+    const epoch = cacheEpoch;
+    return dedupe(key, async () => {
+      const value = await sshRead(pathname, opts);
+      /* 这一趟跑的期间有人做了写操作（批准 / 解封 / 白名单）：结果已经旧了，
+         更旧的值不该盖住刚发生的变更，只把值给出去、不落缓存 */
+      if (epoch === cacheEpoch) cacheSet(key, value, ttl);
+      return value;
+    });
   }
 
   await acquire();
@@ -219,7 +259,6 @@ export async function bridgeCall(pathname, opts = {}) {
     release();
   }
 
-  if (cacheable) cacheSet(key, value, ttl);
   return value;
 }
 

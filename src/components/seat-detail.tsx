@@ -138,6 +138,30 @@ export function ModalShell({
 
 /** 页签数据：按 (员工, 页签) 缓存，来回切页签不重复拉 */
 const tabCache = new Map<string, OfficeSeatTab>();
+/* 在途的页签请求：预取与页签自己的首读合并成一次，不会同一个页签打两遍 */
+const tabInflight = new Map<string, Promise<OfficeSeatTab>>();
+
+function fetchSeatTab(seat: string, tab: OfficeSeatTabKey) {
+  const key = `${seat}:${tab}`;
+  const running = tabInflight.get(key);
+  if (running) return running;
+  const p = api.office.seatTab(seat, tab).then((d) => {
+    tabCache.set(key, d);
+    return d;
+  });
+  tabInflight.set(key, p);
+  const done = () => {
+    if (tabInflight.get(key) === p) tabInflight.delete(key);
+  };
+  p.then(done, done);
+  return p;
+}
+
+/** 预取一个页签（不渲染）：详情一打开就把慢的那几个先拉上 */
+function prefetchSeatTab(seat: string, tab: OfficeSeatTabKey) {
+  if (tabCache.has(`${seat}:${tab}`)) return;
+  void fetchSeatTab(seat, tab).catch(() => { /* 预取失败不打扰用户，点开时还会再要 */ });
+}
 
 function useSeatTab(seat: string, tab: OfficeSeatTabKey, enabled: boolean) {
   const key = `${seat}:${tab}`;
@@ -154,12 +178,14 @@ function useSeatTab(seat: string, tab: OfficeSeatTabKey, enabled: boolean) {
         setError('');
         return;
       }
-      setLoading(true);
-      api.office
-        .seatTab(seat, tab)
+      /* 已经有内容时不再亮转圈：后台对一次（轮询）不该让整页闪一下 loading */
+      if (!tabCache.has(key)) setLoading(true);
+      fetchSeatTab(seat, tab)
         .then((d) => {
-          tabCache.set(key, d);
-          setData(d);
+          /* 内容没变就把旧对象留着。守望页签有待授权时会每 12 秒自己对一次，
+             每次都换新对象等于每次都重画整页（那一堆卡片还是 CSS 多列布局，
+             重排一次就是一帧掉下去）—— 看上去就是"卡"。 */
+          setData((prev) => (prev && JSON.stringify(prev) === JSON.stringify(d) ? prev : d));
           setError('');
         })
         .catch((err) => setError(err instanceof Error ? err.message : '读取失败'))
@@ -657,6 +683,8 @@ function GuardPane({ seat }: { seat: string }) {
      这两种要分开显示，后者才是需要用户处理的状态 */
   const [allow, setAllow] = useState<{ value: string; note: string }[] | null>(null);
   const [allowInput, setAllowInput] = useState('');
+  /* 国内自动封禁的豁免区域（省市名）。输入框本地管，名单以服务端为准 */
+  const [exemptInput, setExemptInput] = useState('');
 
   /* 有待授权单时自己对一次。
      两个理由：① 开单到执行常常是同一秒的事（自动封禁），快照恰好在中间取的
@@ -734,26 +762,68 @@ function GuardPane({ seat }: { seat: string }) {
   }
 
   /**
-   * 境外自动封禁开关。
+   * 自动封禁开关（境外 / 国内两个方向，各一把）。
    *
-   * 这是唯一一个「不需要授权码就会改变封禁行为」的控件，所以必须二次确认，
+   * 这是一类「不需要授权码就会改变封禁行为」的控件，所以必须二次确认，
    * 且确认文案要把「跳过人工」这件事说透 —— 否则点一下就等于把审批权交出去。
+   *
+   * 国内那把要说得更重：国内来源里既有真扫描，也有自己人的家宽 / 4G 出口 IP，
+   * 打开之后凡是没进白名单的出口都会被当成攻击者直接封掉（含港澳台）。
    */
-  async function toggleAutoBan(next: boolean) {
+  async function toggleAutoBan(scope: 'foreign' | 'domestic', next: boolean) {
+    const domestic = scope === 'domestic';
+    const name = domestic ? '国内 IP 自动封禁' : '境外 IP 自动封禁';
+    const who = domestic ? '国内（含港澳台）' : '境外（不含港澳台）';
     const tip = next
-      ? '开启「境外 IP 自动封禁」？\n\n开启后，值守开出的封禁单只要目标 IP 归属地在境外（不含港澳台），会直接执行 ipset add，不再等你批准。\n\n归属地查不到的单仍然走人工。'
-      : '关闭「境外 IP 自动封禁」？关闭后所有封禁申请都要人工批准。';
+      ? `开启「${name}」？\n\n开启后，值守开出的封禁单只要目标 IP 归属地在${who}，会直接执行 ipset add，不再等你批准。`
+        + (domestic
+          ? '\n\n注意：这把刀更钝 —— 你在外面用 4G / 家宽访问时的出口 IP 也在里面。\n没进白名单的出口会被一起封掉，建议先确认白名单里的地址是当前在用的。'
+          : '')
+        + '\n\n归属地查不到的单仍然走人工。'
+      : `关闭「${name}」？关闭后这类封禁申请都要人工批准。`;
     if (!window.confirm(tip)) return;
-    setBusy('auto-ban');
+    setBusy('auto-ban:' + scope);
     try {
-      await api.office.securityAutoBan(next);
-      notify?.(next ? '已开启：境外来源将自动封禁' : '已关闭：恢复人工审批');
+      await api.office.securityAutoBan(next, scope);
+      notify?.(next ? `已开启：${who}来源将自动封禁` : `已关闭：${who}来源恢复人工审批`);
       reload();
     } catch (e) {
       notify?.(e instanceof Error ? e.message : '开关设置失败', 'crit');
     } finally {
       setBusy('');
     }
+  }
+
+  /**
+   * 保存国内自动封禁的豁免区域。
+   *
+   * 传的是**完整名单**（接口不认增量）：所以子项都从当前列表算出来再整体提交，
+   * 避免两个标签页同时开着时把对方的改动覆盖出意外（后写的赢，但看到的就是事实）。
+   */
+  async function saveExempt(next: string[]) {
+    setBusy('auto-ban-exempt');
+    try {
+      const r = await api.office.securityAutoBanExempt(next);
+      const list = Array.isArray(r?.regions) ? r.regions : next;
+      notify?.(list.length ? `已豁免：${list.join('、')}` : '已清空豁免区域');
+      setExemptInput('');
+      reload();
+    } catch (e) {
+      notify?.(e instanceof Error ? e.message : '豁免区域保存失败', 'crit');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  /** 输入框可能一次写好几个：「广州, 深圳」「广东 佛山」都认 */
+  async function addExempt() {
+    const added = exemptInput
+      .split(/[,，、;；\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!added.length) return;
+    const merged = [...exempt, ...added.filter((x) => !exempt.includes(x))].slice(0, 20);
+    await saveExempt(merged);
   }
 
   async function openProfile(ip: string) {
@@ -766,6 +836,8 @@ function GuardPane({ seat }: { seat: string }) {
     }
   }
 
+  /** 国内自动封禁的豁免区域（服务端为准；读不到就是空，不编默认值） */
+  const exempt = guard?.autoBan.domestic.exempt ?? [];
   const high = (guard?.topIps || []).filter((r) => r.severity === 'HIGH' || r.severity === 'CRITICAL');
   const shown = (high.length ? high : guard?.topIps || []).slice(0, 8);
   const maxHour = Math.max(1, ...(guard?.hourly || []).map((x) => x.n));
@@ -785,28 +857,118 @@ function GuardPane({ seat }: { seat: string }) {
 
       {guard ? (
         <>
-          {/* 唯一一个能绕过人工审批的开关，所以放在最上面、说清楚它做了什么 */}
-          <div className="flex items-start gap-3 rounded-field bg-bg-2 px-3 py-2.5">
-            <div className="min-w-0 flex-1">
-              <p className="flex items-center gap-1.5 text-xs font-medium text-ink">
-                <Shield size={12} aria-hidden />
-                境外 IP 自动封禁
-              </p>
-              <p className="mt-1 text-2xs leading-relaxed text-faint">
-                {guard.autoBan.enabled
-                  ? '已开启：归属地在境外（不含港澳台）的来源，开单后直接封禁，不等审批。'
-                  : '关闭中：所有封禁申请都需要人工批准。'}
-                {guard.autoBan.enabled && guard.autoBan.updatedAt
-                  ? ` ${guard.autoBan.updatedAt.slice(0, 16)} 由 ${guard.autoBan.updatedBy || '—'} 开启。`
-                  : ''}
-              </p>
+          {/* 两个能绕过人工审批的开关，所以放在最上面、各自说清楚做了什么。
+              境外是常态（对面就是海量扫描）；国内那把更钝 —— 自己人的家宽出口
+              也在那个方向里，所以两把刀分开、各带各的确认文案。 */}
+          <div className="rounded-field bg-bg-2 px-3 py-2.5">
+            <div className="flex items-start gap-3">
+              <div className="min-w-0 flex-1">
+                <p className="flex items-center gap-1.5 text-xs font-medium text-ink">
+                  <Shield size={12} aria-hidden />
+                  境外 IP 自动封禁
+                </p>
+                <p className="mt-1 text-2xs leading-relaxed text-faint">
+                  {guard.autoBan.enabled
+                    ? '已开启：归属地在境外（不含港澳台）的来源，开单后直接封禁，不等审批。'
+                    : '关闭中：境外来源的封禁申请需要一个个人工批准。'}
+                  {guard.autoBan.enabled && guard.autoBan.updatedAt
+                    ? ` ${guard.autoBan.updatedAt.slice(0, 16)} 由 ${guard.autoBan.updatedBy || '—'} 开启。`
+                    : ''}
+                </p>
+              </div>
+              <Toggle
+                checked={guard.autoBan.enabled}
+                disabled={busy === 'auto-ban:foreign'}
+                label="境外 IP 自动封禁"
+                onChange={(next) => void toggleAutoBan('foreign', next)}
+              />
             </div>
-            <Toggle
-              checked={guard.autoBan.enabled}
-              disabled={busy === 'auto-ban'}
-              label="境外 IP 自动封禁"
-              onChange={toggleAutoBan}
-            />
+
+            <div className="mt-2.5 border-t border-line pt-2.5">
+              <div className="flex items-start gap-3">
+                <div className="min-w-0 flex-1">
+                  <p className="flex items-center gap-1.5 text-xs font-medium text-ink">
+                    <ShieldAlert size={12} aria-hidden className="text-warn" />
+                    国内 IP 自动封禁
+                    <span className="text-2xs font-normal text-warn">含港澳台 · 慎开</span>
+                  </p>
+                  <p className="mt-1 text-2xs leading-relaxed text-faint">
+                    {guard.autoBan.domestic.enabled
+                      ? '已开启：归属地在国内（含港澳台）的来源，开单后直接封禁。白名单之外的自家出口也会被一起封掉。'
+                      : '关闭中：国内来源（含港澳台）的封禁申请仍需人工批准。'}
+                    {guard.autoBan.domestic.enabled && guard.autoBan.domestic.updatedAt
+                      ? ` ${guard.autoBan.domestic.updatedAt.slice(0, 16)} 由 ${guard.autoBan.domestic.updatedBy || '—'} 开启。`
+                      : ''}
+                  </p>
+                </div>
+                <Toggle
+                  checked={guard.autoBan.domestic.enabled}
+                  disabled={busy === 'auto-ban:domestic'}
+                  label="国内 IP 自动封禁"
+                  onChange={(next) => void toggleAutoBan('domestic', next)}
+                />
+              </div>
+
+              {/* 豁免区域：白名单只能一条条加具体 IP，而家宽出口是会变的 ——
+                  按省市豁免才是「这一片是我的人」。命中的不是放行，是改走人工。 */}
+              <div className="mt-2 rounded-field bg-panel px-2.5 py-2">
+                <p className="text-2xs text-muted">
+                  豁免区域
+                  <span className="ml-1.5 text-faint">
+                    {exempt.length ? `${exempt.length} 个：命中的来源只开单、不自动执行` : '按省市名匹配（如 广州 / 广东）'}
+                  </span>
+                </p>
+                {exempt.length ? (
+                  <ul className="mt-1.5 flex flex-wrap gap-1">
+                    {exempt.map((r) => (
+                      <li key={r}>
+                        <span className="inline-flex items-center gap-1 rounded-full border border-line bg-bg-2 py-0.5 pl-2 pr-1 text-2xs text-ink">
+                          {r}
+                          <button
+                            type="button"
+                            disabled={busy === 'auto-ban-exempt'}
+                            onClick={() => void saveExempt(exempt.filter((x) => x !== r))}
+                            aria-label={`移除豁免 ${r}`}
+                            className="grid h-4 w-4 place-items-center rounded-full text-faint transition-colors hover:bg-crit-soft hover:text-crit disabled:opacity-40"
+                          >
+                            <X size={10} aria-hidden />
+                          </button>
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="mt-1 text-2xs leading-relaxed text-faint">
+                    没有豁免区域：国内那把刀一开，凡是没进白名单的国内来源都会直接封掉。
+                    把自己常驻的出口（比如广州的家宽）加进来，这一片就只开单、不自动执行。
+                  </p>
+                )}
+                <div className="mt-1.5 flex gap-1.5">
+                  <input
+                    value={exemptInput}
+                    onChange={(e) => setExemptInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                        e.preventDefault();
+                        void addExempt();
+                      }
+                    }}
+                    placeholder="广州 或 广东（逗号分隔可加多个）"
+                    aria-label="要豁免的省或市"
+                    className="min-w-0 flex-1 rounded-field border border-line bg-bg-2 px-2 py-1 text-2xs text-ink outline-none transition-colors placeholder:text-faint focus:border-accent"
+                  />
+                  <button
+                    type="button"
+                    disabled={busy === 'auto-ban-exempt' || !exemptInput.trim()}
+                    onClick={() => void addExempt()}
+                    className="flex shrink-0 items-center gap-1 rounded-field border border-line bg-bg-2 px-2.5 py-1 text-2xs text-ink transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
+                  >
+                    {busy === 'auto-ban-exempt' ? <Spinner /> : <Plus size={12} />}
+                    加入
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
 
           {!guard.ok && guard.error ? (
@@ -1688,6 +1850,10 @@ export function SeatModal({
         if (!alive) return;
         setDetail(d);
         setTab(d.tabs[0] ?? 'config');
+        /* 边界守望那页要现采两端日志（几秒到二十几秒），比其它页签慢一个量级。
+           详情一打开就先预取：人读配置文档的这段时间足够它回来，点过去直接有内容。
+           其余页签都是读本机文件/DB，快得不值得预取，白占 ssh 并发名额。 */
+        if (d.tabs.includes('guard')) prefetchSeatTab(employee.id, 'guard');
       })
       .catch((e) => {
         if (alive) setDetailErr(e instanceof Error ? e.message : '读取工位详情失败');

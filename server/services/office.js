@@ -633,6 +633,11 @@ function configDoc(seatId, d, usage) {
       '- 判定：单 IP 频率 / 服务广度 / 敏感目标 / 同 /24 段协同，四维评分；双源计数取最大值避免重复计数',
       '- 唤醒：快照只保留 4 个粗档位，**只有跨档才唤醒白饭**；日常扫描只入库、不发消息、0 token',
       '- 封禁：白饭只能生成申请单，你批准后才在 frps 上 `ipset add`；授权码一次性、6 小时有效',
+      '- 自动封禁：境外 / 国内两个独立开关（`auto_ban_foreign` / `auto_ban_domestic`），',
+      '  打开后对应方向的单子开单即执行、不等审批；归属地查不到的一律走人工。',
+      '  国内那把含港澳台，**自家 4G / 家宽的出口也在里面**，打开前先把白名单配齐；',
+      '  还可以按省市加「区域豁免」（`auto_ban_domestic_exempt`，如 广州 / 广东）——',
+      '  命中的来源只开单、不自动执行',
       '- 解封：TTL 由探针自己维护（ipset 未开 timeout），**只解自己加的条目**，不动既有封禁',
       '- 白名单：`~/.hermes/scripts/frp_guard_allow.txt`，内网段自动放行',
       '',
@@ -882,7 +887,28 @@ export const harvestHistory = (limit = 200) =>
  *     不给它变成"拼接任意路径去打那台内网机器"的机会；
  *   · 批准的超时给得比拒绝长：它要 ssh 过去执行并回读结果。
  */
-const officeSecurity = () => bridgeCall('/local/security', { timeout: 20000 });
+/* 一次读要 ssh 过去、再让 frp_guard.py 现采两端日志（实测几秒到二十几秒），
+   所以这条给它单独一套更宽松的参数：
+ *   · 超时 50s —— 必须大于脚本自己的 40s 预算，否则桥还在等、这边先判超时，
+ *     页面拿到的是"数据桥超时"而不是数据（以前给的 20s 就常撞上这条）；
+ *   · 缓存 45s —— 守望看的是 10 分钟分析窗口，45 秒的陈旧完全不影响结论，
+ *     但足够把"工位卡片摘要 + 边界守望页签 + 来回切页签"合并成一次真采；
+ *   · 45s~6min 之间命中 stale 值并后台补新值：打开是 0 延迟；
+ *   · 并发请求在 hermes-local 里合并成一次 ssh（那边按路径去重）。 */
+const officeSecurity = () =>
+  bridgeCall('/local/security', { timeout: 50000, cacheTtl: 45000 });
+
+/**
+ * 决策之后刷新守望缓存。
+ *
+ * 只失效会让"下一次打开"重新付一遍现采的钱（几秒到二十几秒），而批准/解封
+ * 之后人多半会盯着这页看结果。所以失效之后立刻后台取一次，把缓存重新填上 ——
+ * 页面下一次 reload 直接命中新值，不用站在那儿等 python。
+ */
+function refreshSecuritySoon() {
+  invalidateLocal('/local/security');
+  void officeSecurity().catch(() => { /* 失败就等下次打开时再采 */ });
+}
 
 /**
  * 工位卡片上那一行摘要：待授权几条、边界告警几项。
@@ -961,22 +987,47 @@ export function securityDecide(code, approve) {
     method: 'POST',
     body: { code: ticket },
     timeout: approve ? 30000 : 15000,
-  }).finally(() => invalidateLocal('/local/security'));
+  }).finally(refreshSecuritySoon);
 }
 
 /**
- * 境外 IP 自动封禁开关。
+ * 自动封禁开关（境外 / 国内两个方向，各一个键）。
  *
- * 这是唯一一个「不需要授权码就能改变封禁行为」的写接口，所以只接受显式布尔，
- * 不做字符串推断（传错类型等于误开）。真正的写入落在 frp_guard.py：
- * 它负责更新 settings 表并写一条 auto_ban_enabled/disabled 的审计。
+ * 这是唯一一类「不需要授权码就能改变封禁行为」的写接口，所以只接受显式布尔，
+ * 不做字符串推断（传错类型等于误开）；scope 也只认白名单里的值，
+ * 其余一律按境外处理 —— 传错一个字段不该悄悄打开另一把更钝的刀。
+ * 真正的写入落在 frp_guard.py：它负责更新 settings 表并写
+ * auto_ban_enabled / auto_ban_domestic_enabled 这类审计。
  */
-export function securityAutoBan(enabled) {
+export function securityAutoBan(enabled, scope = 'foreign') {
+  const target = String(scope) === 'domestic' ? 'domestic' : 'foreign';
   return bridgeCall('/local/security/auto-ban', {
     method: 'POST',
-    body: { enabled: enabled === true },
+    body: { enabled: enabled === true, scope: target },
     timeout: 20000,
-  }).finally(() => invalidateLocal('/local/security'));
+  }).finally(refreshSecuritySoon);
+}
+
+/**
+ * 国内自动封禁的**区域豁免**：这些省市的 IP 不自动封，仍开单等人工。
+ *
+ * 与开关拆成两个接口是有意的 —— 混在一起的话，"保存开关"会顺手把豁免清空
+ * （少传一个字段就等于全清），那是静默改变判定范围，不该发生。
+ *
+ * 这里只做形状约束（数组、每项限长、总量上限），区域名怎么解析、怎么匹配
+ * 归属地由 frp_guard.py 决定，两边不各写一套。
+ */
+export function securityAutoBanExempt(regions) {
+  if (!Array.isArray(regions)) throw new Error('regions 必须是数组');
+  const items = regions
+    .map((r) => String(r ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 16))
+    .filter(Boolean)
+    .slice(0, 20);
+  return bridgeCall('/local/security/auto-ban-exempt', {
+    method: 'POST',
+    body: { regions: items },
+    timeout: 20000,
+  }).finally(refreshSecuritySoon);
 }
 
 /**
@@ -993,7 +1044,7 @@ export function securityUnblock(ip) {
     method: 'POST',
     body: { ip: target },
     timeout: 45000,
-  }).finally(() => invalidateLocal('/local/security'));
+  }).finally(refreshSecuritySoon);
 }
 
 /** 白名单：读。返回 [{value, note}]，文件在助手机 ~/.hermes/scripts/frp_guard_allow.txt */
@@ -1143,11 +1194,19 @@ function normalizeSecurity(d) {
        告警完全依赖 cron，那条链路断了就没人知道 —— 页面要能把这件事说出来。 */
     alertChannel: String(sn.health?.alert_channel || 'cron'),
 
-    /* 境外 IP 自动封禁开关：开着就不等人点按钮，程序自己批。默认关。 */
+    /* 自动封禁开关：境外与国内各一把，开着就不等人点按钮，程序自己批。默认都关。
+       国内那把是后加的键（auto_ban_domestic），老库读不到时按关闭处理。 */
     autoBan: {
       enabled: Boolean(d?.auto_ban?.enabled),
       updatedAt: String(d?.auto_ban?.updated_at || ''),
       updatedBy: String(d?.auto_ban?.updated_by || ''),
+      domestic: {
+        enabled: Boolean(d?.auto_ban?.domestic?.enabled),
+        updatedAt: String(d?.auto_ban?.domestic?.updated_at || ''),
+        updatedBy: String(d?.auto_ban?.domestic?.updated_by || ''),
+        /** 豁免区域（省市名）：这些地方的 IP 不自动封，仍走人工 */
+        exempt: (d?.auto_ban?.domestic?.exempt || []).map(String).filter(Boolean),
+      },
     },
 
     topIps,
@@ -1512,25 +1571,40 @@ export async function chatStream(seatId, message, onEvent) {
 }
 
 /* ── 启动预热 ─────────────────────────────────────────────────────────
- * 首屏四块本机数据（工位 / 待办 / 用量 / 守望摘要）在服务起来时先拉一遍。
+ * 首屏四块本机数据（工位 / 待办 / 用量 / 尾流配置）在服务起来时先拉一遍。
  * 用户第一次点开智能办公时直接命中内存缓存，不用等 SSH 进程冷启动；
  * 之后靠 hermes-local 的 stale-while-revalidate 保持"先给旧值、后台再刷新"。
  * 失败不影响服务启动，页面会按自己的降级文案提示。
+ *
+ * 边界守望（快照 + 页签）单独排在后面：它要现采两端日志，比上面四块慢一个
+ * 量级，跟首屏抢那 3 个 ssh 并发名额只会让两边都变慢。摘要与页签读的是同一份
+ * `/local/security`，hermes-local 会把它们合并成一次 ssh。
  */
 export async function warmOfficeData() {
-  const tasks = {
+  const report = (names, settled) =>
+    settled.map((r, i) => ({
+      name: names[i],
+      ok: r.status === 'fulfilled',
+      error: r.status === 'rejected' ? (r.reason?.message || String(r.reason)) : '',
+    }));
+
+  const fast = {
     roster: officeRoster,
     board: officeBoard,
     usage: officeUsage,
-    guard: officeGuardBrief,
     /* 尾流配置页签：提前把 /local/watch 取进缓存，首次点开也不用等 SSH */
     'weiliu-config': () => seatTab('weiliu', 'config'),
   };
-  const names = Object.keys(tasks);
-  const settled = await Promise.allSettled(names.map((k) => tasks[k]()));
-  return settled.map((r, i) => ({
-    name: names[i],
-    ok: r.status === 'fulfilled',
-    error: r.status === 'rejected' ? (r.reason?.message || String(r.reason)) : '',
-  }));
+  const fastNames = Object.keys(fast);
+  const out = report(fastNames, await Promise.allSettled(fastNames.map((k) => fast[k]())));
+
+  const guardTasks = {
+    /* 工位卡片上的一行摘要 */
+    guard: officeGuardBrief,
+    /* 边界守望页签的整份数据（与摘要共用一次 ssh） */
+    'weiliu-guard': () => seatTab('weiliu', 'guard'),
+  };
+  const guardNames = Object.keys(guardTasks);
+  out.push(...report(guardNames, await Promise.allSettled(guardNames.map((k) => guardTasks[k]()))));
+  return out;
 }

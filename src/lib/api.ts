@@ -901,7 +901,12 @@ export type BackupSettings = {
  */
 export type HermesSeats = {
   baseUrl: string;
+  /** 盘上安装的版本：升级完成后立刻跟着变，不必等网关重启 */
   gatewayVersion: string | null;
+  /** 运行中进程自报的版本。与上面不同 = 新代码已经在盘上，网关还没重启到位 */
+  gatewayRunningVersion: string | null;
+  /** 上面两个版本不一致 */
+  gatewayRestartPending: boolean;
   /** 工位总数 */
   seats: number | null;
   /** 在编（已入驻的智能员工） */
@@ -1201,10 +1206,27 @@ export type OfficeTabGuard = {
   /** 宿主机上真的登录成功过 —— 判「有没有被打穿」最硬的证据 */
   authOk: { user: string; fromIp: string; n: number; weak: boolean; isNew: boolean }[];
   /**
-   * 境外 IP 自动封禁开关。开着时境外来源的单子直接执行，不等人工；
+   * 自动封禁开关（两个方向各一把）。开着时对应方向的单子直接执行，不等人工；
    * 归属地查不到（接口抖动、内网地址）仍按待授权处理。
+   *
+   * domestic 是后加的那把：国内来源（含港澳台）自动封。它比境外那把更钝 ——
+   * 自己人的家宽 / 4G 出口也在里面，所以只该在配好白名单之后打开。
    */
-  autoBan: { enabled: boolean; updatedAt: string; updatedBy: string };
+  autoBan: {
+    enabled: boolean;
+    updatedAt: string;
+    updatedBy: string;
+    domestic: {
+      enabled: boolean;
+      updatedAt: string;
+      updatedBy: string;
+      /**
+       * 豁免区域（省份 / 城市名，子串匹配）：这些地方的来源不自动封，
+       * 仍会开申请单走人工。空 = 不豁免。
+       */
+      exempt: string[];
+    };
+  };
   pending: OfficeGuardPending[];
   blocks: OfficeGuardBlock[];
   thresholds: { hitsMed: number; hitsHigh: number; hitsCrit: number; subnetIps: number; bytesFail: number; bytesShell: number };
@@ -1992,6 +2014,21 @@ export const api = {
   pet: {
     /** 服务端有 60 秒内存缓存，所以按时轮询也打不穿上游 */
     balance: () => req<PetBalance>('/pet/balance'),
+    /**
+     * 和她闲聊。**不走 `/assistant`**：这条链路不接工作台上下文，
+     * 问到待办/余额/监控会拒绝；history 只用于让对话接得上，不落库。
+     */
+    chat: (
+      message: string,
+      opts: {
+        history?: { role: 'user' | 'assistant'; text: string }[];
+        nickname?: string;
+        /** 关系阶段 0/1/2：只影响语气，不传也不影响边界 */
+        stage?: number;
+        /** 当前情绪：calm / happy / shy / sulk */
+        mood?: string;
+      } = {},
+    ) => req<{ reply: string; engine?: string }>('/pet/chat', send('POST', { message, ...opts })),
   },
 
   settings: {
@@ -2072,13 +2109,25 @@ export const api = {
     securityDecide: (code: string, approve: boolean) =>
       req<{ ok?: boolean; output?: string }>('/office/security/decide', send('POST', { code, approve })),
     /**
-     * 境外 IP 自动封禁总开关。打开后境外来源的封禁单会直接执行，不再等人点按钮；
-     * 归属地查不到的单仍然走人工。只传布尔，服务端不做类型推断。
+     * 自动封禁总开关。打开后该方向（境外 / 国内含港澳台）的封禁单会直接执行，
+     * 不再等人点按钮；归属地查不到的单仍然走人工。
+     *
+     * 两个方向是两个独立的键，所以 scope 必传：服务端只认 'domestic'，
+     * 其余按境外处理 —— 漏传最多是没改到，不会打开另一把刀。
      */
-    securityAutoBan: (enabled: boolean) =>
-      req<{ ok?: boolean; enabled?: boolean; output?: string }>(
+    securityAutoBan: (enabled: boolean, scope: 'foreign' | 'domestic' = 'foreign') =>
+      req<{ ok?: boolean; enabled?: boolean; scope?: string; output?: string }>(
         '/office/security/auto-ban',
-        send('POST', { enabled }),
+        send('POST', { enabled, scope }),
+      ),
+    /**
+     * 国内自动封禁的**区域豁免**：名单里的省市不自动封（仍走人工审批）。
+     * 传数组就整体覆盖，传空数组即清空 —— 所以调用方要给完整名单。
+     */
+    securityAutoBanExempt: (regions: string[]) =>
+      req<{ ok?: boolean; regions?: string[]; output?: string }>(
+        '/office/security/auto-ban-exempt',
+        send('POST', { regions }),
       ),
     /**
      * 手动解封。**会在 frps 上真的执行 ipset del**，所以必须先二次确认。

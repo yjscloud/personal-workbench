@@ -2,16 +2,16 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, type PetBalance } from './api';
 
 /* ── 看板娘（桌宠）的本地状态 ──────────────────────────────────────────
-   名字叫「鲸娘」：DeepSeek 的吉祥物是一条鲸鱼，这里画的是它的人形版本。
+   名字叫「思儿」：原型是 DeepSeek 的吉祥物鲸鱼，这里画的是它的人形版本。
 
    为什么整套养成数据放 localStorage，而不是跟任务、设置一样进 MySQL：
 
-   · **它是"这台浏览器上的这只鲸娘"的事** —— 停靠在哪、心情多少、
+   · **它是"这台浏览器上的这只思儿"的事** —— 停靠在哪、睡没睡、
      今天跟你说了几句话。换一台设备时位置本来就该重算，把旧坐标拖过去
      只会让它出现在一个不存在的角落里；
    · **它不该跟着备份走**。备份的语义是"把知识库和工具箱搬回去"，
-     不是"把桌宠的心情恢复到上周三"。混进去之后，恢复一次备份会静默
-     改掉一个跟数据无关的东西，这比丢几个心情值难解释得多；
+     不是"把桌宠住哪儿改回上周三"。混进去之后，恢复一次备份会静默
+     改掉一个跟数据无关的东西，这比丢几条闲聊难解释得多；
    · 也正因为如此，这里没有任何需要保护的凭据 —— 唯一的凭据
      （DeepSeek 的 API Key）只存在服务端 .env 里，浏览器侧拿不到。
 
@@ -23,6 +23,71 @@ import { api, type PetBalance } from './api';
 export const PET_KEY = 'pet:state';
 
 export type PetDiaryEntry = { at: string; text: string };
+
+/**
+ * 一条对话。只存角色、正文与时间，不存思考过程与动作指令。
+ *
+ * `at` 是给聊天窗画时间分隔用的（"今天 14:20" / "11月3日"）。老存档里没有这个
+ * 字段，读回来时补空串 —— 界面会把这些归到「更早」，而不是假装是今天说的。
+ */
+export type PetChatEntry = { role: 'user' | 'assistant'; text: string; at: string };
+
+/** 聊天记录留多少条。一条百来字节，200 条约 40KB，localStorage 放得下 */
+export const CHAT_KEEP = 200;
+
+/** 追加一条并裁到上限。问与答两处都走它，裁剪口径就不会写岔 */
+export function pushChat(chat: PetChatEntry[], entry: PetChatEntry): PetChatEntry[] {
+  return [...chat, entry].slice(-CHAT_KEEP);
+}
+
+/** 情绪：安静是底，其余会自己散掉 */
+export type PetMood = 'calm' | 'happy' | 'shy' | 'sulk';
+/** 关系阶段：刚认识 / 熟络 / 黏人 */
+export type PetStage = 0 | 1 | 2;
+
+/**
+ * 阈值与称号。
+ *
+ * 刻意**不做等级数字**：她不会在你生日那天突然 Lv+1，也不会因为你三天没来掉级。
+ * 阶段只用来解锁台词和"她敢不敢主动要陪伴"—— 是关系的温度，不是成就列表。
+ */
+export const BOND_STAGES = [
+  { at: 0, stage: 0 as PetStage, title: '刚认识', hint: '她还在偷偷看你' },
+  { at: 24, stage: 1 as PetStage, title: '熟络', hint: '会主动讲她的一天' },
+  { at: 60, stage: 2 as PetStage, title: '黏人', hint: '会直说要你陪' },
+] as const;
+
+/** 亲密度落在哪一档 */
+export function stageOf(bond: number): PetStage {
+  if (bond >= 60) return 2;
+  if (bond >= 24) return 1;
+  return 0;
+}
+
+export function stageInfo(stage: PetStage) {
+  return BOND_STAGES[stage] ?? BOND_STAGES[0];
+}
+
+/** 情绪自己散掉的时间。闹别扭比开心长一点，像小孩记一会儿仇 */
+export const MOOD_TTL_MS: Record<Exclude<PetMood, 'calm'>, number> = {
+  happy: 4 * 60 * 1000,
+  shy: 3 * 60 * 1000,
+  sulk: 6 * 60 * 1000,
+};
+
+export const MOOD_LABEL: Record<PetMood, string> = {
+  calm: '安静',
+  happy: '开心',
+  shy: '害羞',
+  sulk: '闹别扭',
+};
+
+/** 把过期的情绪折回 calm —— 只算不写，状态本身留到下一次 patch */
+export function moodNow(state: Pick<PetState, 'mood' | 'moodAt'>, at = Date.now()): PetMood {
+  if (state.mood === 'calm') return 'calm';
+  const since = Date.parse(state.moodAt) || 0;
+  return at - since < (MOOD_TTL_MS[state.mood] ?? 0) ? state.mood : 'calm';
+}
 
 export type PetState = {
   v: 1;
@@ -37,43 +102,77 @@ export type PetState = {
   particles: boolean;
   /** 深夜静音：23:00–6:00 不主动搭话 */
   quiet: boolean;
-  /** 余额关心：按时轮询余额，低了主动提醒 */
-  watchBalance: boolean;
-  /** 余额显示数字。关掉只显示档位措辞，截图不泄露金额 */
-  showNumber: boolean;
-  /** 低余额阈值（元）。低于它就要提醒 */
-  lowThreshold: number;
   /** 它该怎么称呼你 */
   nickname: string;
-
-  /* ── 养成 ── */
-  mood: number;
-  affection: number;
-  /** 点心库存（投喂用） */
-  food: number;
-  streak: number;
-  lastCheckIn: string;
-  /** 累计摸头次数 */
-  pats: number;
-  /** 首次见面的时间 */
-  since: string;
-  /** todayPats 属于哪一天，跨零点要归零 */
-  day: string;
-  todayPats: number;
-  /** 低余额提醒当天只弹一次 */
-  lowWarnedDay: string;
-  /** "照这个用量撑不过一周"当天只提醒一次 */
-  burnWarnedDay: string;
   /**
-   * 上一次因为读不到余额而开口的时间（ISO）。
-   * 用时间戳而不是"当天一次"：读失败往往连着发生很多次（Key 撤了、代理挂了），
-   * 按天记的话一到零点又会念一遍，而这件事其实是持续状态；
-   * 冷却 6 小时，一天最多说四次。
+   * 形象：`clip` = 24 段透明动画（动态桌宠），`pose` = 24 张静态立绘。
+   *
+   * 默认动效；Safari 不认 VP9-alpha（会渲染成黑底），那种情况下
+   * 组件层会自动退回立绘，这里的值只表达"用户的偏好"，不是"实际用的"。
    */
-  balanceErrorAt: string;
+  art: 'clip' | 'pose';
+  /**
+   * 自由活动：待机时自己玩一会儿（写代码 / 撸猫 / 玩魔方 / 偷吃零食…）。
+   * 只在动效模式有意义 —— 立绘是一张静态图，没有"自己在干嘛"这回事。
+   */
+  roam: boolean;
+  /** 换动作的间隔档位（放完一段后再等多久）。安静 30~60s / 正常 7~18s / 活跃 3~7s */
+  roamGap: 'quiet' | 'normal' | 'lively';
+  /**
+   * 参与随机的小动作 id 列表（见 `assets/pet/extra/` 的文件名）。
+   *
+   * **空数组 = 全部参与**，也是默认值。用空数组而不是"把 78 个 key 都存一遍"，
+   * 是为了以后新增素材时不用去改每个人的存档 —— 默认值天然覆盖新动作。
+   * 面板上点满之后也会落回空数组（见 Pet.tsx 的 chips）。
+   */
+  roamPool: string[];
+  /**
+   * 池子存档的迁移标记。
+   *
+   * 旧版本把 `roamPool` 读回来时截断到 40 条，一次普通的 patch 就把"半份名单"
+   * 落了盘 —— 面板上看着就是只勾了一半。带上这个标记之后，旧存档里的池子
+   * 一次性作废、回到"全部参与"（默认全选），之后用户的选择才会照常保存。
+   */
+  poolV: 2;
+
+  /* ── 她的事（不是你的工作） ── */
+  /**
+   * 亲密度 0–100。**隐藏值**：界面上不显示数字、没有进度条，
+   * 只决定她解锁到哪一档（台词、主动程度）。攒得慢。
+   */
+  bond: number;
+  /** 已经解锁的关系阶段（0 刚认识 / 1 熟络 / 2 黏人），跨过阈值才更新 */
+  stage: PetStage;
+  /** 当前情绪。会随时间自己回到 calm */
+  mood: PetMood;
+  /** 情绪是什么时候开始的（ISO），用来算过期 */
+  moodAt: string;
+  /** 最近一次被摸/投喂/夸/聊天的时间 —— "想被关注"按它算 */
+  lastTouchAt: string;
+  /** 最近一次陪她玩（点播动作）的时间 */
+  lastPlayAt: string;
+  /** 上一次主动要关注/要玩的时间，避免反复索取 */
+  lastNeedAt: string;
+  /** 首次见面的时间。只用来算"一起过的第几天"，不是养成数值 */
+  since: string;
+  /** 相处记录最后写到哪一天：每天最多记一条，避免反复刷新刷出一堆 */
+  diaryDay: string;
+  /**
+   * 相处记录。**只记事，不给奖励** ——
+   * 没有签到、等级、经验条，也没有"陪够三天送点心"那种兑换。
+   * 亲密度只藏在后台用来解锁台词，不显示数字，也不拿来索要陪伴。
+   */
   diary: PetDiaryEntry[];
   /** 相对右下角的偏移（px）。null = 还没拖过，用默认位置 */
   pos: { x: number; y: number } | null;
+
+  /**
+   * 睡着了：完全安静 —— 不轮换小动作、不闲聊、不说梦话以外的任何话。
+   * 点她一下或右键「叫醒」起来。
+   */
+  asleep: boolean;
+  /** 和她的对话记录。带时间、留 200 条，用于聊天窗回看、翻历史与上下文 */
+  chat: PetChatEntry[];
 };
 
 export const defaultPetState = (): PetState => ({
@@ -83,24 +182,25 @@ export const defaultPetState = (): PetState => ({
   chatter: true,
   particles: true,
   quiet: true,
-  watchBalance: true,
-  showNumber: true,
-  lowThreshold: 10,
   nickname: '',
-  mood: 72,
-  affection: 0,
-  food: 3,
-  streak: 0,
-  lastCheckIn: '',
-  pats: 0,
+  art: 'clip',
+  roam: true,
+  roamGap: 'normal',
+  roamPool: [],
+  poolV: 2,
+  bond: 0,
+  stage: 0,
+  mood: 'calm',
+  moodAt: '',
+  lastTouchAt: new Date().toISOString(),
+  lastPlayAt: new Date().toISOString(),
+  lastNeedAt: '',
   since: new Date().toISOString(),
-  day: todayKey(),
-  todayPats: 0,
-  lowWarnedDay: '',
-  burnWarnedDay: '',
-  balanceErrorAt: '',
+  diaryDay: '',
   diary: [],
   pos: null,
+  asleep: false,
+  chat: [],
 });
 
 /** 本地时区的 YYYY-MM-DD。用 UTC 的话，晚上 8 点之后的互动会被记到第二天 */
@@ -111,7 +211,7 @@ export function todayKey(at: Date = new Date()): string {
 
 /**
  * 读一次。**逐字段兜底而不是整份退回默认** ——
- * 一个字段坏掉就把攒了几个月的签到和好感度抹平，代价太大。
+ * 一个字段坏掉就把攒了几个月的相处记录和对话抹平，代价太大。
  */
 export function loadPetState(): PetState {
   const base = defaultPetState();
@@ -134,22 +234,31 @@ export function loadPetState(): PetState {
     chatter: bool(stored.chatter, base.chatter),
     particles: bool(stored.particles, base.particles),
     quiet: bool(stored.quiet, base.quiet),
-    watchBalance: bool(stored.watchBalance, base.watchBalance),
-    showNumber: bool(stored.showNumber, base.showNumber),
-    lowThreshold: Math.max(0, num(stored.lowThreshold, base.lowThreshold)),
     nickname: typeof stored.nickname === 'string' ? stored.nickname.slice(0, 16) : base.nickname,
-    mood: clamp(num(stored.mood, base.mood), 0, 100),
-    affection: Math.max(0, Math.round(num(stored.affection, base.affection))),
-    food: Math.max(0, Math.round(num(stored.food, base.food))),
-    streak: Math.max(0, Math.round(num(stored.streak, base.streak))),
-    lastCheckIn: typeof stored.lastCheckIn === 'string' ? stored.lastCheckIn : base.lastCheckIn,
-    pats: Math.max(0, Math.round(num(stored.pats, base.pats))),
+    art: stored.art === 'pose' || stored.art === 'clip' ? stored.art : base.art,
+    roam: bool(stored.roam, base.roam),
+    roamGap:
+      stored.roamGap === 'quiet' || stored.roamGap === 'lively' || stored.roamGap === 'normal'
+        ? stored.roamGap
+        : base.roamGap,
+    /* 旧存档（没有 poolV）里那份池子可能是被截断过的半份名单，直接作废、
+       回到"全部参与"；新存档才按用户勾选读。上限 200 只是挡住被写坏的数据 */
+    roamPool:
+      stored.poolV === 2 && Array.isArray(stored.roamPool)
+        ? [...new Set(stored.roamPool.filter((x): x is string => typeof x === 'string'))].slice(0, 200)
+        : base.roamPool,
+    poolV: 2,
+    bond: Math.min(100, Math.max(0, Math.round(num(stored.bond, base.bond)))),
+    stage: Math.min(2, Math.max(0, Math.round(num(stored.stage, base.stage)))) as PetStage,
+    mood: (['calm', 'happy', 'shy', 'sulk'] as const).includes(stored.mood as PetMood)
+      ? (stored.mood as PetMood)
+      : base.mood,
+    moodAt: typeof stored.moodAt === 'string' ? stored.moodAt : base.moodAt,
+    lastTouchAt: typeof stored.lastTouchAt === 'string' ? stored.lastTouchAt : base.lastTouchAt,
+    lastPlayAt: typeof stored.lastPlayAt === 'string' ? stored.lastPlayAt : base.lastPlayAt,
+    lastNeedAt: typeof stored.lastNeedAt === 'string' ? stored.lastNeedAt : base.lastNeedAt,
     since: typeof stored.since === 'string' ? stored.since : base.since,
-    day: typeof stored.day === 'string' ? stored.day : base.day,
-    todayPats: Math.max(0, Math.round(num(stored.todayPats, base.todayPats))),
-    lowWarnedDay: typeof stored.lowWarnedDay === 'string' ? stored.lowWarnedDay : base.lowWarnedDay,
-    burnWarnedDay: typeof stored.burnWarnedDay === 'string' ? stored.burnWarnedDay : base.burnWarnedDay,
-    balanceErrorAt: typeof stored.balanceErrorAt === 'string' ? stored.balanceErrorAt : base.balanceErrorAt,
+    diaryDay: typeof stored.diaryDay === 'string' ? stored.diaryDay : base.diaryDay,
     diary: Array.isArray(stored.diary)
       ? stored.diary
           .filter((e): e is PetDiaryEntry => Boolean(e) && typeof (e as PetDiaryEntry).text === 'string')
@@ -159,6 +268,24 @@ export function loadPetState(): PetState {
       stored.pos && Number.isFinite(Number(stored.pos.x)) && Number.isFinite(Number(stored.pos.y))
         ? { x: Number(stored.pos.x), y: Number(stored.pos.y) }
         : null,
+    asleep: bool(stored.asleep, base.asleep),
+    /* 老存档只剩 20 条、也没有 at：照样读进来，缺时间的归到「更早」那一段。
+       单条正文也截一下 —— 被写坏的存档不该把整份设置顶爆 */
+    chat: Array.isArray(stored.chat)
+      ? stored.chat
+          .filter(
+            (e): e is PetChatEntry =>
+              Boolean(e) &&
+              typeof (e as PetChatEntry).text === 'string' &&
+              ((e as PetChatEntry).role === 'user' || (e as PetChatEntry).role === 'assistant'),
+          )
+          .map((e) => ({
+            role: e.role,
+            text: e.text.slice(0, 2000),
+            at: typeof e.at === 'string' ? e.at : '',
+          }))
+          .slice(-CHAT_KEEP)
+      : base.chat,
   };
 }
 
@@ -180,73 +307,7 @@ export function clearPetState(): void {
 
 export const clamp = (v: number, min: number, max: number) => Math.min(max, Math.max(min, v));
 
-/* ── 羁绊等级 ──────────────────────────────────────────────────────── */
-
-/** need = 到这一级需要的累计好感度。称号在升级那一下会进成长日记 */
-export type PetLevel = { level: number; need: number; title: string };
-
-export const LEVELS: readonly PetLevel[] = [
-  { level: 1, need: 0, title: '刚认识的鲸鱼' },
-  { level: 2, need: 15, title: '会打招呼的搭档' },
-  { level: 3, need: 40, title: '熟络的鲸娘' },
-  { level: 4, need: 80, title: '并肩值的夜班' },
-  { level: 5, need: 140, title: '鲸汐守护者' },
-  { level: 6, need: 210, title: '深海同频' },
-  { level: 7, need: 300, title: '不离不弃的羁绊' },
-];
-
-export function levelOf(affection: number): PetLevel {
-  let found = LEVELS[0];
-  for (const l of LEVELS) {
-    if (affection >= l.need) found = l;
-  }
-  return found;
-}
-
-/** 距离下一级还差多少好感度；满级返回 null */
-export function nextLevel(affection: number): { need: number; left: number } | null {
-  const next = LEVELS.find((l) => l.need > affection);
-  return next ? { need: next.need, left: next.need - affection } : null;
-}
-
-/* ── 余额档位 ──────────────────────────────────────────────────────── */
-
-export type BalanceTier = 'unknown' | 'empty' | 'low' | 'fair' | 'good';
-
-/**
- * 档位由阈值推出来，而不是写死几个金额：
- * 阈值是用户自己定的"该充钱了"那条线，档位必须跟着它走 ——
- * 写死的话（比如 5 元以下算低），把阈值调到 50 之后措辞就跟提醒对不上了。
- *
- * 关掉「余额显示数字」时界面上只有这个档位的措辞，所以它既要能一眼看出
- * 严重程度，也不能靠色相单独表意（colorless 也要读得懂）。
- */
-export function balanceTier(balance: PetBalance | null, threshold: number): BalanceTier {
-  if (!balance || !balance.configured || !balance.ok || balance.total === null) return 'unknown';
-  const total = balance.total;
-  const line = threshold > 0 ? threshold : 10;
-  if (total <= 0) return 'empty';
-  if (total <= line) return 'low';
-  if (total <= line * 3) return 'fair';
-  return 'good';
-}
-
-export const TIER_LABEL: Record<BalanceTier, string> = {
-  unknown: '待读取',
-  empty: '已用尽',
-  low: '快见底',
-  fair: '还够用',
-  good: '很充裕',
-};
-
-/** 档位 → 语气色（走全站那几个语义色，不新造颜色） */
-export const TIER_TONE: Record<BalanceTier, 'ok' | 'warn' | 'crit' | 'neutral'> = {
-  unknown: 'neutral',
-  empty: 'crit',
-  low: 'crit',
-  fair: 'warn',
-  good: 'ok',
-};
+/* ── 余额读数（顶栏用量浮层用；桌宠本身已经不看余额了） ─────────────── */
 
 const CURRENCY_SIGN: Record<string, string> = { CNY: '¥', USD: '$', EUR: '€', JPY: '¥' };
 
@@ -284,27 +345,26 @@ export function runwayText(balance: PetBalance | null): string | null {
 }
 
 /**
- * 余额面板里那句"今天花了多少"。
+ * 余额浮层里那句"今天花了多少"。
  *
- * 没有可比的一天时如实说，不摆一个 0 冒充结论；关掉「显示余额数字」时
- * **连这句话里的金额也要藏掉** —— 只把上面那个大数字藏起来是假的，
- * 消耗量同样是钱。
+ * 没有可比的一天时如实说，不摆一个 0 冒充结论 —— "今天是第一笔记录"和
+ * "今天还没花钱"是两件事，混成一句就会让人以为账户一直没动。
  */
-export function spendText(balance: PetBalance | null, showNumber = true): string {
+export function spendText(balance: PetBalance | null): string {
   if (!balance || !balance.ok) return '今天还没读到可比的数据';
   if (!balance.spend) return '今天是第一笔记录，明天才有消耗值';
   if (balance.spend.toppedUp) return '今天充过钱，所以没有消耗数';
   if (balance.spend.amount <= 0) return '今天还没花钱';
-  return showNumber ? `今天花了 ${fmtMoney(balance.spend.amount, balance.currency)}` : '今天有消耗（金额已隐藏）';
+  return `今天花了 ${fmtMoney(balance.spend.amount, balance.currency)}`;
 }
 
 /* ── React 侧的挂载 ────────────────────────────────────────────────── */
 
 /**
- * 养成状态 + 落盘。
+ * 她的状态 + 落盘。
  *
- * patch 收一个函数（而不是一个对象）：多处交互会在同一帧改同一个数
- * （摸头同时加心情和好感度），传对象的话后一次会把前一次整个盖掉。
+ * patch 收一个函数（而不是一个对象）：多处交互会在同一帧改同一份状态
+ * （比如睡下和位置同时变），传对象的话后一次会把前一次整个盖掉。
  */
 export function usePetState() {
   const [state, setState] = useState<PetState>(() => loadPetState());
@@ -317,14 +377,6 @@ export function usePetState() {
     });
   }, []);
 
-  /* 跨零点时把"今天摸了几次"归零。挂在状态上而不是定时器里：
-     空闲标签页的定时器会被浏览器掐到分钟级，而归零这件事晚几秒无所谓。 */
-  useEffect(() => {
-    const day = todayKey();
-    if (state.day === day) return;
-    patch((prev) => ({ ...prev, day, todayPats: 0 }));
-  }, [state.day, patch]);
-
   const reset = useCallback(() => {
     clearPetState();
     setState(defaultPetState());
@@ -336,6 +388,7 @@ export function usePetState() {
 /**
  * 余额轮询。
  *
+ * 只有顶栏的用量浮层在用（桌宠自己不看了，余额是工作台的事）。
  * 间隔比 token 用量（30 秒）松得多：余额是"钱"，变化只发生在你真的花了钱，
  * 而服务端本身还有 60 秒缓存 —— 打得太密只是自己空转。
  * 但**切回窗口时会立刻对一次**：刚问完模型回到页面，看到旧数会以为没扣钱。

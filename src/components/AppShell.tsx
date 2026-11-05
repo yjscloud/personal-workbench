@@ -1,4 +1,4 @@
-import { Fragment, Suspense, useEffect, useRef, useState } from 'react';
+import { Fragment, Suspense, useEffect, useId, useRef, useState } from 'react';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import {
   Activity,
@@ -12,17 +12,19 @@ import {
   Sparkles,
   Sun,
   Users,
+  Wallet,
   Wrench,
 } from 'lucide-react';
-import { api } from '@/lib/api';
-import { fmtTokens, todayTokens, usageTip, useAiUsage } from '@/lib/ai-usage';
+import { api, type AiUsage, type PetBalance } from '@/lib/api';
+import { fmtTokens, gatewaySourceLabel, todayTokens, useAiUsage, usedTokens } from '@/lib/ai-usage';
 import { useStore } from '@/lib/store';
 import { useMonitor } from '@/lib/monitor';
 import { useAuth } from '@/lib/auth';
 import { initialTheme, switchTheme, type AccentName, type ThemeMode } from '@/lib/theme';
 import { applyBackground } from '@/lib/background';
-import { cls } from '@/lib/format';
-import { Button, Led, LiveDot, Skeleton, Spinner } from './ui';
+import { cls, fmtMoney } from '@/lib/format';
+import { runwayText, spendText, usePetBalance } from '@/lib/pet';
+import { Button, Led, LiveDot, Meter, Skeleton, Spinner, toneByRatio } from './ui';
 import { SlideHighlight, useSlideBox } from './SlideHighlight';
 import { Assistant } from './Assistant';
 import { Pet } from './Pet';
@@ -446,23 +448,254 @@ function TopBar({
  * 这个数是**网关记账**（含智能办公室里那几位员工：定时任务、巡检、采集），
  * 不是面板自己调了几次 —— 面板自己那点只是其中一小块，光看它会以为一天没花什么。
  * 读到网关那份时在数后面缀一句「含员工」：否则"面板没怎么用过，怎么这么多"
- * 会让人以为数错了。悬停能看到按来源的拆分。网关那份还没读到时退回本地记账。
+ * 会让人以为数错了。
+ *
+ * 明细走**自己画的浮层**，不用原生 title：那份明细有七八行（调用、输入输出、
+ * 缓存、预算、来源拆分），原生提示框是一串等宽的黑字，既不换行也不分层，
+ * 悬停两秒还会消失。浮层里可以排版、可以画预算条，也能用键盘聚焦打开。
+ *
+ * 同一格右边还站着 DeepSeek 账户余额：token 是"今天用了多少"，余额是"还剩多少"，
+ * 这两个数要放在一起才回答得了"要不要充钱"。所以余额**不用点开**就看得见，
+ * 浮层里那份（含赠金、今日花费、还能用几天）是它的明细。
  */
 function TokenUsage() {
   const usage = useAiUsage();
+  /* 悬停展开、焦点进也展开：后者是给键盘用户的 —— 原来那份明细挂在 title 上，
+     Tab 到这里什么都不会出现，读屏也只念得到一个孤零零的数 */
+  const [open, setOpen] = useState(false);
+  const detailId = useId();
+  /* 余额要在状态栏里直接可见，不能等浮层打开才读：挂上就取一次，
+     之后 5 分钟对一次（服务端还有 60 秒缓存，打不穿上游）。
+     这个数是存量，变化只发生在真的花了钱，不必跟 token 那样 30 秒一跳。 */
+  const { balance, error: balanceError } = usePetBalance(true);
+
   if (!usage) return null;
   const gateway = usage.gateway;
+  /* 只摆**能确认**的数：没配 Key、读失败、还没读到，都不占这一格。
+     状态栏里挂一个「¥0.00」会让人以为账户空了，比不显示更糟。 */
+  const balanceText =
+    balance?.configured && balance.ok && balance.total !== null
+      ? fmtMoney(balance.total, balance.currency ?? 'CNY')
+      : null;
 
   return (
-    <span
-      className="hidden items-center gap-1.5 border border-line px-2 py-1 text-2xs text-muted md:inline-flex"
-      title={usageTip(usage)}
+    <div
+      className="relative hidden md:block"
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      /* relatedTarget 还在这一块里就别关：从触发条移到浮层上，焦点会先 blura 一次 */
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') setOpen(false);
+      }}
     >
-      <Activity size={11} aria-hidden className="shrink-0 text-accent" />
-      今日消耗 Token
-      <span className="num font-medium text-ink">{fmtTokens(todayTokens(usage))}</span>
-      {gateway ? <span className="hidden text-faint lg:inline">含员工</span> : null}
-    </span>
+      {/* 不用 button：点它没有"动作"可触发，它只是明细的开关（hover / 聚焦）。
+          做成 button 会让读屏报一个按下去什么都不会发生的按钮。 */}
+      <span
+        tabIndex={0}
+        aria-describedby={open ? detailId : undefined}
+        className={cls(
+          'flex items-center gap-1.5 rounded-field border px-2 py-1 text-2xs text-muted transition-colors duration-150',
+          open ? 'border-faint text-ink' : 'border-line hover:border-faint hover:text-ink',
+        )}
+      >
+        <Activity size={11} aria-hidden className="shrink-0 text-accent" />
+        今日消耗 Token
+        <span className="num font-medium text-ink">{fmtTokens(todayTokens(usage))}</span>
+        {gateway ? <span className="hidden text-faint lg:inline">含员工</span> : null}
+        {balanceText ? (
+          <>
+            {/* 一道竖线把"今天用了多少"和"还剩多少"分开：同一个胶囊里的两组数，
+                不加分隔会被顺着读成「49.5 万余额」 */}
+            <span aria-hidden className="ml-0.5 h-3 w-px shrink-0 bg-line" />
+            {/* 窄屏只留图标和金额（「余额」两个字放不下），图标就是它的标签 */}
+            <Wallet size={11} aria-hidden className="shrink-0 text-faint" />
+            <span className="hidden text-faint lg:inline">余额</span>
+            <span className="num font-medium text-ink">{balanceText}</span>
+          </>
+        ) : null}
+      </span>
+
+      {/* pt-2 是"过桥"：触发条与浮层之间那 8px 也属于悬停区，
+          否则鼠标从上往下走的一瞬间会经过页面背景，浮层在半路就收了 */}
+      {open ? (
+        <div
+          id={detailId}
+          role="tooltip"
+          className="absolute right-0 top-full z-50 w-[336px] pt-2"
+        >
+          <UsageDetail usage={usage} balance={balance} balanceError={balanceError} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * 用量明细浮层。
+ *
+ * 顶栏那一格只放得下一个数，而"这些 token 花在哪"才是真正要看的：
+ * 输入/输出/缓存是三种完全不同的东西（缓存只按 1/10 计价），
+ * 来源拆分则回答"是员工在跑，还是我在用助手"。
+ *
+ * 网关那份还没读到时退回面板本地记账 —— 这时候**不画预算条**：
+ * 本地记账没有预算这个概念，摆一根 0% 的条子等于凭空造了个口径。
+ */
+function UsageDetail({
+  usage,
+  balance,
+  balanceError,
+}: {
+  usage: AiUsage;
+  /** DeepSeek 账户余额（含今日花费与可用天数）。null = 还没读到 */
+  balance: PetBalance | null;
+  /** 请求本身失败（网络 / 后端），与「读到了但上游报错」是两件事 */
+  balanceError: string | null;
+}) {
+  const g = usage.gateway;
+  const total = todayTokens(usage);
+  const n = (v: number) => v.toLocaleString('zh-CN');
+
+  const budgetRatio = g && g.budget_tokens > 0 ? g.today.total / g.budget_tokens : null;
+  /* 昨天是 0 时没有"增长百分之几"可算（除零），这一段就整句不写 */
+  const delta = g && g.yesterday.total > 0 ? (g.today.total - g.yesterday.total) / g.yesterday.total : null;
+  /* "还能用几天"只在一周内见底时才回话，其余情况是 null */
+  const runway = balance ? runwayText(balance) : null;
+
+  /* 两种来源的形状不一样：网关给的是 键 → token 数，本地记账给的是 键 → 计数器。
+     先统一成"标签 + 一行文字"，下面只画一张表 */
+  const sourceRows: [string, string][] = g
+    ? Object.entries(g.today.sources)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => [gatewaySourceLabel(k), fmtTokens(v)])
+    : Object.entries(usage.sources)
+        .sort((a, b) => usedTokens(b[1]) - usedTokens(a[1]))
+        .map(([k, v]) => [usage.labels[k] ?? k, `${v.calls} 次 · ${fmtTokens(usedTokens(v))}`]);
+
+  return (
+    <div className="panel animate-fade-rise p-3 shadow-pop">
+      <div className="flex items-baseline justify-between gap-3">
+        <p className="text-2xs text-muted">今日消耗 Token</p>
+        {g && typeof g.today.cost_cny === 'number' ? (
+          <p className="num text-2xs text-muted">¥{g.today.cost_cny.toFixed(2)}</p>
+        ) : null}
+      </div>
+      <p className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        {/* 万位的数上面已经取过整了，这里补一行精确值 —— 悬停就是为了看这个 */}
+        <span className="num text-xl font-semibold leading-none text-ink">{fmtTokens(total)}</span>
+        {total >= 10_000 ? <span className="num text-3xs text-faint">{n(total)} tokens</span> : null}
+      </p>
+      <p className="mt-1 text-3xs leading-relaxed text-faint">
+        {g ? 'Hermes 网关记账，含智能办公室里的员工消耗' : '网关那份还没读到，这是面板本地记账'}
+      </p>
+
+      <dl className="mt-2.5 grid grid-cols-2 gap-x-4 gap-y-1 border-t border-line pt-2.5 text-2xs">
+        <UsageStat label="调用" value={g ? `${n(g.today.api_calls)} 次` : `${n(usage.today.calls)} 次`} />
+        <UsageStat
+          label="昨日"
+          value={g ? fmtTokens(g.yesterday.total) : fmtTokens(usedTokens(usage.yesterday))}
+        />
+        <UsageStat label="输入" value={n(g ? g.today.input : usage.today.prompt)} />
+        <UsageStat label="输出" value={n(g ? g.today.output : usage.today.completion)} />
+        {g ? <UsageStat label="缓存命中" value={n(g.today.cache_read)} /> : null}
+        {g ? <UsageStat label="计费" value={n(g.today.billed)} /> : null}
+      </dl>
+
+      {g ? (
+        /* 口径必须写出来：总量含缓存、计费不含，两者差一个数量级是常态。
+           不解释的话，看到的要么是"缓存那部分漏算了"，要么是"账单对不上" */
+        <p className="mt-1.5 text-3xs leading-relaxed text-faint">
+          计费 = 输入 + 输出，不含缓存命中（缓存按 1/10 计价）
+        </p>
+      ) : null}
+
+      {delta !== null ? (
+        <p className="mt-1.5 text-3xs text-faint">
+          {`较昨日 ${delta >= 0 ? '+' : ''}${(delta * 100).toFixed(0)}%`}
+        </p>
+      ) : null}
+
+      {budgetRatio !== null ? (
+        <div className="mt-2.5">
+          <div className="flex items-baseline justify-between gap-3 text-3xs">
+            <span className="text-faint">预算 {g?.budget_label}</span>
+            <span className="num text-muted">{(budgetRatio * 100).toFixed(0)}%</span>
+          </div>
+          {/* 超预算时条子染成告警色：80% 起琥珀、90% 起红，和监控页同一套阈值 */}
+          <Meter ratio={budgetRatio} tone={toneByRatio(budgetRatio)} className="mt-1.5" height={3} />
+        </div>
+      ) : null}
+
+      {/* DeepSeek 账户余额：token 说的是"今天用了多少"，余额说的是"还剩多少" ——
+          两个数摆在一起，才判断得出要不要充钱。四态分开写，宁可少一行，
+          也不要拿一个 0 或一个空格冒充实读到的数。 */}
+      <div className="mt-2.5 border-t border-line pt-2">
+        {balance?.configured === false ? (
+          <p className="text-3xs leading-relaxed text-faint">未配置 DeepSeek API Key，余额读不到</p>
+        ) : balance?.ok && balance.total !== null ? (
+          <>
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="text-2xs text-muted">DeepSeek 余额</span>
+              <span className="num text-sm font-semibold text-ink">
+                {fmtMoney(balance.total, balance.currency ?? 'CNY')}
+              </span>
+            </div>
+            <p className="mt-0.5 text-3xs leading-relaxed text-faint">
+              {[
+                balance.granted ? `含赠金 ${fmtMoney(balance.granted, balance.currency ?? 'CNY')}` : null,
+                spendText(balance),
+              ]
+                .filter((s): s is string => Boolean(s))
+                .join(' · ')}
+            </p>
+            {/* 只在一周内见底时才说这句：余额是存量，光看"还剩多少"判断不了要不要充值 */}
+            {runway ? <p className="mt-0.5 text-3xs text-faint">{runway}</p> : null}
+          </>
+        ) : balance && !balance.ok ? (
+          <p className="text-3xs leading-relaxed text-warn">余额读取失败：{balance.error}</p>
+        ) : balanceError ? (
+          <p className="text-3xs leading-relaxed text-warn">余额读取失败：{balanceError}</p>
+        ) : (
+          <p className="text-3xs text-faint">正在读 DeepSeek 余额…</p>
+        )}
+      </div>
+
+      {sourceRows.length ? (
+        <div className="mt-2.5 border-t border-line pt-2">
+          <p className="text-3xs text-faint">来源</p>
+          <ul className="mt-1 space-y-0.5">
+            {sourceRows.map(([label, value]) => (
+              <li key={label} className="flex items-baseline justify-between gap-3 text-2xs">
+                <span className="truncate text-muted">{label}</span>
+                <span className="num shrink-0 text-ink">{value}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      <p className="mt-2.5 border-t border-line pt-2 text-3xs leading-relaxed text-faint">
+        面板自身：今天 {n(usage.today.calls)} 次 · {fmtTokens(usedTokens(usage.today))} tokens，累计{' '}
+        {n(usage.total.calls)} 次 · {fmtTokens(usedTokens(usage.total))}
+        {g ? '；已含在上面那笔里，不另加' : ''}
+      </p>
+
+      {g?.models.length ? <p className="mt-1 text-3xs text-faint">模型 {g.models.join(' / ')}</p> : null}
+      {g?.error ? <p className="mt-1 text-3xs text-warn">上次读网关用量失败：{g.error}</p> : null}
+    </div>
+  );
+}
+
+/** 明细里的一格读数：标签在左、数值在右，数值走等宽数字 */
+function UsageStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-2">
+      <dt className="text-faint">{label}</dt>
+      <dd className="num text-ink">{value}</dd>
+    </div>
   );
 }
 

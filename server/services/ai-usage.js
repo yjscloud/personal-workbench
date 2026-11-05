@@ -28,6 +28,7 @@ export const SOURCE_LABELS = {
   assistant: '工作台助手',
   article: '文章助手',
   news: 'AI 读',
+  pet: '思儿闲聊',
   other: '其它',
 };
 

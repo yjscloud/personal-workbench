@@ -166,9 +166,15 @@ export async function hermesSeats({ timeout = 15000 } = {}) {
   }
   if (!data) throw new Error('数据桥没有返回工位状态');
 
+  const installed = data.gateway_version || null;
+  const running = data.gateway_running_version || null;
   return {
     baseUrl: cfg.baseUrl,
-    gatewayVersion: data.gateway_version || null,
+    /* 盘上装的版本：升级后立刻跟着变，不必等网关重启 */
+    gatewayVersion: installed,
+    /* 进程自报的版本：它与上面那个不同，说明新代码已经在盘上但网关还没重启到位 */
+    gatewayRunningVersion: running,
+    gatewayRestartPending: Boolean(installed && running && installed !== running),
     seats: data.seats ?? null,
     staffed: data.staffed ?? null,
     vacant: data.vacant ?? null,

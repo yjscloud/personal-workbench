@@ -135,6 +135,14 @@ app.use('/api', (_req, res) => res.status(404).json({ ok: false, error: '接口�
 /* 生产模式下直接托管构建产物 */
 const distDir = path.join(ROOT, 'dist');
 if (fs.existsSync(distDir)) {
+  /* /assets 下的文件名都带内容哈希，改了就换名字，所以可以放心让浏览器长期留着。
+     这一条对桌宠的 24 段动画最要紧：一段 400KB、每次刷新都重新校验甚至重下，
+     体验和流量都很难看；设成 immutable 之后第二次打开是 0 请求。
+     注意只对 /assets 生效，index.html 仍然每次都问（否则发版后拿不到新的入口）。 */
+  app.use(
+    '/assets',
+    express.static(path.join(distDir, 'assets'), { index: false, immutable: true, maxAge: '30d' }),
+  );
   app.use(express.static(distDir, { index: false }));
   app.get('*', (_req, res) => res.sendFile(path.join(distDir, 'index.html')));
 }

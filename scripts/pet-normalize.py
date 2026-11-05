@@ -126,7 +126,7 @@ def main() -> int:
         if not m:
             print(f'跳过（文件名里没有 NN-pose）: {os.path.basename(path)}')
             continue
-        name = f'{m.group(1)}-{m.group(2)}.png'
+        name = f'{m.group(1)}-{m.group(2)}.webp'
         if name in seen:
             print(f'!! 撞名 {name}: {seen[name]} / {path}')
             continue
@@ -136,7 +136,10 @@ def main() -> int:
         bbox = out.split()[3].getbbox()
         print(f'{name:18s} bbox={bbox}')
         if not args.check:
-            out.save(os.path.join(args.dst, name))
+            # 出 WebP 而不是 PNG：同样的画面 298KB → 58KB，24 张 7.3MB → 1.4MB。
+            # quality 95 而不是 90：WhaleFace 会把 idle 放大到 190% 裁脸，
+            # 90 之后眼睛高光和发丝边缘能看出来。
+            out.save(os.path.join(args.dst, name), format='WEBP', quality=95, method=6)
 
     missing = 24 - len(seen)
     print(f'\n处理 {len(seen)} 张' + (f'，还差 {missing} 张' if missing else '，24 张齐了'))

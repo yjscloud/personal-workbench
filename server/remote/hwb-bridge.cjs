@@ -1273,6 +1273,62 @@ function secTs(msAgo) {
     + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
 }
 
+/**
+ * `frp_guard.py json` 的落盘缓存。
+ *
+ * 上面那个 `cached()` 是进程内 Map —— 而桥**每次调用都是一个新 node 进程**
+ * （工作台每次 bridgeCall 都 ssh 过来跑一遍），所以它对这些跨请求的数据
+ * 从来没命中过，"30 秒缓存"等于不存在。这条快照要 ssh 两台主机现采日志，
+ * 一遍就是几秒到二十几秒，页面上每开一次守望页就付一次。
+ *
+ * 于是把快照单独存一份文件（TTL 60 秒，分析窗口是 10 分钟，不看这一分钟）：
+ *   · 只缓存现采结果，库里的待授权/封禁记录照旧现查 —— 那是要立刻看到的；
+ *   · 读写都兜住异常：缓存坏了只等于慢一次，不能让整块快照黑掉；
+ *   · 先写临时文件再 rename，避免读到写了一半的 JSON。
+ */
+const SECURITY_SNAPSHOT_CACHE = path.join(HARVESTER_DIR, 'security', 'snapshot_cache.json');
+const SECURITY_SNAPSHOT_TTL = Number(process.env.AO_SECURITY_SNAPSHOT_TTL_MS || 60000);
+/* 失败只记 20 秒：够挡住"连续点几次都等满 40 秒"，又不至于让一次偶发抖动
+   在页面上挂成一条一分钟都下不去的"采集异常"。 */
+const SECURITY_SNAPSHOT_FAIL_TTL = 20000;
+
+function readSnapshotCache() {
+  try {
+    const raw = fs.readFileSync(SECURITY_SNAPSHOT_CACHE, 'utf8');
+    const hit = JSON.parse(raw);
+    if (!hit) return null;
+    const age = Date.now() - Number(hit.at);
+    /* age < 0：系统时间被往回拨过，这份缓存说不清新旧，按没有处理 */
+    if (!Number.isFinite(age) || age < 0) return null;
+    if (hit.ok === true && hit.output && age < SECURITY_SNAPSHOT_TTL) return hit;
+    if (hit.ok === false && age < SECURITY_SNAPSHOT_FAIL_TTL) return hit;
+  } catch (e) { /* 没有缓存 / 读到半截 / 过期：都按没有处理 */ }
+  return null;
+}
+
+function writeSnapshotCache(entry) {
+  try {
+    fs.mkdirSync(path.dirname(SECURITY_SNAPSHOT_CACHE), { recursive: true });
+    const tmp = SECURITY_SNAPSHOT_CACHE + '.' + process.pid + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(entry));
+    fs.renameSync(tmp, SECURITY_SNAPSHOT_CACHE);
+  } catch (e) { /* 缓存写不进去只是慢一次，不影响这次返回 */ }
+}
+
+/** 实时快照：优先吃 60 秒内的落盘缓存，否则现采一次并回写（失败也记 20 秒） */
+function liveSnapshot() {
+  const hit = readSnapshotCache();
+  if (hit) {
+    return Promise.resolve(hit.ok
+      ? { ok: true, output: hit.output, error: '', cached: true }
+      : { ok: false, output: '', error: hit.error || '采集器没有给出结果', cached: true });
+  }
+  return runFrpGuard(['json'], 40000).then((live) => {
+    writeSnapshotCache({ at: Date.now(), ok: live.ok && !!live.output, output: live.output, error: live.error });
+    return live;
+  });
+}
+
 function securityPayload() {
   return cached('security', async () => {
     const since24 = secTs(24 * 3600 * 1000);
@@ -1322,10 +1378,18 @@ function securityPayload() {
     const geoFill = [];
     pending.forEach((p) => { if (p.ip && !p.geo && !geoFill.includes(p.ip)) geoFill.push(p.ip); });
     blocks.forEach((b) => { if (b.ip && !b.geo && !geoFill.includes(b.ip)) geoFill.push(b.ip); });
-    if (geoFill.length) {
-      const g = await runFrpGuard(['geo', '--ips', geoFill.slice(0, 60).join(',')], 15000);
+
+    /* 两件事并行：补归属地（最多 15s）与实时快照（最多 40s）。
+       它们互不依赖，串着做等于让「补个归属地」白占十秒；而这条接口的
+       每一秒都直接压在打开守望页的等待上。 */
+    const geoJob = geoFill.length
+      ? runFrpGuard(['geo', '--ips', geoFill.slice(0, 60).join(',')], 15000)
+      : Promise.resolve(null);
+    const [g, live] = await Promise.all([geoJob, liveSnapshot()]);
+
+    if (g && g.ok && g.output) {
       let geoMap = {};
-      try { geoMap = g.ok && g.output ? JSON.parse(g.output) : {}; } catch (e) { geoMap = {}; }
+      try { geoMap = JSON.parse(g.output) || {}; } catch (e) { geoMap = {}; }
       const fill = (row) => {
         if (!row.geo) row.geo = String((geoMap[row.ip] || {}).place || '');
       };
@@ -1333,7 +1397,6 @@ function securityPayload() {
       blocks.forEach(fill);
     }
 
-    const live = await runFrpGuard(['json'], 40000);
     let snapshot = null;
     try { snapshot = live.ok && live.output ? JSON.parse(live.output) : null; } catch (e) { snapshot = null; }
 
@@ -1357,21 +1420,42 @@ function securityPayload() {
     /* 24h 涉及服务数按中文名去重（双源合并后口径） */
     const services24 = new Set(svcRowsRaw.map((r) => alias[r.proxy] || r.proxy)).size;
 
-    /* 自动封禁开关的真实状态。
-       不返回它，面板上那个 Toggle 只能显示默认的「关闭」—— 用户以为没开、
+    /* 自动封禁开关的真实状态（境外 / 国内两个键，各管一边）。
+       不返回它，面板上那两个 Toggle 只能显示默认的「关闭」—— 用户以为没开、
        实际开着，值守脚本照旧自动执行。老库没有 settings 表时按关闭处理，
-       与 frp_guard.py 的 auto_ban_enabled() 保持同一语义。 */
-    let autoBan = { enabled: false, updated_at: '', updated_by: '' };
-    try {
-      const row = sqliteAll(SECURITY_DB,
-        "select value, updated_at, updated_by from settings where key = 'auto_ban_foreign'")[0];
-      const v = String((row && row.value) || '').trim().toLowerCase();
-      autoBan = {
+       与 frp_guard.py 的 auto_ban_enabled() / auto_ban_domestic_enabled() 同语义。 */
+    const flagState = (rows, key) => {
+      const row = rows.find((x) => x.key === key) || {};
+      const v = String(row.value || '').trim().toLowerCase();
+      return {
         enabled: ['1', 'true', 'on', 'yes'].includes(v),
-        updated_at: (row && row.updated_at) || '',
-        updated_by: (row && row.updated_by) || '',
+        updated_at: String(row.updated_at || ''),
+        updated_by: String(row.updated_by || ''),
       };
-    } catch (e) { /* 没有 settings 表：保持关闭 */ }
+    };
+    let autoBan = {
+      enabled: false, updated_at: '', updated_by: '',
+      domestic: { enabled: false, updated_at: '', updated_by: '', exempt: [] },
+    };
+    try {
+      const rows = sqliteAll(SECURITY_DB,
+        "select key, value, updated_at, updated_by from settings "
+        + "where key in ('auto_ban_foreign', 'auto_ban_domestic', 'auto_ban_domestic_exempt')");
+      const exemptRow = rows.find((x) => x.key === 'auto_ban_domestic_exempt') || {};
+      autoBan = {
+        ...flagState(rows, 'auto_ban_foreign'),
+        /* 国内自动封禁是后加的键：老库里没有这一行，读到 undefined 就是关闭。
+           exempt 是「这些省市不自动封」的区域名，由 frp_guard.py 判定时用。 */
+        domestic: {
+          ...flagState(rows, 'auto_ban_domestic'),
+          exempt: String(exemptRow.value || '')
+            .split(/[,，、;；\s]+/)
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .slice(0, 20),
+        },
+      };
+    } catch (e) { /* 没有 settings 表：两个都保持关闭 */ }
 
     return {
       summary24h: { total: sum.n || 0, sources: sum.ips || 0, services: services24 },
@@ -1542,23 +1626,56 @@ async function handleSecurityAllow(req, res) {
 }
 
 /**
- * 境外 IP 自动封禁总开关。
+ * 自动封禁总开关（境外 / 国内两个方向）。
  *
  * 这个接口以前根本没实现：面板上那个 Toggle 一点就 405（Method Not Allowed），
  * 所以"关掉了"其实什么也没关 —— 库里 auto_ban_foreign 还是老值，值守脚本
  * 继续按旧状态自动执行。教训是：开关这种能改变"封禁要不要等人"的东西，
  * 必须把写入链路走通，否则界面在撒谎。
  *
+ * 两个方向是两个独立的键（auto_ban_foreign / auto_ban_domestic），所以请求里
+ * 必须带上 scope：scope 只认 'domestic'，其余（含缺省）一律按境外处理 ——
+ * 少传一个字段只该"什么都没改"，绝不该悄悄打开另一把刀。
+ *
  * 只认显式布尔：传错类型一律按"关闭"处理，绝不因为缺参而把开关打开。
  */
 async function handleSecurityAutoBan(req, res) {
   const body = await readJsonBody(req, 8 * 1024);
   const enabled = body?.enabled === true;
-  const d = await runFrpGuard(['auto-ban', enabled ? '--on' : '--off', '--by', '网页设置'], 20000);
+  const scope = String(body?.scope || '').trim() === 'domestic' ? 'domestic' : 'foreign';
+  const args = ['auto-ban', enabled ? '--on' : '--off', '--by', '网页设置'];
+  if (scope === 'domestic') args.push('--domestic');
+  const d = await runFrpGuard(args, 20000);
   _cache.delete('security');
   const detail = String(d.error || '').trim() || String(d.output || '').trim();
   if (!d.ok) return sendJson(res, 400, { ok: false, error: detail || '助手侧未给出原因（命令可能没有执行）' });
-  return sendJson(res, 200, { ok: true, enabled, output: d.output });
+  return sendJson(res, 200, { ok: true, enabled, scope, output: d.output });
+}
+
+/**
+ * 国内自动封禁的**区域豁免**（这些省市不自动封，仍开单等人工）。
+ *
+ * 与开关分两个接口：一个布尔、一个列表，混在一起的话"保存开关"会顺手把
+ * 豁免清空（少传一个字段就变成全清），那是静默放宽/收紧判定，不该发生。
+ *
+ * 只接受区域名字符串数组，逐项做形状约束（长度、去控制字符、总量 20 条）；
+ * 真正的解析与落库在 frp_guard.py，两边不各写一套规则。
+ */
+async function handleSecurityAutoBanExempt(req, res) {
+  let body;
+  try { body = await readJsonBody(req, 8 * 1024); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+  const raw = Array.isArray(body?.regions) ? body.regions : null;
+  if (!raw) return sendJson(res, 400, { error: 'regions 必须是数组' });
+  const regions = raw
+    .map((r) => String(r ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 16))
+    .filter(Boolean)
+    .slice(0, 20);
+
+  const d = await runFrpGuard(['auto-ban', '--domestic-exempt', regions.join(','), '--by', '网页设置'], 20000);
+  _cache.delete('security');
+  const detail = String(d.error || '').trim() || String(d.output || '').trim();
+  if (!d.ok) return sendJson(res, 400, { ok: false, error: detail || '助手侧未给出原因（命令可能没有执行）' });
+  return sendJson(res, 200, { ok: true, regions, output: d.output });
 }
 
 /* ---------- 公开的工位状态（登录页用，无需登录） ----------
@@ -1595,6 +1712,34 @@ function scraplingReady() {
 let _officeStatus = { at: 0, val: null };
 const OFFICE_STATUS_TTL = 5000;        /* 5 秒内复用，登录页轮询不会打到网关 */
 
+/**
+ * 网关版本：以**盘上那份安装记录**为准，不信进程自报的 /health。
+ *
+ * 升级的写法是「先把代码和 install-stamp.json 写盘，最后才重启网关」，而运行中的
+ * 进程在启动时就把版本号算好并记在内存里 —— 于是升级完成后 /health 还会一直回
+ * 旧版本（本机实测：盘上 v0.22.7，/health 仍回 0.22.5，重启网关才变）。
+ * 面板那一格跟的应该是"现在装的是哪一版"，所以读 stamp；没有 stamp 的源码安装
+ * 退回 git tag；两者都没有才用升级回执里的版本。
+ *
+ * 每次调用都读一次文件：/public/agents 是几十秒一次的轮询，一个几百字节的
+ * JSON 比任何缓存都便宜，也不会出现"缓存过期那几分钟里版本是旧的"。
+ */
+function installedGatewayVersion() {
+  const stamp = readJsonSafe(path.join(INSTALL_DIR, 'install-stamp.json')) || {};
+  const fromStamp = String(stamp.baseVersion || stamp.displayVersion || '').trim();
+  if (fromStamp) return fromStamp;
+
+  try {
+    const tag = String(execSync(`git -C ${JSON.stringify(INSTALL_DIR)} describe --tags --abbrev=0`, {
+      timeout: 5000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    }) || '').trim();
+    if (tag) return tag.replace(/^v/, '');
+  } catch (_) { /* 不是 git 检出，继续往后退 */ }
+
+  const latest = readJsonSafe(path.join(HERMES_HOME, 'logs', 'update_receipts', 'latest.json')) || {};
+  return String((latest.post_update && latest.post_update.version) || '').trim();
+}
+
 /* 在线判断只要「有没有值守任务」，不要跑 infra_watch.py 的 state/alerts 探针
    （那两个加起来约 5 秒）。完整探针留给 /local/watch 页签按需取。 */
 function watchJobCount() {
@@ -1620,12 +1765,17 @@ function buildOfficeStatus() {
     const items = OFFICE_ROSTER.map((a) => ({
       id: a.id, name: a.name, en: a.en, online: !!flags[a.id],
     }));
+    /* 两个版本都给出去：gateway_version 是盘上装的（会自动跟着升级走），
+       running 是进程自报的。两者不一致 = 升级完了但网关还没重启到位，
+       界面能据此说清"为什么还显示旧的运行版本" */
+    const runningVersion = (gw && gw.version) || '';
     return {
       seats: OFFICE_SEATS,
       staffed: items.length,
       vacant: Math.max(0, OFFICE_SEATS - items.length),
       online: items.filter((a) => a.online).length,
-      gateway_version: (gw && gw.version) || '',
+      gateway_version: installedGatewayVersion() || runningVersion,
+      gateway_running_version: runningVersion,
       items,
       checked_at: new Date().toISOString(),
     };
@@ -2917,6 +3067,10 @@ async function handleLocal(req, res) {
     if (req.method === 'POST' && route === '/local/security/reject') return handleSecurityDecision(req, res, false);
     /* 自动封禁总开关：写 attacks.db 的 settings，由 frp_guard.py 落库并审计 */
     if (req.method === 'POST' && route === '/local/security/auto-ban') return handleSecurityAutoBan(req, res);
+    /* 国内自动封禁的区域豁免（哪些省市不自动封） */
+    if (req.method === 'POST' && route === '/local/security/auto-ban-exempt') {
+      return handleSecurityAutoBanExempt(req, res);
+    }
     /* 手动解封：误封（尤其自动封禁误伤）之后的自救入口，删不掉就不会改状态 */
     if (req.method === 'POST' && route === '/local/security/unblock') return handleSecurityUnblock(req, res);
     /* 白名单：读 / 增删。写操作只认 IP 或 CIDR，挡住 0.0.0.0/0 这种东西 */

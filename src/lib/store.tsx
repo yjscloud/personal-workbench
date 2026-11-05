@@ -11,7 +11,6 @@ import {
   type Ticket,
   type Todo,
 } from './api';
-
 type Toast = { id: number; text: string; tone: 'ok' | 'warn' | 'crit' };
 
 type StoreValue = {
