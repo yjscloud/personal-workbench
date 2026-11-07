@@ -1053,10 +1053,15 @@ export function securityAllowList() {
 }
 
 /** 白名单：增 / 删。真正的格式校验在桥那侧（挡 0.0.0.0/0 这类写法） */
-export function securityAllowSave(entry, action = 'add') {
+export function securityAllowSave(entry, action = 'add', note = '') {
   return bridgeCall('/local/security/allow', {
     method: 'POST',
-    body: { entry: String(entry || '').trim(), action: action === 'remove' ? 'remove' : 'add' },
+    body: {
+      entry: String(entry || '').trim(),
+      action: action === 'remove' ? 'remove' : 'add',
+      /* 备注让自动同步加的条目能被认出来（换 IP 时只删自己那条） */
+      note: String(note || '').trim(),
+    },
     timeout: 15000,
   }).then(normalizeAllow);
 }

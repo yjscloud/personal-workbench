@@ -1257,6 +1257,43 @@ export type OfficeSecurityAllow = {
   entries: { value: string; note: string }[];
 };
 
+/**
+ * 出口 IP 自动加白的状态。
+ *
+ * `ip` 是最近一次检测到的出口，`appliedIp` 是当前写在白名单里的那条 ——
+ * 两者不同就说明检测失败或自动同步被关掉了，页面要把这件事说出来。
+ */
+export type OfficeSecurityEgress = {
+  ok: boolean;
+  enabled: boolean;
+  intervalMinutes: number;
+  /** 自动条目备注的前缀（页面用它把「自动加的」和「手写的」分开） */
+  marker: string;
+  /** 出口写死在 EGRESS_ALLOW_IP，不走外部接口 */
+  fixed: boolean;
+  bridgeReady: boolean;
+  ip: string;
+  appliedIp: string;
+  /** 这个 IP 是怎么得来的：gateway 最可信，global 只是兜底 */
+  via: 'gateway' | 'domestic' | 'global' | 'fixed' | '';
+  viaLabel: string;
+  /** 归属地（查不到就是空串），用来让人一眼确认"确实是广州那条线" */
+  place: string;
+  checkedAt: string;
+  changedAt: string;
+  nextAt: string;
+  failStreak: number;
+  lastError: string;
+  sources: { name: string; ok: boolean; ip: string }[];
+  history: { at: string; from: string; to: string; by?: string }[];
+  note: string;
+  /** 本轮是否真的写了白名单（false = 只检测） */
+  applied?: boolean;
+  changes?: { added: string[]; removed: string[]; applied: boolean };
+  expected?: { add: string; remove: string };
+  error?: string;
+};
+
 /** 破坏性操作日志：重置 / 导入 / 云恢复 / 批量彻底删除 / 封禁决策与解封 */
 export type OperationLogItem = {
   seq: number;
@@ -2143,6 +2180,19 @@ export const api = {
     /** 白名单：增删。格式校验在服务端，前端传什么都要过一遍 */
     securityAllowSave: (entry: string, action: 'add' | 'remove' = 'add') =>
       req<OfficeSecurityAllow>('/office/security/allow', send('POST', { entry, action })),
+    /**
+     * 出口 IP 自动加白：状态。服务端每 30 分钟自己跑一轮，这里只读结果。
+     * 关掉自动同步后仍可读到最近一次的检测值（appliedIp 会停在旧值）。
+     */
+    securityEgress: () => req<OfficeSecurityEgress>('/office/security/egress'),
+    /**
+     * 立即检测一轮。**开着自动同步时会真的改白名单**（删旧加新）；
+     * 关着时只检测、不写入 —— 关掉的开关不该被一次点击绕过去。
+     */
+    securityEgressCheck: () => req<OfficeSecurityEgress>('/office/security/egress/check', send('POST', {})),
+    /** 自动同步开关，只影响 30 分钟那一轮，不动已有的白名单条目 */
+    securityEgressToggle: (enabled: boolean) =>
+      req<OfficeSecurityEgress>('/office/security/egress/toggle', send('POST', { enabled })),
   },
 
   search: {

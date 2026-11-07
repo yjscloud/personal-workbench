@@ -18,6 +18,7 @@ import { collectStars, ensureStarsFresh } from './services/github-stars.js';
 import { runDueReminders } from './services/reminders.js';
 import { startSampler, stopSampler } from './services/sampler.js';
 import { warmOfficeData } from './services/office.js';
+import { startEgressSync } from './services/security-egress.js';
 import { bridgeCall } from './services/hermes-local.js';
 import { purgeOldKnowledge, purgeOldMonitoringData, purgeOldNews } from './services/retention.js';
 import { applyBackupSchedule } from './services/backup.js';
@@ -366,6 +367,10 @@ async function bootstrap() {
     startSampler();
     // AI 用量同理：桥要靠"被调用"才会把增量记到当天
     startUsageSampler();
+    /* 出口 IP 自动加白：家宽 / 4G 的出口会变，白名单里那条旧 IP 一失效，
+       自己人就被自己的规则当成扫描来源。30 分钟对一次，变了就换掉。
+       和采样器一样挂在启动块里：它需要数据桥可用，不需要人打开页面。 */
+    startEgressSync();
 
     /* 智能办公首屏预热：工位 / 待办 / 用量 / 守望摘要先拉进内存缓存，
        用户第一次点开就不用为 SSH 冷启动买单。失败只记日志，不影响启动 */

@@ -1,5 +1,6 @@
 import https from 'node:https';
 import http from 'node:http';
+import tls from 'node:tls';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,12 +24,20 @@ const DEFAULT_CA_FILE = path.join(__dirname, '..', 'data', 'pve-ca.pem');
  */
 function trustedCa() {
   const file = (process.env.PVE_CA_FILE || '').trim() || DEFAULT_CA_FILE;
+  let pem = '';
   try {
-    const pem = fs.readFileSync(file, 'utf8');
-    return /BEGIN CERTIFICATE/.test(pem) ? pem : null;
+    pem = fs.readFileSync(file, 'utf8');
   } catch {
-    return null;
+    return null; /* 没有这个文件：按 Node 默认根走，公网证书照常能过 */
   }
+  if (!/BEGIN CERTIFICATE/.test(pem)) return null;
+
+  /* 传 ca 是**整份替换**，不是追加：一旦给了这张私有 CA，Node 内置的那批
+     Mozilla 根就不再生效。以前 pveproxy 用 pve-root-ca 自签，单给它正合适；
+     但 PVE 换成公网证书（TrustAsia / Let's Encrypt）之后，这张 CA 里没有
+     那条链 —— 证书完全正确也会报 UNABLE_TO_GET_ISSUER_CERT_LOCALLY，
+     界面上就是"监控离线"。所以必须把内置根一起给它。 */
+  return [pem, ...tls.rootCertificates];
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -44,6 +53,9 @@ export function pveConfig(settings) {
     tokenSecret: (p.tokenSecret || process.env.PVE_TOKEN_SECRET || '').trim(),
     node: (p.node || process.env.PVE_NODE || '').trim(),
     verifyTls: typeof p.verifyTls === 'boolean' ? p.verifyTls : envTls === 'true',
+    /* 证书上写的是域名、连接却用 IP 时（很常见：内网直连 172.16.x.x），
+       校验的主机名要单独给 —— 否则链是通的，也会以 ALTNAME_INVALID 失败。 */
+    serverName: (p.serverName || process.env.PVE_TLS_SERVERNAME || '').trim(),
   };
 }
 
@@ -63,7 +75,18 @@ function friendlyPveError(message) {
   if (noNode) return `PVE 上没有叫「${noNode[1]}」的节点，请检查「默认节点」是否填错`;
   if (/getaddrinfo|ENOTFOUND|EAI_AGAIN/.test(text)) return `连不上 PVE 主机（${text}）`;
   if (/ECONNREFUSED/.test(text)) return 'PVE 拒绝了连接，请确认 8006 端口可达、地址与协议（https）正确';
-  if (/certificate|self-signed|UNABLE_TO_VERIFY/i.test(text)) return '证书校验失败，自签证书请在设置里打开「信任自签证书」';
+  if (/ALTNAME|does not match certificate/i.test(text)) {
+    return '证书和地址对不上：证书是签给某个域名的，而这里填的是 IP（或反过来）。'
+      + '用内网 IP 连接时，请在 .env 里补 PVE_TLS_SERVERNAME=<证书上的域名>；'
+      + '或把 PVE 地址改成证书里的那个名字。别用关掉校验来绕。';
+  }
+  if (/certificate|self-signed|UNABLE_TO_VERIFY|ISSUER_CERT|CERT_HAS_EXPIRED/i.test(text)) {
+    /* 这句以前只提"自签证书去关校验"，但更常见的其实是**证书换过**：
+       pveproxy 从自签换成公网证书（或反过来），而 data/pve-ca.pem 里还是旧签发者。
+       把两种可能都说出来，别让人第一反应就是把校验关掉。 */
+    return `证书校验失败（${text}）。若 PVE 最近换过证书，检查 server/data/pve-ca.pem 是否还是当前签发者`
+      + '（PVE 上是 /etc/pve/pve-root-ca.pem）；确认无误后可载入正确的 CA，或临时关掉「校验证书」';
+  }
   if (/401|permission|Authentication/i.test(text)) return '认证失败，请检查 Token ID 与密钥，并确认该 Token 已被授予权限（PVE 默认新建 Token 没有权限）';
   return text || '未知错误';
 }
@@ -110,6 +133,8 @@ function request(cfg, apiPath, { method = 'GET', timeout = 8000, body = null } =
         method,
         rejectUnauthorized: cfg.verifyTls,
         ...(ca ? { ca } : {}),
+        /* 只在开了校验时给：关校验的时候 servername 只会影响 SNI，没意义 */
+        ...(cfg.verifyTls && cfg.serverName ? { servername: cfg.serverName } : {}),
         headers: {
           Authorization: authHeader(cfg),
           Accept: 'application/json',

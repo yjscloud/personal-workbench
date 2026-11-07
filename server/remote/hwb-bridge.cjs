@@ -1577,6 +1577,49 @@ function allowEntries() {
   return out;
 }
 
+/**
+ * 网关地址：frp_guard.py 是权威来源 —— 它才是真正连过去执行 ipset 的那个人，
+ * 白名单要挡的也正是它日志里的源地址。
+ * 取值顺序：本进程环境变量 > ~/.hermes/.env > 脚本里的默认值。
+ */
+function frpsTarget() {
+  const fromEnv = String(process.env.FRPS_SSH || '').trim();
+  if (fromEnv) return fromEnv;
+  const envText = readTextSafe(path.join(HERMES_HOME, '.env'));
+  const fromFile = envText.match(/^\s*FRPS_SSH\s*=\s*(\S+)/m);
+  if (fromFile) return fromFile[1].trim();
+  const py = readTextSafe(FRP_GUARD_PY);
+  const fromPy = py.match(/FRPS_SSH\s*=\s*os\.environ\.get\(\s*["']FRPS_SSH["']\s*,\s*["']([^"']+)["']/);
+  return fromPy ? fromPy[1].trim() : '';
+}
+
+/**
+ * 「服务器看到的工位出口 IP」。
+ *
+ * 为什么不直接问 ipify 这类公网回显：去国外的流量和去网关的流量可能被分流到
+ * 不同出口（实测这台机器去 ipify 是香港，去网关是广州移动），而白名单要挡的
+ * 是后者。ssh 到网关让它报出自己的 SSH_CLIENT —— 那就是 frps / haproxy 日志
+ * 里会出现的那个源地址，一步不用猜，也不依赖任何第三方接口。
+ */
+function probeEgressFromGateway(timeoutMs) {
+  const target = frpsTarget();
+  if (!target) return Promise.resolve({ ok: false, error: '找不到网关地址（FRPS_SSH）' });
+  return new Promise((resolve) => {
+    execFile('ssh',
+      ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6', '-o', 'StrictHostKeyChecking=no',
+        '-o', 'LogLevel=ERROR', target, 'printenv SSH_CLIENT'],
+      { timeout: timeoutMs || 12000, maxBuffer: 1 << 16 },
+      (err, stdout, stderr) => {
+        const ip = String(stdout || '').trim().split(/\s+/)[0] || '';
+        if (err || !/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+          const why = String(stderr || '').trim() || String((err && err.message) || '').trim();
+          return resolve({ ok: false, target, error: (why || '网关没有返回来源地址').slice(0, 300) });
+        }
+        resolve({ ok: true, ip, target, via: 'gateway' });
+      });
+  });
+}
+
 /* 写之前先校验。一个手滑的 0.0.0.0/0 等于把整套防护关掉，
    这种事不能靠人自觉 —— 掩码比 /8 还宽的一律拒掉。 */
 function parseAllowEntry(raw) {
@@ -1602,13 +1645,25 @@ async function handleSecurityAllow(req, res) {
   const action = String(body?.action || 'add');
   const entry = parseAllowEntry(body?.entry);
   if (!entry) return sendJson(res, 400, { error: '只接受 IPv4 或 CIDR（掩码不小于 /8）' });
+  /* 备注不是装饰：出口 IP 自动同步要靠它认出「哪一条是我自动加的」——
+     换 IP 时删的是自己那一条，绝不碰人手工写的记录。所以备注也当不可信输入处理：
+     井号会截断注释、换行会凭空多出一行，一律压成空格。 */
+  const note = String(body?.note || '').replace(/[#\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60);
 
   const lines = readAllowLines();
   const exists = allowEntries().some((e) => e.value === entry);
-  if (action === 'add' && !exists) {
-    /* 追加前补一个换行：文件末尾没有换行时直接 push 会把两条粘成一条 */
-    if (lines.length && lines[lines.length - 1].trim()) lines.push(entry);
-    else lines.push(entry);
+  if (action === 'add') {
+    const line = note ? `${entry} # ${note}` : entry;
+    if (!exists) {
+      /* 追加前补一个换行：文件末尾没有换行时直接 push 会把两条粘成一条 */
+      if (lines.length && lines[lines.length - 1].trim()) lines.push(line);
+      else lines.push(line);
+    } else if (note) {
+      /* 值已存在：只更新这一行的备注，位置与其它条目都不动 */
+      for (let i = 0; i < lines.length; i += 1) {
+        if (lines[i].split('#')[0].trim() === entry) lines[i] = line;
+      }
+    }
   } else if (action === 'remove' && exists) {
     const kept = lines.filter((l) => l.split('#')[0].trim() !== entry);
     lines.length = 0;
@@ -3078,6 +3133,8 @@ async function handleLocal(req, res) {
       if (req.method === 'GET' || req.method === 'POST') return handleSecurityAllow(req, res);
       return send({ error: 'Method Not Allowed' }, 405);
     }
+    /* 「服务器看到的工位出口 IP」：白名单要挡的是网关眼里的源地址 */
+    if (route === '/local/security/egress') return send(await probeEgressFromGateway());
     /* 设置页保存飞书机器人配置时把这份推过来（见 services/feishu-bot.js） */
     if (req.method === 'POST' && route === '/local/feishu-config') return handleFeishuConfig(req, res);
     if (route === '/local/harvester/sites') {

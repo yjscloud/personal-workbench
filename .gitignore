@@ -23,6 +23,9 @@ server/data/usage-overrides.json
 # IP 归属地查询缓存
 server/data/.ip-geo-cache.json
 
+# 出口 IP 自动加白的运行时状态：记录的是这台机器当前出口，属于环境事实而非代码
+server/data/security-egress.json
+
 # 浏览器自动化留下的无障碍树快照，里面是真实工单内容
 trash.yaml
 # playwright-cli 的会话目录：快照同样含真实数据，且每次跑都是新的

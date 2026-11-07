@@ -32,6 +32,7 @@ import {
   securityAllowList,
   securityAllowSave,
 } from './services/office.js';
+import { egressStatus, setEgressEnabled, syncEgress } from './services/security-egress.js';
 import { readGovernor, GOVERNORS } from './services/cpu.js';
 import { backgroundStatus, saveBackground, clearBackground } from './services/background.js';
 import { sampleOnce, samplerStatus } from './services/sampler.js';
@@ -3409,6 +3410,47 @@ router.post(
     const r = await securityAllowSave(entry, act);
     /* 白名单改一条就可能让某个来源「永不告警、永不可封」，属于防护配置变更 */
     await auditOp(req, 'security.allow.' + act, entry, act === 'add' ? '加入白名单' : '移出白名单');
+    ok(res, r);
+  }),
+);
+
+/**
+ * 出口 IP 自动加白：状态 / 立即检测 / 开关。
+ *
+ * 面板和工位在同一条出口后面时，这里测到的就是 frps 看到的「自己人」源 IP。
+ * 手动检测在关掉自动同步时**只测不写** —— 一个关掉的开关不该因为点了一次
+ * 「检测」就悄悄改了防护配置；要不要生效由 enabled 说了算。
+ */
+router.get(
+  '/office/security/egress',
+  wrap(async (_req, res) => {
+    ok(res, await egressStatus());
+  }),
+);
+router.post(
+  '/office/security/egress/check',
+  wrap(async (req, res) => {
+    if (!needsLocal(res)) return;
+    const r = await syncEgress({ by: '手动检测' });
+    await auditOp(
+      req,
+      'security.egress.check',
+      r.ip || '',
+      r.applied
+        ? `出口 IP 同步：${r.ip}${r.changes?.added?.length ? '（已写入白名单）' : '（已在白名单）'}`
+        : `出口 IP 检测：${r.ip || '失败'}${r.applied === false ? '（未写入）' : ''}`,
+    );
+    ok(res, r);
+  }),
+);
+router.post(
+  '/office/security/egress/toggle',
+  wrap(async (req, res) => {
+    if (!needsLocal(res)) return;
+    const enabled = req.body?.enabled === true;
+    const r = await setEgressEnabled(enabled);
+    await auditOp(req, 'security.egress.toggle', enabled ? 'on' : 'off',
+      enabled ? '开启出口 IP 自动加白' : '关闭出口 IP 自动加白');
     ok(res, r);
   }),
 );

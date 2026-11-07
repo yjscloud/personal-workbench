@@ -37,6 +37,7 @@ import {
   type OfficeHarvestRun,
   type OfficeMessage,
   type OfficeSeatChip,
+  type OfficeSecurityEgress,
   type OfficeSeatTab,
   type OfficeSeatTabKey,
   type OfficeSession,
@@ -683,6 +684,8 @@ function GuardPane({ seat }: { seat: string }) {
      这两种要分开显示，后者才是需要用户处理的状态 */
   const [allow, setAllow] = useState<{ value: string; note: string }[] | null>(null);
   const [allowInput, setAllowInput] = useState('');
+  /* 出口 IP 自动同步：null = 还没读到（桥不通），页面据此区分"没读过"和"没开" */
+  const [egress, setEgress] = useState<OfficeSecurityEgress | null>(null);
   /* 国内自动封禁的豁免区域（省市名）。输入框本地管，名单以服务端为准 */
   const [exemptInput, setExemptInput] = useState('');
 
@@ -744,8 +747,60 @@ function GuardPane({ seat }: { seat: string }) {
       .securityAllow()
       .then((d) => { if (alive) setAllow(d.entries); })
       .catch(() => { if (alive) setAllow(null); });
+    /* 出口同步的状态是本机落盘的，不依赖数据桥 —— 桥挂了它也该读得出来，
+       这样页面才不会把「桥不通」误说成「没开自动同步」 */
+    api.office
+      .securityEgress()
+      .then((d) => { if (alive) setEgress(d); })
+      .catch(() => {});
     return () => { alive = false; };
   }, []);
+
+  /** 立即检测一轮。开着自动同步时会真的改白名单，所以文案要说清做了没有 */
+  async function checkEgress() {
+    setBusy('egress');
+    try {
+      const d = await api.office.securityEgressCheck();
+      setEgress(d);
+      /* 真改过名单就同步刷新列表，别让页面还挂着被删掉的那条 */
+      if (d.applied) {
+        api.office.securityAllow()
+          .then((r) => setAllow(r.entries))
+          .catch(() => {});
+      }
+      if (!d.ok) {
+        notify?.(d.error || d.lastError || '出口 IP 检测失败', 'crit');
+      } else if (!d.enabled) {
+        notify?.(`当前出口 ${d.ip}（自动同步未开启，没有写入白名单）`);
+      } else if (d.changes?.removed?.length) {
+        notify?.(`出口已变更为 ${d.ip}，白名单已换掉 ${d.changes.removed.join('、')}`);
+      } else {
+        notify?.(`出口 ${d.ip} 已在白名单，无需变更`);
+      }
+    } catch (e) {
+      notify?.(e instanceof Error ? e.message : '检测失败', 'crit');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  /** 开关只控制 30 分钟那一轮，不动已有条目 —— 关掉等于"从此不再自动更新" */
+  async function toggleEgress(next: boolean) {
+    if (next && !window.confirm(
+      '开启后每 30 分钟检测一次本机出口公网 IP，变化时自动把白名单里那条换掉。\n\n'
+      + '只会动页面上标着「自动」的那一条，手写的条目不受影响。继续？',
+    )) return;
+    setBusy('egress-toggle');
+    try {
+      const d = await api.office.securityEgressToggle(next);
+      setEgress(d);
+      notify?.(next ? '已开启出口 IP 自动同步' : '已关闭出口 IP 自动同步');
+    } catch (e) {
+      notify?.(e instanceof Error ? e.message : '开关失败', 'crit');
+    } finally {
+      setBusy('');
+    }
+  }
 
   async function saveAllow(entry: string, action: 'add' | 'remove') {
     setBusy('allow');
@@ -1279,6 +1334,83 @@ function GuardPane({ seat }: { seat: string }) {
               </p>
             ) : (
               <>
+                {/* 出口 IP 自动同步：家宽 / 4G 的出口会变，手抄一条 IP 迟早过期，
+                    过期了就是"自己人被自己的规则当成攻击者"。自动加的那条带固定备注，
+                    换 IP 时删的就是它 —— 人手工写的条目一条都不碰。 */}
+                <div className="mb-2 rounded-field border border-line bg-bg-2 px-2.5 py-2">
+                  <div className="flex items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                      <p className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-2xs font-medium text-ink">
+                        <Activity size={11} aria-hidden />
+                        出口 IP 自动同步
+                        {egress?.ip ? <span className="num text-muted">{egress.ip}</span> : null}
+                        {egress?.place ? <span className="text-faint">{egress.place}</span> : null}
+                        {egress ? (
+                          egress.enabled
+                            ? <Badge tone="ok">每 {egress.intervalMinutes} 分钟</Badge>
+                            : <Badge tone="warn">已关闭</Badge>
+                        ) : null}
+                        {egress?.fixed ? <Badge tone="neutral">地址写死</Badge> : null}
+                      </p>
+                      <p className="mt-1 text-2xs leading-relaxed text-faint">
+                        {!egress ? (
+                          '还没读到同步状态。'
+                        ) : egress.enabled ? (
+                          <>
+                            上次检测 {egress.checkedAt ? fmtRelative(egress.checkedAt) : '—'}，
+                            下一轮约 {egress.nextAt ? fmtRelative(egress.nextAt) : '—'}。
+                            {egress.appliedIp
+                              ? ` 白名单里当前是 ${egress.appliedIp}。`
+                              : ' 还没有写入白名单。'}
+                          </>
+                        ) : (
+                          '已关闭：现有条目保留，出口变化不会再自动更新。'
+                        )}
+                      </p>
+                      {egress?.viaLabel ? (
+                        <p className="mt-1 text-2xs leading-relaxed text-faint">
+                          来源：{egress.viaLabel}
+                          {egress.via === 'global'
+                            ? ' —— 分流环境下这可能是另一条出口，加了未必拦得住你，建议先核对 frps 日志里的源 IP。'
+                            : ''}
+                        </p>
+                      ) : null}
+                      {egress?.lastError ? (
+                        <p className="mt-1 text-2xs leading-relaxed text-warn">上一轮失败：{egress.lastError}</p>
+                      ) : null}
+                      {egress?.changedAt ? (
+                        <p className="mt-1 text-2xs leading-relaxed text-faint">
+                          {egress.history?.[0]
+                            ? `最近变更 ${fmtDateTime(egress.changedAt)}：${egress.history[0].from || '—'} → ${egress.history[0].to}`
+                            : `最近变更 ${fmtDateTime(egress.changedAt)}`}
+                        </p>
+                      ) : null}
+                    </div>
+                    <Toggle
+                      checked={egress?.enabled ?? false}
+                      disabled={!egress || busy === 'egress-toggle'}
+                      label="出口 IP 自动同步"
+                      onChange={(next) => void toggleEgress(next)}
+                    />
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={!egress || busy === 'egress' || busy === 'egress-toggle'}
+                      onClick={() => void checkEgress()}
+                      className="flex shrink-0 items-center gap-1 rounded-field border border-line bg-panel px-2.5 py-1 text-2xs text-ink transition-colors hover:border-accent hover:text-accent disabled:opacity-50"
+                    >
+                      {busy === 'egress' ? <Spinner /> : <RefreshCw size={12} />}
+                      立即检测
+                    </button>
+                    <span className="text-2xs leading-relaxed text-faint">
+                      {egress?.enabled
+                        ? '变了就删掉旧的自动条目，再加上新的'
+                        : '当前只检测，不写入白名单'}
+                    </span>
+                  </div>
+                </div>
+
                 <ul className="space-y-1">
                   {allow.map((a) => (
                     <li key={a.value} className="flex items-center gap-2 text-2xs">
@@ -1288,6 +1420,9 @@ function GuardPane({ seat }: { seat: string }) {
                       ) : (
                         <span className="flex-1" />
                       )}
+                      {egress && a.note.startsWith(egress.marker) ? (
+                        <Badge tone="accent">自动</Badge>
+                      ) : null}
                       <button
                         type="button"
                         disabled={busy === 'allow'}
