@@ -1066,6 +1066,21 @@ export function securityAllowSave(entry, action = 'add', note = '') {
   }).then(normalizeAllow);
 }
 
+/**
+ * 边界守望总开关：暂停 / 恢复上游那两班岗。
+ *
+ * 这不是"面板少看一点"——它真的会把 Hermes 上「边界攻击守望」（每 5 分钟采集）
+ * 与「边界攻击研判」（每 10 分钟判读 + 发飞书卡）一起暂停，所以必须由人显式
+ * 点、并且二次确认。超时给到 40s：网关要逐个任务 pause 再重新读一遍状态。
+ */
+export function securityGuardToggle(enabled) {
+  return bridgeCall('/local/security/enabled', {
+    method: 'POST',
+    body: { enabled: Boolean(enabled) },
+    timeout: 40000,
+  }).finally(refreshSecuritySoon);
+}
+
 function normalizeAllow(d) {
   return {
     path: String(d?.path || ''),
@@ -1213,6 +1228,24 @@ function normalizeSecurity(d) {
         exempt: (d?.auto_ban?.domestic?.exempt || []).map(String).filter(Boolean),
       },
     },
+
+    /* 总开关：上游 cron 里那两班岗（采集 / 研判）是否在跑。
+       关闭时桥不再现采日志，但历史汇总、待授权、封禁史照旧 —— 关的是"守望"，
+       不是"记忆"。paused 与 ok=false 是两件事：一个是"我自己关的"，一个是
+       "采集挂了"，页面必须分得开，否则关掉守望看起来像个故障。 */
+    paused: Boolean(d?.guard) && d?.guard?.enabled === false,
+    guardJobs: (d?.guard?.jobs || []).map((j) => ({
+      key: String(j.key || ''),
+      name: String(j.name || ''),
+      found: Boolean(j.found),
+      enabled: Boolean(j.enabled),
+      state: String(j.state || ''),
+      pausedAt: String(j.pausedAt || ''),
+      lastRunAt: String(j.lastRunAt || ''),
+      lastStatus: String(j.lastStatus || ''),
+    })),
+    guardError: String(d?.guard?.error || ''),
+    guardWarning: String(d?.guard?.warning || ''),
 
     topIps,
     subnets: (sn.subnets || []).map((s) => ({

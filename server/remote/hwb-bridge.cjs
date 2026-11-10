@@ -173,6 +173,37 @@ function gwPostJson(pathname, payload, timeoutMs) {
   });
 }
 
+/* 往网关发一个带 JSON 的请求（PATCH / POST 都走这里）。
+   与 gwGet 的区别是**失败必须 reject**：这类调用会改变守护状态，
+   静默失败等于让页面上的开关骗人。 */
+function gwSend(method, pathname, payload, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const mod = GATEWAY.protocol === 'https:' ? https : http;
+    const data = Buffer.from(JSON.stringify(payload || {}), 'utf8');
+    const headers = Object.assign({
+      'Content-Type': 'application/json',
+      'Content-Length': data.length,
+      Accept: 'application/json',
+    }, API_KEY ? { authorization: 'Bearer ' + API_KEY } : {});
+    const req = mod.request({
+      hostname: GATEWAY.hostname, port: GATEWAY.port || 80, path: pathname, method, headers,
+    }, (r) => {
+      let body = '';
+      r.on('data', (c) => { body += c; });
+      r.on('end', () => {
+        if (r.statusCode < 200 || r.statusCode >= 300) {
+          return reject(new Error('网关 HTTP ' + r.statusCode + ' ' + body.slice(0, 160)));
+        }
+        if (!body.trim()) return resolve({});
+        try { resolve(JSON.parse(body)); } catch (_) { reject(new Error('网关返回不是 JSON')); }
+      });
+    });
+    req.setTimeout(timeoutMs || 15000, () => req.destroy(new Error('网关响应超时')));
+    req.on('error', (e) => reject(e));
+    req.end(data);
+  });
+}
+
 /* 遍历目录收集 SKILL.md */
 function walkSkills(dir, source, out, depth, label, base) {
   if (depth > 6 || out.length > 800) return;
@@ -1333,6 +1364,10 @@ function securityPayload() {
   return cached('security', async () => {
     const since24 = secTs(24 * 3600 * 1000);
 
+    /* 守望开关的真实状态（来自 cron 台账，不另存一份布尔值）。
+       读的是本机文件，不产生任何等待，所以不必和下面的 SQL 并行 */
+    const guard = guardOn();
+
     const sum = sqliteAll(SECURITY_DB,
       `select count(*) n, count(distinct ip) ips, count(distinct proxy) svc
          from events where ts >= '${since24}'`)[0] || { n: 0, ips: 0, svc: 0 };
@@ -1385,7 +1420,12 @@ function securityPayload() {
     const geoJob = geoFill.length
       ? runFrpGuard(['geo', '--ips', geoFill.slice(0, 60).join(',')], 15000)
       : Promise.resolve(null);
-    const [g, live] = await Promise.all([geoJob, liveSnapshot()]);
+    /* 守望关掉时不现采：那一趟要 ssh 两台主机扫日志（几秒到二十几秒），
+       关掉的意义就是"别再打扰那两台机器"。历史汇总照旧从库里读出来。 */
+    const liveJob = guard.enabled
+      ? liveSnapshot()
+      : Promise.resolve({ ok: false, output: '', error: '', skipped: true });
+    const [g, live] = await Promise.all([geoJob, liveJob]);
 
     if (g && g.ok && g.output) {
       let geoMap = {};
@@ -1462,8 +1502,12 @@ function securityPayload() {
       topIps, topProxy, hourly, pending, blocks,
       auto_ban: autoBan,
       snapshot,
-      snapshot_ok: live.ok,
-      snapshot_error: live.error || '',
+      snapshot_ok: guard.enabled ? live.ok : false,
+      /* 关闭是一种状态，不是故障：这里留空，由页面按 guard.enabled 显示「已暂停」，
+         别让人把"我自己关的"误读成"采集挂了" */
+      snapshot_error: guard.enabled ? (live.error || '') : '',
+      /* 总开关：enabled / jobs / warning / error 原样给前端，页面据此画开关与状态 */
+      guard,
       thresholds: {
         window_min: pick(/^WINDOW_MIN = (\d+)/m, 10),
         hits_med: pick(/^TH_HITS_MED = (\d+)/m, 8),
@@ -1620,6 +1664,101 @@ function probeEgressFromGateway(timeoutMs) {
   });
 }
 
+/* ── 边界守望总开关 ────────────────────────────────────────────────────
+ * 「守望开着没有」不另存一份状态，直接看那两班岗的定时任务在不在跑：
+ *   · 采集「运维值守·边界攻击守望」每 5 分钟跑 frp_guard.py；
+ *   · 研判「运维值守·边界攻击研判」每 10 分钟判读并发飞书卡。
+ * 自己再记一份布尔值迟早会与 cron 不一致（比如有人在 Hermes 控制台里单独
+ * 暂停了采集），所以以 Hermes 的 cron 为准 —— 它才是真正决定"有没有人在
+ * 值守"的地方。
+ *
+ * 按名字匹配而不是写死 id：id 是 Hermes 生成的随机串，任务重建就变了；
+ * 名字才是这两班岗的稳定标识。
+ */
+const GUARD_JOB_PATTERNS = [
+  { key: 'collect', re: /边界攻击守望/ },
+  { key: 'judge', re: /边界攻击研判/ },
+];
+
+/**
+ * 任务台账从这里读，而不是 `/api/jobs`。
+ *
+ * 那个接口只返回**活跃**任务：一旦 pause，这两个任务会直接从列表里消失，
+ * 开关就会永远看到"找不到任务"，关掉之后再也读不出"已关闭"这个事实
+ * （实测踩过：关掉后 /api/jobs 从 8 条变成 5 条）。文件才是完整台账，
+ * pause 只改 enabled / state / paused_at 三个字段，记录一直在。
+ */
+const CRON_JOBS_FILE = path.join(HERMES_HOME, 'cron', 'jobs.json');
+
+function cronJobsFromFile() {
+  const d = readJsonSafe(CRON_JOBS_FILE);
+  if (Array.isArray(d)) return d;
+  return d && Array.isArray(d.jobs) ? d.jobs : [];
+}
+
+function guardJobState(jobs) {
+  return GUARD_JOB_PATTERNS.map((g) => {
+    const j = (jobs || []).find((x) => g.re.test(String((x && x.name) || '')));
+    return {
+      key: g.key,
+      id: j ? String(j.id || '') : '',
+      name: j ? String(j.name || '') : '',
+      found: Boolean(j),
+      enabled: j ? j.enabled !== false : false,
+      state: j ? String(j.state || '') : '',
+      pausedAt: j ? String(j.paused_at || '') : '',
+      lastRunAt: j ? String(j.last_run_at || '') : '',
+      lastStatus: j ? String(j.last_status || '') : '',
+    };
+  });
+}
+
+/** 两班岗都开着才算守望开启；被删掉一个不算"开着"，但要指名道姓说是哪个没了 */
+function guardOn() {
+  const list = guardJobState(cronJobsFromFile());
+  const found = list.filter((j) => j.found);
+  const missing = list.filter((j) => !j.found);
+  return {
+    enabled: found.length > 0 && found.every((j) => j.enabled),
+    jobs: list,
+    error: found.length ? '' : 'Hermes 上找不到边界守望的定时任务（可能被删掉了）',
+    warning: missing.length && found.length
+      ? '缺少任务：' + missing.map((m) => (m.key === 'collect' ? '采集' : '研判')).join('、')
+      : '',
+  };
+}
+
+/**
+ * 开 / 关守望。走 Hermes 官方的 pause / resume，而不是直接改 jobs.json ——
+ * 调度器自己维护 next_run_at 与状态，绕过它写文件等于赌"下次读盘"。
+ *
+ * 逐个任务执行：一个失败不该把另一个也停在半路，失败原因原样带回页面。
+ */
+async function setGuardEnabled(enabled) {
+  const before = guardOn();
+  const targets = before.jobs.filter((j) => j.found && j.enabled !== enabled);
+  const changed = [];
+  const errors = [];
+  for (const j of targets) {
+    try {
+      await gwSend('POST',
+        '/api/jobs/' + encodeURIComponent(j.id) + (enabled ? '/resume' : '/pause'), {});
+      changed.push({ id: j.id, name: j.name, key: j.key });
+    } catch (e) {
+      errors.push(`${j.name || j.id}：${e.message || e}`);
+    }
+  }
+  _cache.delete('security');
+  const after = guardOn();
+  return {
+    ...after,
+    requested: enabled,
+    changed,
+    ok: !errors.length && after.enabled === enabled,
+    error: errors.join('；') || after.error,
+  };
+}
+
 /* 写之前先校验。一个手滑的 0.0.0.0/0 等于把整套防护关掉，
    这种事不能靠人自觉 —— 掩码比 /8 还宽的一律拒掉。 */
 function parseAllowEntry(raw) {
@@ -1678,6 +1817,24 @@ async function handleSecurityAllow(req, res) {
     return sendJson(res, 500, { error: '写白名单失败：' + e.message });
   }
   return sendJson(res, 200, { ok: true, entries: allowEntries() });
+}
+
+/**
+ * 开 / 关边界守望。
+ *
+ * 只认显式布尔：`enabled !== true` 一律按"关闭"处理 —— 少传一个字段只该
+ * "什么都没改"，绝不该悄悄把采集停掉或者反过来。返回的是**执行之后**的
+ * 真实状态（重新读一遍 cron），所以页面不用猜，失败也不会显示成功。
+ */
+async function handleSecurityEnabled(req, res) {
+  let body;
+  try { body = await readJsonBody(req, 4 * 1024); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+  if (body?.enabled === undefined) return sendJson(res, 400, { error: '缺少 enabled（true / false）' });
+  try {
+    return sendJson(res, 200, await setGuardEnabled(body.enabled === true));
+  } catch (e) {
+    return sendJson(res, 502, { ok: false, error: '切换边界守望失败：' + (e.message || e) });
+  }
 }
 
 /**
@@ -3135,6 +3292,12 @@ async function handleLocal(req, res) {
     }
     /* 「服务器看到的工位出口 IP」：白名单要挡的是网关眼里的源地址 */
     if (route === '/local/security/egress') return send(await probeEgressFromGateway());
+    /* 边界守望总开关：读 = 两班岗在不在跑；写 = 暂停 / 恢复它们 */
+    if (route === '/local/security/enabled') {
+      if (req.method === 'POST') return handleSecurityEnabled(req, res);
+      if (req.method === 'GET') return send(guardOn());
+      return send({ error: 'Method Not Allowed' }, 405);
+    }
     /* 设置页保存飞书机器人配置时把这份推过来（见 services/feishu-bot.js） */
     if (req.method === 'POST' && route === '/local/feishu-config') return handleFeishuConfig(req, res);
     if (route === '/local/harvester/sites') {

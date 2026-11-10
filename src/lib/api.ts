@@ -1230,6 +1230,37 @@ export type OfficeTabGuard = {
   pending: OfficeGuardPending[];
   blocks: OfficeGuardBlock[];
   thresholds: { hitsMed: number; hitsHigh: number; hitsCrit: number; subnetIps: number; bytesFail: number; bytesShell: number };
+  /**
+   * 总开关关闭中：上游「采集」与「研判」两班岗都已暂停。
+   * 它和 `ok: false` 是两件事 —— 一个是"我自己关的"，一个是"采集挂了"。
+   */
+  paused: boolean;
+  guardJobs: OfficeGuardJob[];
+  guardError: string;
+  guardWarning: string;
+};
+
+/** 守望的两班岗在 Hermes cron 里的状态（采集 / 研判） */
+export type OfficeGuardJob = {
+  key: string;
+  name: string;
+  found: boolean;
+  enabled: boolean;
+  state: string;
+  pausedAt: string;
+  lastRunAt: string;
+  lastStatus: string;
+};
+
+/** 总开关的执行结果：桥返回的是执行之后**重新读到**的真实状态 */
+export type OfficeGuardSwitch = {
+  ok: boolean;
+  enabled: boolean;
+  requested?: boolean;
+  warning: string;
+  error: string;
+  jobs: OfficeGuardJob[];
+  changed?: { id: string; name: string; key: string }[];
 };
 
 /** 单个来源 IP 的画像（点「画像」按需深挖；首次要采 SSH 用户名，慢一点） */
@@ -2145,6 +2176,12 @@ export const api = {
      */
     securityDecide: (code: string, approve: boolean) =>
       req<{ ok?: boolean; output?: string }>('/office/security/decide', send('POST', { code, approve })),
+    /**
+     * 边界守望总开关。**会真的暂停 / 恢复上游两个定时任务**：
+     * 每 5 分钟的采集与每 10 分钟的研判（含飞书卡）。历史与白名单不受影响。
+     */
+    securityGuardToggle: (enabled: boolean) =>
+      req<OfficeGuardSwitch>('/office/security/enabled', send('POST', { enabled })),
     /**
      * 自动封禁总开关。打开后该方向（境外 / 国内含港澳台）的封禁单会直接执行，
      * 不再等人点按钮；归属地查不到的单仍然走人工。

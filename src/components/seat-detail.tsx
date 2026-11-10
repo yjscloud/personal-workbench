@@ -817,6 +817,42 @@ function GuardPane({ seat }: { seat: string }) {
   }
 
   /**
+   * 边界守望总开关。
+   *
+   * 关掉不是"少看一个页签"：它会暂停 Hermes 上的两个定时任务（每 5 分钟采集、
+   * 每 10 分钟研判并发飞书），等于这段时间没人盯着边界。所以关闭必须二次确认，
+   * 文案要把"停的是什么、什么还留着"说清楚。
+   *
+   * 成功与否以服务端返回的**执行后状态**为准：网关可能拒绝、任务可能被删，
+   * 那就如实报错并刷新页签，不能因为点了就显示已切换。
+   */
+  async function toggleGuard(next: boolean) {
+    const tip = next
+      ? '恢复边界守望？\n\n会重启「边界攻击守望」（每 5 分钟采集）与「边界攻击研判」'
+        + '（每 10 分钟判读并推送飞书）。\n\n注意：如果「境外 / 国内 IP 自动封禁」还是开着的，'
+        + '恢复后会立刻按原规则自动执行。'
+      : '关闭边界守望？\n\n会暂停上游两个定时任务：\n· 每 5 分钟的边界日志采集\n'
+        + '· 每 10 分钟的研判与飞书告警\n\n接下来没人盯着新的扫描与爆破；'
+        + '已封禁的 IP、白名单、历史记录都保持不变。';
+    if (!window.confirm(tip)) return;
+    setBusy('guard');
+    try {
+      const r = await api.office.securityGuardToggle(next);
+      if (!r.ok) {
+        notify?.(r.error || '切换失败：上游没有确认新的状态', 'crit');
+      } else {
+        notify?.(next ? '边界守望已开启' : '边界守望已关闭');
+      }
+      /* 状态以服务端为准：重新拉一次页签，让开关、健康度、待授权一起对齐 */
+      reload();
+    } catch (e) {
+      notify?.(e instanceof Error ? e.message : '切换失败', 'crit');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  /**
    * 自动封禁开关（境外 / 国内两个方向，各一把）。
    *
    * 这是一类「不需要授权码就会改变封禁行为」的控件，所以必须二次确认，
@@ -912,6 +948,60 @@ function GuardPane({ seat }: { seat: string }) {
 
       {guard ? (
         <>
+          {/* 总开关放最上面：它决定下面这些数字还有没有人继续在生产。
+              关掉不是"隐藏这一页"，而是上游真的停止采集与研判 —— 所以先把话说清。 */}
+          <div
+            className={cls(
+              'rounded-field border px-3 py-2.5',
+              guard.paused ? 'border-warn/40 bg-warn-soft/40' : 'border-line bg-bg-2',
+            )}
+          >
+            <div className="flex items-start gap-3">
+              <div className="min-w-0 flex-1">
+                <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs font-medium text-ink">
+                  <Shield size={12} aria-hidden className={guard.paused ? 'text-warn' : 'text-ok'} />
+                  边界守望
+                  {guard.paused ? (
+                    <Badge tone="warn" dot>已关闭</Badge>
+                  ) : (
+                    <Badge tone="ok" dot>守护中</Badge>
+                  )}
+                  {guard.paused ? null : (
+                    <span className="text-2xs font-normal text-faint">每 5 分钟采集 · 每 10 分钟研判</span>
+                  )}
+                </p>
+                <p className="mt-1 text-2xs leading-relaxed text-faint">
+                  {guard.paused
+                    ? '上游的采集与研判都已暂停：新的扫描 / 爆破不会入库，也不会推送飞书。已封禁的 IP、白名单与历史记录都还在，重新开启即恢复。'
+                    : '上游定时任务在跑：边界日志每 5 分钟采一轮，跨档的才唤醒研判并推送飞书。关掉会同时暂停这两件事。'}
+                </p>
+                {busy === 'guard' ? (
+                  <p className="mt-1 flex items-center gap-1.5 text-2xs text-muted">
+                    <Spinner />
+                    正在{guard.paused ? '开启' : '关闭'}…（要等上游确认后才算数）
+                  </p>
+                ) : null}
+                {guard.guardError ? (
+                  <p className="mt-1 text-2xs leading-relaxed text-crit">{guard.guardError}</p>
+                ) : null}
+                {guard.guardWarning ? (
+                  <p className="mt-1 text-2xs leading-relaxed text-warn">{guard.guardWarning}</p>
+                ) : null}
+                {guard.paused && guard.guardJobs.some((j) => j.pausedAt) ? (
+                  <p className="mt-1 text-2xs leading-relaxed text-faint">
+                    暂停于 {fmtDateTime(guard.guardJobs.find((j) => j.pausedAt)?.pausedAt)}
+                  </p>
+                ) : null}
+              </div>
+              <Toggle
+                checked={!guard.paused}
+                disabled={busy === 'guard' || Boolean(guard.guardError)}
+                label="边界守望"
+                onChange={(next) => void toggleGuard(next)}
+              />
+            </div>
+          </div>
+
           {/* 两个能绕过人工审批的开关，所以放在最上面、各自说清楚做了什么。
               境外是常态（对面就是海量扫描）；国内那把更钝 —— 自己人的家宽出口
               也在那个方向里，所以两把刀分开、各带各的确认文案。 */}
@@ -1039,7 +1129,9 @@ function GuardPane({ seat }: { seat: string }) {
               <Shield size={12} aria-hidden />
               分析窗口 {guard.windowMin} 分钟
             </span>
-            <span className={guard.ok ? 'text-ok' : 'text-crit'}>{guard.ok ? '采集正常' : '采集异常'}</span>
+            <span className={guard.paused ? 'text-warn' : guard.ok ? 'text-ok' : 'text-crit'}>
+              {guard.paused ? '已暂停 · 不采新日志' : guard.ok ? '采集正常' : '采集异常'}
+            </span>
             {/* 告警走哪条路必须看得见：只有 cron 投递时，那条链路断了就等于没人知道 */}
             {guard.alertChannel === 'cron' ? (
               <span

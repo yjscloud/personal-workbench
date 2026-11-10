@@ -31,6 +31,7 @@ import {
   securityUnblock,
   securityAllowList,
   securityAllowSave,
+  securityGuardToggle,
 } from './services/office.js';
 import { egressStatus, setEgressEnabled, syncEgress } from './services/security-egress.js';
 import { readGovernor, GOVERNORS } from './services/cpu.js';
@@ -3410,6 +3411,29 @@ router.post(
     const r = await securityAllowSave(entry, act);
     /* 白名单改一条就可能让某个来源「永不告警、永不可封」，属于防护配置变更 */
     await auditOp(req, 'security.allow.' + act, entry, act === 'add' ? '加入白名单' : '移出白名单');
+    ok(res, r);
+  }),
+);
+
+/**
+ * 边界守望总开关。
+ *
+ * 关掉会真的暂停上游两个定时任务（每 5 分钟采集 + 每 10 分钟研判），
+ * 也就是"接下来没人盯着边界了" —— 属于防护能力的开关，必须留审计。
+ * 返回的是执行之后的真实状态（桥重新读了一遍 cron），不是我们请求的那个值。
+ */
+router.post(
+  '/office/security/enabled',
+  wrap(async (req, res) => {
+    if (!needsLocal(res)) return;
+    const enabled = req.body?.enabled === true;
+    const r = await securityGuardToggle(enabled);
+    await auditOp(
+      req,
+      enabled ? 'security.guard.on' : 'security.guard.off',
+      'guard',
+      enabled ? '开启边界守望（恢复采集与研判）' : '关闭边界守望（暂停采集与研判）',
+    );
     ok(res, r);
   }),
 );
