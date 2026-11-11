@@ -23,7 +23,7 @@ import { notifyPanelNotice, panelNotifyReady } from './feishu-bot.js';
    飞书抽风的那 6 小时里进来的 star，不该就这么没人知道。 */
 
 /** 没配仓库时盯这个（也就是这个面板自己的仓库） */
-export const DEFAULT_REPO = 'yjscloud/ProxCenter';
+export const DEFAULT_REPO = 'yjscloud/pvecenter';
 
 const TIMEOUT_MS = 15000;
 

@@ -231,10 +231,10 @@ export function defaultData() {
       theme: { mode: 'light', accent: 'azure' },
       pve: { host: '', port: 8006, tokenId: '', tokenSecret: '', node: '', verifyTls: false },
       /* 监控页那张 GitHub star 卡片盯哪个仓库、涨了发到哪个飞书群。
-         仓库留空则用 yjscloud/ProxCenter；webhook 留空 = 只记数不发通知
+         仓库留空则用 yjscloud/pvecenter；webhook 留空 = 只记数不发通知
          （.env 里的 FEISHU_WEBHOOK_URL 作为兜底，老部署不必改）。
          签名密钥是机器人开了「签名校验」才用的，同样可以留空。 */
-      stars: { repo: 'yjscloud/ProxCenter', feishuUrl: '', feishuSecret: '' },
+      stars: { repo: 'yjscloud/pvecenter', feishuUrl: '', feishuSecret: '' },
       /* 全站飞书通知出口。默认关闭 webhook（没填 = 不发），开关与通知范围先给全开：
          填完地址就能直接用，不必再回来点一遍 */
       feishuBot: {
@@ -373,6 +373,6 @@ export function defaultData() {
        stars 先给 null 而不是 0：卡片要区分"还没采过"和"真的是 0 个 star"，
        给 0 的话首屏会理直气壮地显示一个错数。
        pending 是攒着还没发出去的增量 —— 飞书不通时不丢通知，等下次合并发。 */
-    githubStars: { repo: 'yjscloud/ProxCenter', stars: null, history: [], pending: 0 },
+    githubStars: { repo: 'yjscloud/pvecenter', stars: null, history: [], pending: 0 },
   };
 }

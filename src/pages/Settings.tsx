@@ -1272,7 +1272,7 @@ export default function Settings() {
 
         <div className="grid gap-3 sm:grid-cols-2">
           <Field label="要监控的仓库" hint="owner/repo，也可以直接粘 GitHub 地址">
-            <Input value={starsCfg.repo} onChange={(e) => patchStars({ repo: e.target.value })} placeholder="yjscloud/ProxCenter" />
+            <Input value={starsCfg.repo} onChange={(e) => patchStars({ repo: e.target.value })} placeholder="yjscloud/pvecenter" />
           </Field>
           <Field label="飞书 Webhook 地址" hint={starsCfg.feishuUrl ? '清空并保存即停止通知' : '留空则只记数、不发通知'}>
             <Input
@@ -1300,7 +1300,7 @@ export default function Settings() {
           </Field>
           <div className="flex items-end pb-1.5">
             <p className="text-2xs leading-relaxed text-faint">
-              通知内容形如「ProxCenter 新增 3 个 star（当前 128）」。发不出去也不会丢 —— 攒着下次一起发。
+              通知内容形如「pvecenter 新增 3 个 star（当前 128）」。发不出去也不会丢 —— 攒着下次一起发。
             </p>
           </div>
         </div>
