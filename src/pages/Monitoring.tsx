@@ -217,7 +217,7 @@ export default function Monitoring() {
       {/* Star 卡片和两张图同排：它是这一页唯一一个"外部世界"的数，
           单独占一行会让它看起来比 CPU/IO 更重要。三列只在 lg 以上成立，
           窄屏自然堆成三行。 */}
-      <Section title="资源走势" hint="CPU 与内存使用率、磁盘读写吞吐随时间的变化，以及 ProxCenter 的 star 变化">
+      <Section title="资源走势" hint="CPU 与内存使用率、磁盘读写吞吐随时间的变化，以及 pvecenter 的 star 变化">
         <div className="grid gap-5 lg:grid-cols-3">
           <CpuMemChart />
           <IoChart />
@@ -855,7 +855,7 @@ function IoChart() {
 }
 
 /* ══════════════════════════════════════════════════════════════════
-   ProxCenter 的 GitHub star
+   pvecenter 的 GitHub star
 
    数据是服务端每 6 小时采一次的**采样结果**（services/github-stars.js），
    前端不轮询：这个数一天只变四次，每 15 秒问一遍纯属浪费。
@@ -948,7 +948,7 @@ function StarPanel() {
     <Card>
       <CardHead
         title="GitHub Star"
-        hint={`${data?.repo ?? 'yjscloud/ProxCenter'} · 每 6 小时采集`}
+        hint={`${data?.repo ?? 'yjscloud/pvecenter'} · 每 6 小时采集`}
         right={
           <Button size="sm" variant="ghost" onClick={() => void refresh()} disabled={busy} aria-label="立即采集 star 数">
             <RefreshCw size={13} className={cls(busy && 'animate-spin')} />
@@ -1050,7 +1050,7 @@ function StarPanel() {
                 </button>
               ) : null}
               <a
-                href={data?.htmlUrl ?? 'https://github.com/yjscloud/ProxCenter'}
+                href={data?.htmlUrl ?? 'https://github.com/yjscloud/pvecenter'}
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center gap-1 text-muted transition-colors hover:text-accent"
@@ -1455,6 +1455,10 @@ function ThermalPanel() {
   const { overview } = useMonitor();
   const temps = overview?.sensors?.temperatures ?? [];
   const powerSensors = overview?.sensors?.power ?? [];
+  /* 一条都没读到时，后端会带上**具体原因**（SSH 报错 / 没装 lm-sensors /
+     有输出但没解析出读数）。以前这里写死"去装 lm-sensors"，于是母机上
+     明明装着、真正坏的是别的环节时，提示会把人指错方向。 */
+  const sensorError = overview?.sensors?.error ?? null;
 
   const cpuTemps = temps.filter((t) => t.kind === 'cpu');
   // 主板（acpitz 等）单独成组：以前它没被排除，会掉进「其它温度点」里，
@@ -1499,7 +1503,10 @@ function ThermalPanel() {
         <Empty
           icon={<Thermometer size={20} />}
           title="没有读到温度数据"
-          hint="需要在 PVE 节点上安装 lm-sensors 并执行 sensors-detect，节点才会上报温度指标。"
+          hint={
+            sensorError ??
+            '母机上的 sensors 没有报出温度：apt install lm-sensors && sensors-detect 之后重新采样即可。'
+          }
         />
       ) : (
         <div className={cls('grid gap-4', otherTemps.length ? 'lg:grid-cols-4' : 'lg:grid-cols-3')}>

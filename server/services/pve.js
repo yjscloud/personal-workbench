@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { collectSmart, clearSmartCache } from './smart.js';
 import { collectNet, clearNetCache } from './net.js';
+import { collectSensors, clearSensorsCache } from './sensors.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** PVE 集群自带的私有 CA。默认放数据目录，可用 PVE_CA_FILE 指向别处 */
@@ -189,6 +190,7 @@ export function clearPveCache() {
   cacheMap.clear();
   clearSmartCache();
   clearNetCache();
+  clearSensorsCache();
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -502,6 +504,13 @@ export function parseSensorsText(text) {
       continue;
     }
     if (line.includes('=') || line.includes('(')) continue; // 阈值续行
+    /* `sensors` 的原文在芯片名下面还有一行 "Adapter: PCI adapter"。
+       它没带数字、也不含 = 和 (，会被当成芯片名 —— 于是真正的
+       nvme-pci-0100 / acpitz-acpi-0 / coretemp-isa-0000 全被它顶掉，
+       温度点按标签瞎猜分类：主板 acpitz 掉进"其它"、CPU 只能靠
+       "Package id 0" 这种标签救回来。装 lm-sensors 之后走的正是这条路
+       （PVE 的 thermalstate 里反而没有 Adapter 行），所以必须显式跳过。 */
+    if (/^Adapter:/i.test(line)) continue;
     chip = line;
   }
 
@@ -633,6 +642,41 @@ export async function getNodeLoad(settings) {
   return Number.isFinite(cpu) ? cpu : null;
 }
 
+/* ────────────────────────────────────────────────────────────────────────
+ * 温度从哪来
+ *
+ * 9.2.26 的 /nodes/{node}/status 不返回 thermalstate（root 直连 pvesh 也一样），
+ * /nodes/{node}/sensors 不是个接口，所以真实读数只可能来自母机上的 `sensors`。
+ * 这里按「先接口、后 SSH」取，两边的产物是同一份 sensors 文本，共用 parseSensorsText。
+ *
+ * 三种失败要分开报，否则界面上又只剩一句"没读到"，把人指去装一个已经装了的包：
+ *   · SSH 不通        → 带 ssh 原始报错（这通常才是根因，硬盘/网卡卡也会一起空）
+ *   · 没装 lm-sensors → 直接让人去装（sensors.js 给好的原文）
+ *   · 有输出没读数     → sensors 探到了芯片但没有温度通道
+ * 所以 error 一并回给前端，由空状态原样展示。
+ * ──────────────────────────────────────────────────────────────────────── */
+async function readSensors(cfg, statusRaw) {
+  const fromApi = parseSensors(statusRaw?.thermalstate);
+  if (fromApi.temperatures.length) return { ...fromApi, source: 'pve', error: null };
+
+  let res = null;
+  try {
+    res = await collectSensors(cfg.host);
+  } catch (err) {
+    return { temperatures: [], power: [], source: 'none', error: `读取温度失败：${err.message}` };
+  }
+  if (!res) return { temperatures: [], power: [], source: 'none', error: '没有配置 PVE 地址，读不到温度' };
+  if (!res.available) return { temperatures: [], power: [], source: 'ssh', error: res.error };
+
+  const parsed = parseSensorsText(res.raw);
+  return {
+    temperatures: parsed.temperatures,
+    power: parsed.power,
+    source: 'ssh',
+    error: parsed.temperatures.length ? null : '母机 sensors 有输出，但没有解析出温度读数',
+  };
+}
+
 export async function getOverview(settings, { node, timeframe = 'hour' } = {}) {
   const cfg = pveConfig(settings);
   const live = isConfigured(settings);
@@ -645,7 +689,7 @@ export async function getOverview(settings, { node, timeframe = 'hour' } = {}) {
       node: n,
       warning: '尚未配置 Proxmox 连接，当前展示的是演示数据。可在「设置 → Proxmox 连接」中填入 PVE 地址与 API Token。',
       status,
-      sensors: demoSensors(n),
+      sensors: { ...demoSensors(n), source: 'demo', error: null },
       disks: demoDisks(),
       diskHealth: null, // 演示模式没有母机可连，硬盘详情整块不展示
       net: null,
@@ -686,12 +730,12 @@ export async function getOverview(settings, { node, timeframe = 'hour' } = {}) {
   }
   const [statusRaw, disksRaw, seriesRaw, qemuRaw, lxcRaw] = fetched;
 
-  /* 温度从 /status 的 thermalstate 里取。
-     以前这里打的是 /nodes/{node}/sensors —— 那个接口在 PVE 上并不存在，
-     返回 "Method not implemented"，又被 .catch(() => []) 吞掉，
-     于是温度永远是空的、界面上也看不到任何报错。
-     thermalstate 就在已经请求过的 /status 里，顺带还省掉一次 HTTP。 */
-  const sensors = parseSensors(statusRaw?.thermalstate);
+  /* 温度。以前这里只认 /status 的 thermalstate，而 9.2 的 /nodes/{node}/status
+     里**根本没有这个字段** —— 于是温度永远是空的，空状态还甩锅给
+     "母机没装 lm-sensors"，实际母机上 sensors 一直是好的。
+     所以改成两条腿：thermalstate 有就读（老版本给的是 sensors 原文），
+     没有就 SSH 上机跑 sensors（见 services/sensors.js）。 */
+  const sensors = await readSensors(cfg, statusRaw);
   const disks = (disksRaw || []).map((d) => ({
     dev: d.devpath || d.dev || '—',
     model: d.model || d.vendor || '未知磁盘',

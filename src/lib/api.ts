@@ -592,7 +592,14 @@ export type Overview = {
   node: string;
   warning: string | null;
   status: PveStatus;
-  sensors: { temperatures: SensorReading[]; power: SensorReading[] };
+  sensors: {
+    temperatures: SensorReading[];
+    power: SensorReading[];
+    /** 这批读数从哪来：PVE 接口 / 母机 SSH 跑 sensors / 演示数据 */
+    source?: 'pve' | 'ssh' | 'demo' | 'none';
+    /** 一条读数都没取到时，这里放**具体原因**（SSH 报错、没装 lm-sensors、解析为空），空状态直接展示 */
+    error?: string | null;
+  };
   disks: PveDisk[];
   /** 完整 SMART 健康数据；演示模式或采集不可用时为 null */
   diskHealth: { disks: DiskHealth[]; available: boolean; error: string | null } | null;
