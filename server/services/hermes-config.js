@@ -4,12 +4,12 @@
  * 合并 agent_office 之后，工作台对 Hermes 只有两条通道，都从环境变量来：
  *
  *   1. 网关 HTTP（直连，Bearer）
- *        HERMES_API_BASE_URL   例：http://172.16.149.100:8642
+ *        HERMES_API_BASE_URL   例：http://hermes.home.local:8642
  *        HERMES_API_KEY        ~/.hermes/.env 里的 API_SERVER_KEY
  *      提供：会话列表 / 会话明细 / 对话 SSE / 模型 / 工具集
  *
  *   2. 本机数据桥（SSH，只读）
- *        HERMES_LOCAL_HOST     例：172.16.149.100
+ *        HERMES_LOCAL_HOST     例：hermes.home.local
  *        HERMES_LOCAL_USER     SSH 用户，默认 root
  *        HERMES_LOCAL_KEY      SSH 私钥，默认 /root/.ssh/id_rsa
  *        HERMES_BRIDGE_PATH    远端桥脚本，默认 /data/personal-workbench-bridge/hwb-bridge.cjs
